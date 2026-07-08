@@ -133,6 +133,22 @@ def test_failed_and_cancelled(tmp_path):
     run(main())
 
 
+def test_stderr_event_and_timeout(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        stderr_job = await manager.start(
+            cmd("import json,sys; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), file=sys.stderr, flush=True)")
+        )
+        checkpoint = await manager.wait(stderr_job["job_id"], ["checkpoint"], timeout_seconds=5)
+        assert checkpoint["event"]["source"] == "stderr"
+
+        timeout_job = await manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
+        timed_out = await manager.wait(timeout_job["job_id"], ["timeout"], timeout_seconds=5)
+        assert timed_out["event"]["type"] == "timeout"
+
+    run(main())
+
+
 def test_multiple_waiters(tmp_path):
     async def main():
         manager = JobManager(tmp_path)

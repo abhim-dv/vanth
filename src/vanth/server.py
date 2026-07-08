@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -271,7 +273,7 @@ class JobManager:
         try:
             exit_code = await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            proc.kill()
+            await self._kill_process(proc, force=True)
             exit_code = await proc.wait()
             await self._readers_done(job_id)
             await asyncio.sleep(0)
@@ -288,6 +290,20 @@ class JobManager:
         tasks = self.reader_tasks.pop(job_id, [])
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _kill_process(self, proc: asyncio.subprocess.Process, force: bool) -> None:
+        if sys.platform == "win32" and proc.pid:
+            args = ["taskkill", "/PID", str(proc.pid), "/T"]
+            if force:
+                args.append("/F")
+            killer = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            await killer.wait()
+            return
+        proc.kill() if force else proc.terminate()
 
     async def _finish(self, job_id: str, status: str, exit_code: int | None = None) -> None:
         self.db.execute(
@@ -398,11 +414,11 @@ class JobManager:
         )
         self.db.commit()
         await self._emit(job_id, "cancelled")
-        proc.kill() if signal == "kill" else proc.terminate()
+        await self._kill_process(proc, force=signal == "kill")
         try:
             await asyncio.wait_for(proc.wait(), timeout=kill_after_seconds)
         except asyncio.TimeoutError:
-            proc.kill()
+            await self._kill_process(proc, force=True)
             await proc.wait()
         await self._readers_done(job_id)
         await asyncio.sleep(0)
