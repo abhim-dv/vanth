@@ -10,6 +10,22 @@ uv sync
 uv run vanth
 ```
 
+MCP stdio config:
+
+```json
+{
+  "mcpServers": {
+    "vanth": {
+      "command": "uv",
+      "args": ["--directory", "F:/git/vanth", "run", "vanth"],
+      "env": {
+        "VANTH_HOME": "F:/git/vanth/.vanth"
+      }
+    }
+  }
+}
+```
+
 Jobs can emit events on stdout or stderr:
 
 ```python
@@ -23,4 +39,10 @@ Agents should wait for meaningful events instead of polling logs:
 
 ```text
 job_wait(job_id, filters=["progress", "checkpoint", "failed", "completed"])
+```
+
+Example job:
+
+```cmd
+uv run python examples\long_job.py
 ```

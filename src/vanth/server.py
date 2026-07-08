@@ -6,6 +6,8 @@ import os
 import subprocess
 import sqlite3
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 
 EVENT_PREFIX = "AGENT_EVENT "
 TERMINAL = {"completed", "failed", "cancelled", "timeout"}
+DEFAULT_MAX_EVENT_BYTES = 65536
 
 
 def now_iso() -> str:
@@ -52,7 +55,12 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 class JobManager:
     def __init__(self, home: str | Path | None = None) -> None:
-        self.home = Path(home or os.environ.get("AGENT_BG_HOME") or Path.home() / ".vanth")
+        self.home = Path(home or os.environ.get("VANTH_HOME") or os.environ.get("AGENT_BG_HOME") or Path.home() / ".vanth")
+        self.max_event_bytes = int(
+            os.environ.get("VANTH_MAX_EVENT_BYTES")
+            or os.environ.get("AGENT_BG_MAX_EVENT_BYTES")
+            or DEFAULT_MAX_EVENT_BYTES
+        )
         self.logs = self.home / "logs"
         self.events_dir = self.home / "events"
         self.logs.mkdir(parents=True, exist_ok=True)
@@ -100,20 +108,21 @@ class JobManager:
             (now_iso(),),
         )
         self.db.commit()
-        self.processes: dict[str, asyncio.subprocess.Process] = {}
-        self.reader_tasks: dict[str, list[asyncio.Task[None]]] = {}
-        self.conditions: dict[str, asyncio.Condition] = {}
-        self.lock = asyncio.Lock()
+        self.processes: dict[str, subprocess.Popen[bytes]] = {}
+        self.reader_threads: dict[str, list[threading.Thread]] = {}
+        self.conditions: dict[str, threading.Condition] = {}
+        self.db_lock = threading.RLock()
 
     def close(self) -> None:
         self.db.close()
 
-    def _condition(self, job_id: str) -> asyncio.Condition:
-        self.conditions.setdefault(job_id, asyncio.Condition())
+    def _condition(self, job_id: str) -> threading.Condition:
+        self.conditions.setdefault(job_id, threading.Condition())
         return self.conditions[job_id]
 
     def _row(self, sql: str, args: tuple[Any, ...]) -> sqlite3.Row | None:
-        return self.db.execute(sql, args).fetchone()
+        with self.db_lock:
+            return self.db.execute(sql, args).fetchone()
 
     def _event_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -128,7 +137,7 @@ class JobManager:
             "created_at": row["created_at"],
         }
 
-    async def _emit(
+    def _emit(
         self,
         job_id: str,
         event_type: str,
@@ -139,7 +148,13 @@ class JobManager:
         source: str = "server",
     ) -> dict[str, Any]:
         payload = normalize_event_payload({"type": event_type, "message": message, "data": data or {}, "level": level})
-        async with self.lock:
+        data_json = json.dumps(payload["data"], separators=(",", ":"))
+        if len(data_json.encode()) > self.max_event_bytes:
+            payload["data"] = {"truncated": True, "max_bytes": self.max_event_bytes}
+            payload["message"] = payload["message"] or "Event payload exceeded max bytes"
+            payload["level"] = "warning"
+            data_json = json.dumps(payload["data"], separators=(",", ":"))
+        with self.db_lock:
             row = self._row("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,))
             seq = int(row["seq"])
             created_at = now_iso()
@@ -156,7 +171,7 @@ class JobManager:
                     payload["type"],
                     payload["level"],
                     payload["message"],
-                    json.dumps(payload["data"], separators=(",", ":")),
+                    data_json,
                     source,
                     created_at,
                 ),
@@ -176,7 +191,7 @@ class JobManager:
             events_path = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))["events_path"]
             with Path(events_path).open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, separators=(",", ":")) + "\n")
-        async with self._condition(job_id):
+        with self._condition(job_id):
             self._condition(job_id).notify_all()
         return event
 
@@ -197,43 +212,52 @@ class JobManager:
         proc_env = os.environ.copy()
         if env:
             proc_env.update(env)
-        proc = await asyncio.create_subprocess_shell(
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        proc = subprocess.Popen(
             command,
             cwd=cwd,
             env=proc_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            creationflags=creationflags,
         )
         self.processes[job_id] = proc
-        self.db.execute(
-            """
-            INSERT INTO jobs(job_id, name, command, cwd, status, pid, created_at, updated_at, started_at,
-              timeout_seconds, notify_on, stdout_path, stderr_path, events_path)
-            VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                name,
-                command,
-                cwd,
-                proc.pid,
-                created_at,
-                created_at,
-                created_at,
-                timeout_seconds,
-                json.dumps(notify_on or []),
-                str(stdout_path),
-                str(stderr_path),
-                str(events_path),
-            ),
-        )
-        self.db.commit()
-        await self._emit(job_id, "started")
-        self.reader_tasks[job_id] = [
-            asyncio.create_task(self._read_stream(job_id, proc.stdout, stdout_path, "stdout")),
-            asyncio.create_task(self._read_stream(job_id, proc.stderr, stderr_path, "stderr")),
+        with self.db_lock:
+            self.db.execute(
+                """
+                INSERT INTO jobs(job_id, name, command, cwd, status, pid, created_at, updated_at, started_at,
+                  timeout_seconds, notify_on, stdout_path, stderr_path, events_path)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    name,
+                    command,
+                    cwd,
+                    proc.pid,
+                    created_at,
+                    created_at,
+                    created_at,
+                    timeout_seconds,
+                    json.dumps(notify_on or []),
+                    str(stdout_path),
+                    str(stderr_path),
+                    str(events_path),
+                ),
+            )
+            self.db.commit()
+        self._emit(job_id, "started")
+        self.reader_threads[job_id] = [
+            threading.Thread(target=self._read_stream, args=(job_id, proc.stdout, stdout_path, "stdout"), daemon=True),
+            threading.Thread(target=self._read_stream, args=(job_id, proc.stderr, stderr_path, "stderr"), daemon=True),
         ]
-        asyncio.create_task(self._watch(job_id, proc, timeout_seconds))
+        for thread in self.reader_threads[job_id]:
+            thread.start()
+        threading.Thread(target=self._watch, args=(job_id, proc, timeout_seconds), daemon=True).start()
         return {
             "job_id": job_id,
             "status": "running",
@@ -244,23 +268,23 @@ class JobManager:
             "message": "Job started",
         }
 
-    async def _read_stream(
+    def _read_stream(
         self,
         job_id: str,
-        stream: asyncio.StreamReader | None,
+        stream,
         path: Path,
         source: str,
     ) -> None:
         if stream is None:
             return
         with path.open("ab") as f:
-            while line := await stream.readline():
+            while line := stream.readline():
                 f.write(line)
                 f.flush()
                 payload = parse_agent_event_line(line.decode(errors="replace").rstrip("\r\n"))
                 if payload:
                     event = normalize_event_payload(payload)
-                    await self._emit(
+                    self._emit(
                         job_id,
                         event["type"],
                         message=event["message"],
@@ -269,50 +293,47 @@ class JobManager:
                         source=source,
                     )
 
-    async def _watch(self, job_id: str, proc: asyncio.subprocess.Process, timeout_seconds: int | None) -> None:
+    def _watch(self, job_id: str, proc: subprocess.Popen[bytes], timeout_seconds: int | None) -> None:
         try:
-            exit_code = await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            await self._kill_process(proc, force=True)
-            exit_code = await proc.wait()
-            await self._readers_done(job_id)
-            await asyncio.sleep(0)
-            await self._finish(job_id, "timeout", exit_code)
+            exit_code = proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            self._kill_process(proc, force=True)
+            exit_code = proc.wait()
+            self._readers_done(job_id)
+            self._finish(job_id, "timeout", exit_code)
             return
         status = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))["status"]
         if status == "cancelled":
             return
-        await self._readers_done(job_id)
-        await asyncio.sleep(0)
-        await self._finish(job_id, "completed" if exit_code == 0 else "failed", exit_code)
+        self._readers_done(job_id)
+        self._finish(job_id, "completed" if exit_code == 0 else "failed", exit_code)
 
-    async def _readers_done(self, job_id: str) -> None:
-        tasks = self.reader_tasks.pop(job_id, [])
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+    def _readers_done(self, job_id: str) -> None:
+        for thread in self.reader_threads.pop(job_id, []):
+            thread.join(timeout=2)
 
-    async def _kill_process(self, proc: asyncio.subprocess.Process, force: bool) -> None:
+    def _kill_process(self, proc: subprocess.Popen[bytes], force: bool) -> None:
         if sys.platform == "win32" and proc.pid:
             args = ["taskkill", "/PID", str(proc.pid), "/T"]
             if force:
                 args.append("/F")
-            killer = await asyncio.create_subprocess_exec(
-                *args,
+            subprocess.run(
+                args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            await killer.wait()
             return
         proc.kill() if force else proc.terminate()
 
-    async def _finish(self, job_id: str, status: str, exit_code: int | None = None) -> None:
-        self.db.execute(
-            "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=? WHERE job_id=?",
-            (status, exit_code, now_iso(), now_iso(), job_id),
-        )
+    def _finish(self, job_id: str, status: str, exit_code: int | None = None) -> None:
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=? WHERE job_id=?",
+                (status, exit_code, now_iso(), now_iso(), job_id),
+            )
         self.db.commit()
         data = {"exit_code": exit_code} if exit_code is not None else {}
-        await self._emit(job_id, status, data=data)
+        self._emit(job_id, status, data=data)
         self.processes.pop(job_id, None)
 
     def _event_query(self, job_id: str, types: list[str] | None, since_event_id: str | None, limit: int) -> list[dict[str, Any]]:
@@ -325,10 +346,11 @@ class JobManager:
         if types:
             where += " AND type IN (%s)" % ",".join("?" for _ in types)
             args.extend(types)
-        rows = self.db.execute(
-            f"SELECT * FROM events WHERE {where} ORDER BY seq LIMIT ?",
-            (*args, limit),
-        ).fetchall()
+        with self.db_lock:
+            rows = self.db.execute(
+                f"SELECT * FROM events WHERE {where} ORDER BY seq LIMIT ?",
+                (*args, limit),
+            ).fetchall()
         return [self._event_dict(row) for row in rows]
 
     async def wait(
@@ -338,31 +360,55 @@ class JobManager:
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
     ) -> dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            self.wait_sync,
+            job_id,
+            filters,
+            since_event_id,
+            timeout_seconds,
+        )
+
+    def wait_sync(
+        self,
+        job_id: str,
+        filters: list[str],
+        since_event_id: str | None = None,
+        timeout_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        return self._wait(job_id, filters, since_event_id, timeout_seconds)
+
+    def _wait(
+        self,
+        job_id: str,
+        filters: list[str],
+        since_event_id: str | None = None,
+        timeout_seconds: int = 3600,
+    ) -> dict[str, Any]:
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
             raise ValueError(f"Unknown job_id: {job_id}")
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        deadline = time.monotonic() + timeout_seconds
         while True:
             events = self._event_query(job_id, filters, since_event_id, 1)
             if events:
                 return {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]}
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"result": "timeout", "job_id": job_id, "status": self.status(job_id)["status"], "message": "No matching event before timeout"}
-            async with self._condition(job_id):
-                try:
-                    await asyncio.wait_for(self._condition(job_id).wait(), timeout=remaining)
-                except asyncio.TimeoutError:
+            with self._condition(job_id):
+                if not self._condition(job_id).wait(timeout=remaining):
                     return {"result": "timeout", "job_id": job_id, "status": self.status(job_id)["status"], "message": "No matching event before timeout"}
 
     def status(self, job_id: str) -> dict[str, Any]:
         row = self._row("SELECT * FROM jobs WHERE job_id=?", (job_id,))
         if not row:
             raise ValueError(f"Unknown job_id: {job_id}")
-        last = self.db.execute("SELECT * FROM events WHERE job_id=? ORDER BY seq DESC LIMIT 1", (job_id,)).fetchone()
-        progress = self.db.execute(
-            "SELECT * FROM events WHERE job_id=? AND type='progress' ORDER BY seq DESC LIMIT 1",
-            (job_id,),
-        ).fetchone()
+        with self.db_lock:
+            last = self.db.execute("SELECT * FROM events WHERE job_id=? ORDER BY seq DESC LIMIT 1", (job_id,)).fetchone()
+            progress = self.db.execute(
+                "SELECT * FROM events WHERE job_id=? AND type='progress' ORDER BY seq DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
         result = {
             "job_id": job_id,
             "status": row["status"],
@@ -381,10 +427,11 @@ class JobManager:
         if status:
             where = "WHERE status IN (%s)" % ",".join("?" for _ in status)
             args.extend(status)
-        rows = self.db.execute(
-            f"SELECT job_id, name, status, updated_at FROM jobs {where} ORDER BY updated_at DESC LIMIT ?",
-            (*args, limit),
-        ).fetchall()
+        with self.db_lock:
+            rows = self.db.execute(
+                f"SELECT job_id, name, status, updated_at FROM jobs {where} ORDER BY updated_at DESC LIMIT ?",
+                (*args, limit),
+            ).fetchall()
         return {"jobs": [dict(row) for row in rows]}
 
     def events(self, job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
@@ -405,23 +452,29 @@ class JobManager:
         return {"job_id": job_id, "stream": stream, "truncated": size > max_bytes, "content": content}
 
     async def stop(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(None, self.stop_sync, job_id, signal, kill_after_seconds)
+
+    def stop_sync(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
+        return self._stop(job_id, signal, kill_after_seconds)
+
+    def _stop(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
         proc = self.processes.get(job_id)
         if not proc:
             raise ValueError(f"Job is not running in this server: {job_id}")
-        self.db.execute(
-            "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=?",
-            (now_iso(), now_iso(), job_id),
-        )
-        self.db.commit()
-        await self._emit(job_id, "cancelled")
-        await self._kill_process(proc, force=signal == "kill")
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=?",
+                (now_iso(), now_iso(), job_id),
+            )
+            self.db.commit()
+        self._emit(job_id, "cancelled")
+        self._kill_process(proc, force=signal == "kill")
         try:
-            await asyncio.wait_for(proc.wait(), timeout=kill_after_seconds)
-        except asyncio.TimeoutError:
-            await self._kill_process(proc, force=True)
-            await proc.wait()
-        await self._readers_done(job_id)
-        await asyncio.sleep(0)
+            proc.wait(timeout=kill_after_seconds)
+        except subprocess.TimeoutExpired:
+            self._kill_process(proc, force=True)
+            proc.wait()
+        self._readers_done(job_id)
         self.processes.pop(job_id, None)
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
 
@@ -470,18 +523,18 @@ def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192) -> dict
 
 
 @mcp.tool()
-async def job_wait(
+def job_wait(
     job_id: str,
     filters: list[str],
     since_event_id: str | None = None,
     timeout_seconds: int = 3600,
 ) -> dict[str, Any]:
-    return await get_manager().wait(job_id, filters, since_event_id, timeout_seconds)
+    return get_manager().wait_sync(job_id, filters, since_event_id, timeout_seconds)
 
 
 @mcp.tool()
-async def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
-    return await get_manager().stop(job_id, signal, kill_after_seconds)
+def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
+    return get_manager().stop_sync(job_id, signal, kill_after_seconds)
 
 
 def main() -> None:

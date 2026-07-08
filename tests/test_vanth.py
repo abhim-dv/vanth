@@ -36,6 +36,21 @@ def test_normalize_progress_percent():
     assert event["data"]["percent"] == 50
 
 
+def test_vanth_home_and_event_size_cap(tmp_path, monkeypatch):
+    async def main():
+        monkeypatch.setenv("VANTH_HOME", str(tmp_path / "state"))
+        monkeypatch.setenv("VANTH_MAX_EVENT_BYTES", "20")
+        manager = JobManager()
+        started = await manager.start(cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','data':{'big':'x'*100}}), flush=True)"))
+        event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        assert event["event"]["data"] == {"truncated": True, "max_bytes": 20}
+        assert manager.home == tmp_path / "state"
+        await manager.wait(started["job_id"], ["completed"], event["event"]["event_id"], timeout_seconds=5)
+        manager.close()
+
+    run(main())
+
+
 def test_wait_returns_stored_event(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
