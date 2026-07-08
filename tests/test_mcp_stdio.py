@@ -41,15 +41,32 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         },
                     )
                 )
+                progress = content(
+                    await session.call_tool(
+                        "job_wait",
+                        {"job_id": start["job_id"], "filters": ["progress"], "timeout_seconds": 5},
+                        read_timeout_seconds=timedelta(seconds=10),
+                    )
+                )
+                status = content(await session.call_tool("job_status", {"job_id": start["job_id"]}))
                 waited = content(
                     await session.call_tool(
                         "job_wait",
-                        {"job_id": start["job_id"], "filters": ["checkpoint"], "timeout_seconds": 5},
+                        {
+                            "job_id": start["job_id"],
+                            "filters": ["checkpoint"],
+                            "since_event_id": progress["event"]["event_id"],
+                            "timeout_seconds": 5,
+                        },
                         read_timeout_seconds=timedelta(seconds=10),
                     )
                 )
                 tail = content(await session.call_tool("job_tail", {"job_id": start["job_id"]}))
 
+                assert progress["event"]["type"] == "progress"
+                assert progress["event"]["data"]["current"] == 1
+                assert progress["status"] == "running"
+                assert status["progress"]["current"] >= 1
                 assert waited["event"]["message"] == "demo checkpoint"
                 assert "AGENT_EVENT" in tail["content"]
 
