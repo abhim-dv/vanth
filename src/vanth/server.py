@@ -16,7 +16,6 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 EVENT_PREFIX = "AGENT_EVENT "
-TERMINAL = {"completed", "failed", "cancelled", "timeout"}
 DEFAULT_MAX_EVENT_BYTES = 65536
 
 
@@ -490,6 +489,10 @@ def get_manager() -> JobManager:
     return manager
 
 
+def tool_error(message: str) -> dict[str, Any]:
+    return {"result": "error", "error": message}
+
+
 @mcp.tool()
 async def job_start(
     command: str,
@@ -504,7 +507,10 @@ async def job_start(
 
 @mcp.tool()
 def job_status(job_id: str) -> dict[str, Any]:
-    return get_manager().status(job_id)
+    try:
+        return get_manager().status(job_id)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
 
 @mcp.tool()
@@ -514,12 +520,18 @@ def job_list(status: list[str] | None = None, limit: int = 50) -> dict[str, Any]
 
 @mcp.tool()
 def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
-    return get_manager().events(job_id, since_event_id, types, limit)
+    try:
+        return get_manager().events(job_id, since_event_id, types, limit)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
 
 @mcp.tool()
 def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192) -> dict[str, Any]:
-    return get_manager().tail(job_id, stream, max_bytes)
+    try:
+        return get_manager().tail(job_id, stream, max_bytes)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
 
 @mcp.tool()
@@ -529,12 +541,18 @@ def job_wait(
     since_event_id: str | None = None,
     timeout_seconds: int = 3600,
 ) -> dict[str, Any]:
-    return get_manager().wait_sync(job_id, filters, since_event_id, timeout_seconds)
+    try:
+        return get_manager().wait_sync(job_id, filters, since_event_id, timeout_seconds)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
 
 @mcp.tool()
 def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
-    return get_manager().stop_sync(job_id, signal, kill_after_seconds)
+    try:
+        return get_manager().stop_sync(job_id, signal, kill_after_seconds)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
 
 def main() -> None:

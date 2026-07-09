@@ -41,8 +41,19 @@ Agents should wait for meaningful events instead of polling logs:
 job_wait(job_id, filters=["progress", "checkpoint", "failed", "completed"])
 ```
 
+Typical tool flow:
+
+```text
+job_start(command="uv run python examples\\long_job.py", notify_on=["progress", "checkpoint", "failed", "completed"])
+job_wait(job_id="...", filters=["progress", "checkpoint", "failed", "completed"], timeout_seconds=3600)
+job_status(job_id="...")
+job_tail(job_id="...", stream="stdout", max_bytes=8192)
+```
+
 Example job:
 
 ```cmd
 uv run python examples\long_job.py
 ```
+
+V0 jobs run with stdin closed (`DEVNULL`). Interactive input and `job_send` are intentionally not supported yet.

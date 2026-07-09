@@ -71,3 +71,38 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                 assert "AGENT_EVENT" in tail["content"]
 
     asyncio.run(main())
+
+
+def test_mcp_stdio_errors_and_event_cap(tmp_path):
+    async def main():
+        env = {**os.environ, "VANTH_HOME": str(tmp_path), "VANTH_MAX_EVENT_BYTES": "20"}
+        server = StdioServerParameters(
+            command="uv",
+            args=["run", "vanth"],
+            cwd=str(Path(__file__).parents[1]),
+            env=env,
+        )
+        async with stdio_client(server) as (read, write):
+            async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
+                await session.initialize()
+                missing = content(await session.call_tool("job_status", {"job_id": "job_missing"}))
+                assert missing["result"] == "error"
+
+                command = subprocess.list2cmdline(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','data':{'big':'x'*100}}), flush=True)",
+                    ]
+                )
+                start = content(await session.call_tool("job_start", {"command": command}))
+                event = content(
+                    await session.call_tool(
+                        "job_wait",
+                        {"job_id": start["job_id"], "filters": ["checkpoint"], "timeout_seconds": 5},
+                        read_timeout_seconds=timedelta(seconds=10),
+                    )
+                )
+                assert event["event"]["data"] == {"truncated": True, "max_bytes": 20}
+
+    asyncio.run(main())
