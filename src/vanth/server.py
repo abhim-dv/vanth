@@ -16,6 +16,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .client import VanthClient
+from .codex_bridge import send_delivery_to_codex
 
 EVENT_PREFIX = "AGENT_EVENT "
 DEFAULT_MAX_EVENT_BYTES = 65536
@@ -259,6 +260,15 @@ class JobManager:
         payload = delivery["payload"]
         target = payload.get("target", {})
         command = target.get("command")
+        if not command and target.get("type") == "codex_thread":
+            if target.get("auto_dispatch") is False:
+                return
+            try:
+                send_delivery_to_codex(payload)
+                self.mark_delivery(delivery["delivery_id"], "delivered")
+            except Exception as exc:
+                self.mark_delivery(delivery["delivery_id"], "failed", str(exc))
+            return
         if not command:
             return
         try:

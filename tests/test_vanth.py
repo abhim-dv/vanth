@@ -102,6 +102,7 @@ def test_wake_target_enqueues_delivery(tmp_path):
                     "type": "codex_thread",
                     "thread_id": "thread_test",
                     "events": ["checkpoint"],
+                    "auto_dispatch": False,
                 }
             ],
         )
@@ -118,6 +119,66 @@ def test_wake_target_enqueues_delivery(tmp_path):
         marked = manager.mark_delivery(deliveries[0]["delivery_id"], "delivered")
         assert marked["status"] == "delivered"
         assert marked["attempts"] == 1
+
+    run(main())
+
+
+def test_codex_thread_delivery_dispatches_via_app_server(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path / "state")
+        calls = tmp_path / "codex_calls.jsonl"
+        fake_codex = tmp_path / "fake_codex.py"
+        fake_codex.write_text(
+            """
+import json
+import sys
+from pathlib import Path
+
+calls = Path(sys.argv[1])
+for line in sys.stdin:
+    req = json.loads(line)
+    calls.open("a", encoding="utf-8").write(json.dumps(req) + "\\n")
+    method = req["method"]
+    if method == "initialize":
+        result = {"userAgent": "fake", "codexHome": "", "platformFamily": "test", "platformOs": "test"}
+    elif method == "thread/resume":
+        result = {"thread": {"id": req["params"]["threadId"], "status": {"type": "idle"}}}
+    elif method == "turn/start":
+        result = {"turn": {"id": "turn_test", "status": "inProgress"}}
+    else:
+        result = {}
+    print(json.dumps({"id": req["id"], "result": result}), flush=True)
+""".strip(),
+            encoding="utf-8",
+        )
+        code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'codex dispatch'}), flush=True)"
+        started = await manager.start(
+            cmd(code),
+            wake_targets=[
+                {
+                    "type": "codex_thread",
+                    "events": ["checkpoint"],
+                    "thread_id": "thread_test",
+                    "codex_command": [sys.executable, str(fake_codex), str(calls)],
+                }
+            ],
+        )
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        deadline = time.monotonic() + 5
+        delivery = None
+        while time.monotonic() < deadline:
+            delivery = manager.deliveries(started["job_id"])["deliveries"][0]
+            if delivery["status"] != "pending":
+                break
+            time.sleep(0.05)
+
+        assert delivery is not None
+        assert delivery["status"] == "delivered"
+        assert delivery["attempts"] == 1
+        requests = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        assert [request["method"] for request in requests] == ["initialize", "thread/resume", "turn/start"]
+        assert requests[1]["params"]["threadId"] == "thread_test"
+        assert requests[2]["params"]["input"][0]["text"] == delivery["payload"]["prompt"]
 
     run(main())
 

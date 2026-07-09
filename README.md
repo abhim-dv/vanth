@@ -69,11 +69,24 @@ job_start(
     }
   ]
 )
-job_deliveries(job_id="...", status="pending")
-job_mark_delivery(delivery_id="...", status="delivered")
 ```
 
-`vanth` stores durable delivery payloads. A Codex adapter can read pending `codex_thread` deliveries, call Codex `send_message_to_thread`, then mark the delivery `delivered`.
+For `codex_thread` targets, the daemon calls Codex's local app-server over stdio:
+
+```text
+initialize -> thread/resume -> turn/start
+```
+
+Use `auto_dispatch: false` if an agent should inspect pending deliveries manually. Use `codex_command` to point at a non-default Codex binary.
+
+```json
+{
+  "type": "codex_thread",
+  "thread_id": "019f...",
+  "events": ["checkpoint"],
+  "codex_command": ["C:\\codex\\codex.exe"]
+}
+```
 
 Example job:
 
