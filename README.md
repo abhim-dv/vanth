@@ -50,6 +50,25 @@ job_status(job_id="...")
 job_tail(job_id="...", stream="stdout", max_bytes=8192)
 ```
 
+Codex wake target flow:
+
+```text
+job_start(
+  command="uv run python examples\\long_job.py",
+  wake_targets=[
+    {
+      "type": "codex_thread",
+      "thread_id": "019f...",
+      "events": ["checkpoint", "failed", "completed"]
+    }
+  ]
+)
+job_deliveries(job_id="...", status="pending")
+job_mark_delivery(delivery_id="...", status="delivered")
+```
+
+`vanth` stores durable delivery payloads. A Codex adapter can read pending `codex_thread` deliveries, call Codex `send_message_to_thread`, then mark the delivery `delivered`.
+
 Example job:
 
 ```cmd

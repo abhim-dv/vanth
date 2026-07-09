@@ -37,7 +37,14 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         {
                             "command": subprocess.list2cmdline(
                                 [sys.executable, str(Path(__file__).parents[1] / "examples" / "long_job.py")]
-                            )
+                            ),
+                            "wake_targets": [
+                                {
+                                    "type": "codex_thread",
+                                    "thread_id": "thread_test",
+                                    "events": ["checkpoint"],
+                                }
+                            ],
                         },
                     )
                 )
@@ -62,12 +69,15 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                     )
                 )
                 tail = content(await session.call_tool("job_tail", {"job_id": start["job_id"]}))
+                deliveries = content(await session.call_tool("job_deliveries", {"job_id": start["job_id"]}))
 
                 assert progress["event"]["type"] == "progress"
                 assert progress["event"]["data"]["current"] == 1
                 assert progress["status"] == "running"
                 assert status["progress"]["current"] >= 1
                 assert waited["event"]["message"] == "demo checkpoint"
+                assert deliveries["deliveries"][0]["target_type"] == "codex_thread"
+                assert deliveries["deliveries"][0]["payload"]["target"]["thread_id"] == "thread_test"
                 assert "AGENT_EVENT" in tail["content"]
 
     asyncio.run(main())

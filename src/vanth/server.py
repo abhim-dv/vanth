@@ -100,6 +100,30 @@ class JobManager:
             );
             CREATE INDEX IF NOT EXISTS idx_events_job_seq ON events(job_id, seq);
             CREATE INDEX IF NOT EXISTS idx_events_job_type_seq ON events(job_id, type, seq);
+            CREATE TABLE IF NOT EXISTS wake_targets (
+              target_id TEXT PRIMARY KEY,
+              job_id TEXT NOT NULL,
+              type TEXT NOT NULL,
+              events_json TEXT NOT NULL,
+              config_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deliveries (
+              delivery_id TEXT PRIMARY KEY,
+              event_id TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              target_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              delivered_at TEXT,
+              last_error TEXT,
+              UNIQUE(event_id, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wake_targets_job ON wake_targets(job_id);
+            CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status, created_at);
             """
         )
         self.db.execute(
@@ -190,9 +214,57 @@ class JobManager:
             events_path = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))["events_path"]
             with Path(events_path).open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, separators=(",", ":")) + "\n")
+            self._enqueue_deliveries(event)
         with self._condition(job_id):
             self._condition(job_id).notify_all()
         return event
+
+    def _enqueue_deliveries(self, event: dict[str, Any]) -> None:
+        targets = self.db.execute("SELECT * FROM wake_targets WHERE job_id=?", (event["job_id"],)).fetchall()
+        for target in targets:
+            events = json.loads(target["events_json"] or "[]")
+            if events and event["type"] not in events:
+                continue
+            payload = self._delivery_payload(event, target)
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO deliveries(
+                  delivery_id, event_id, target_id, job_id, target_type, status, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    "del_" + uuid.uuid4().hex[:16],
+                    event["event_id"],
+                    target["target_id"],
+                    event["job_id"],
+                    target["type"],
+                    json.dumps(payload, separators=(",", ":")),
+                    now_iso(),
+                ),
+            )
+        self.db.commit()
+
+    def _delivery_payload(self, event: dict[str, Any], target: sqlite3.Row) -> dict[str, Any]:
+        config = json.loads(target["config_json"] or "{}")
+        prompt = config.get("prompt")
+        if not prompt:
+            prompt = (
+                "vanth event\n"
+                f"job_id: {event['job_id']}\n"
+                f"event: {event['type']}\n"
+                f"message: {event.get('message') or ''}\n"
+                f"data: {json.dumps(event.get('data') or {}, separators=(',', ':'))}\n\n"
+                "Continue from this event. Use vanth job_status/job_events/job_tail for details instead of polling."
+            )
+        return {
+            "target": {
+                "type": target["type"],
+                **config,
+            },
+            "event": event,
+            "prompt": prompt,
+        }
 
     async def start(
         self,
@@ -202,6 +274,7 @@ class JobManager:
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         notify_on: list[str] | None = None,
+        wake_targets: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
@@ -249,6 +322,8 @@ class JobManager:
                 ),
             )
             self.db.commit()
+            self._insert_wake_targets(job_id, wake_targets or [], created_at)
+            self.db.commit()
         self._emit(job_id, "started")
         self.reader_threads[job_id] = [
             threading.Thread(target=self._read_stream, args=(job_id, proc.stdout, stdout_path, "stdout"), daemon=True),
@@ -266,6 +341,28 @@ class JobManager:
             "events_path": str(events_path),
             "message": "Job started",
         }
+
+    def _insert_wake_targets(self, job_id: str, targets: list[dict[str, Any]], created_at: str) -> None:
+        for target in targets:
+            target_type = target.get("type")
+            events = target.get("events") or target.get("notify_on") or []
+            if not isinstance(target_type, str):
+                continue
+            config = {key: value for key, value in target.items() if key not in {"type", "events", "notify_on"}}
+            self.db.execute(
+                """
+                INSERT INTO wake_targets(target_id, job_id, type, events_json, config_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "target_" + uuid.uuid4().hex[:12],
+                    job_id,
+                    target_type,
+                    json.dumps(events, separators=(",", ":")),
+                    json.dumps(config, separators=(",", ":")),
+                    created_at,
+                ),
+            )
 
     def _read_stream(
         self,
@@ -330,7 +427,7 @@ class JobManager:
                 "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=? WHERE job_id=?",
                 (status, exit_code, now_iso(), now_iso(), job_id),
             )
-        self.db.commit()
+            self.db.commit()
         data = {"exit_code": exit_code} if exit_code is not None else {}
         self._emit(job_id, status, data=data)
         self.processes.pop(job_id, None)
@@ -436,6 +533,55 @@ class JobManager:
     def events(self, job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
         return {"events": self._event_query(job_id, types, since_event_id, limit)}
 
+    def deliveries(self, job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
+        where = []
+        args: list[Any] = []
+        if job_id:
+            where.append("job_id=?")
+            args.append(job_id)
+        if status:
+            where.append("status=?")
+            args.append(status)
+        sql_where = "WHERE " + " AND ".join(where) if where else ""
+        with self.db_lock:
+            rows = self.db.execute(
+                f"SELECT * FROM deliveries {sql_where} ORDER BY created_at DESC LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+        return {"deliveries": [self._delivery_dict(row) for row in rows]}
+
+    def _delivery_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "delivery_id": row["delivery_id"],
+            "event_id": row["event_id"],
+            "target_id": row["target_id"],
+            "job_id": row["job_id"],
+            "target_type": row["target_type"],
+            "status": row["status"],
+            "attempts": row["attempts"],
+            "payload": json.loads(row["payload_json"] or "{}"),
+            "created_at": row["created_at"],
+            "delivered_at": row["delivered_at"],
+            "last_error": row["last_error"],
+        }
+
+    def mark_delivery(self, delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
+        delivered_at = now_iso() if status == "delivered" else None
+        with self.db_lock:
+            self.db.execute(
+                """
+                UPDATE deliveries
+                SET status=?, attempts=attempts+1, delivered_at=COALESCE(?, delivered_at), last_error=?
+                WHERE delivery_id=?
+                """,
+                (status, delivered_at, error, delivery_id),
+            )
+            self.db.commit()
+            row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
+        if not row:
+            raise ValueError(f"Unknown delivery_id: {delivery_id}")
+        return self._delivery_dict(row)
+
     def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192) -> dict[str, Any]:
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be stdout or stderr")
@@ -501,8 +647,9 @@ async def job_start(
     env: dict[str, str] | None = None,
     timeout_seconds: int | None = None,
     notify_on: list[str] | None = None,
+    wake_targets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return await get_manager().start(command, cwd, name, env, timeout_seconds, notify_on)
+    return await get_manager().start(command, cwd, name, env, timeout_seconds, notify_on, wake_targets)
 
 
 @mcp.tool()
@@ -522,6 +669,19 @@ def job_list(status: list[str] | None = None, limit: int = 50) -> dict[str, Any]
 def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
     try:
         return get_manager().events(job_id, since_event_id, types, limit)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+
+@mcp.tool()
+def job_deliveries(job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
+    return get_manager().deliveries(job_id, status, limit)
+
+
+@mcp.tool()
+def job_mark_delivery(delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
+    try:
+        return get_manager().mark_delivery(delivery_id, status, error)
     except ValueError as exc:
         return tool_error(str(exc))
 

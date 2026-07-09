@@ -89,6 +89,37 @@ def test_checkpoint_progress_and_tail(tmp_path):
     run(main())
 
 
+def test_wake_target_enqueues_delivery(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'wake me'}), flush=True)"
+        started = await manager.start(
+            cmd(code),
+            wake_targets=[
+                {
+                    "type": "codex_thread",
+                    "thread_id": "thread_test",
+                    "events": ["checkpoint"],
+                }
+            ],
+        )
+        event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        deliveries = manager.deliveries(started["job_id"])["deliveries"]
+
+        assert len(deliveries) == 1
+        assert deliveries[0]["event_id"] == event["event"]["event_id"]
+        assert deliveries[0]["target_type"] == "codex_thread"
+        assert deliveries[0]["status"] == "pending"
+        assert deliveries[0]["payload"]["target"]["thread_id"] == "thread_test"
+        assert "wake me" in deliveries[0]["payload"]["prompt"]
+
+        marked = manager.mark_delivery(deliveries[0]["delivery_id"], "delivered")
+        assert marked["status"] == "delivered"
+        assert marked["attempts"] == 1
+
+    run(main())
+
+
 def test_restart_persists_completed_job(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
