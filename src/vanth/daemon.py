@@ -43,9 +43,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/health":
                 ok(self, {"ok": True})
+            elif parsed.path == "/doctor":
+                ok(self, get_manager().doctor())
+            elif parsed.path == "/view":
+                ok(
+                    self,
+                    get_manager().agent_view(
+                        query.get("thread_id", [None])[0],
+                        int(query.get("limit", ["50"])[0]),
+                    ),
+                )
             elif parsed.path == "/jobs":
                 statuses = query.get("status") or None
-                ok(self, get_manager().list(statuses, int(query.get("limit", ["50"])[0])))
+                ok(
+                    self,
+                    get_manager().list(
+                        statuses,
+                        int(query.get("limit", ["50"])[0]),
+                        query.get("thread_id", [None])[0],
+                    ),
+                )
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/status"):
                 ok(self, get_manager().status(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/events"):
@@ -65,6 +82,7 @@ class Handler(BaseHTTPRequestHandler):
                         parsed.path.split("/")[2],
                         query.get("stream", ["stdout"])[0],
                         int(query.get("max_bytes", ["8192"])[0]),
+                        int(query["offset"][0]) if "offset" in query else None,
                     ),
                 )
             elif parsed.path == "/deliveries":
@@ -94,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/mark"):
                 ok(self, get_manager().mark_delivery(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/retry"):
+                ok(self, get_manager().retry_delivery(parsed.path.split("/")[2]))
             else:
                 error(self, "Not found", 404)
         except ValueError as exc:

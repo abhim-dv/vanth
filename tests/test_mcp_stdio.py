@@ -54,7 +54,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                 async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
                     await session.initialize()
                     tools = {tool.name for tool in (await session.list_tools()).tools}
-                    assert {"job_start", "job_wait", "job_tail"} <= tools
+                    assert {"job_start", "job_wait", "job_tail", "job_view", "job_doctor", "job_retry_delivery"} <= tools
 
                     start = content(
                         await session.call_tool(
@@ -68,8 +68,11 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                                         "type": "codex_thread",
                                         "thread_id": "thread_test",
                                         "events": ["checkpoint"],
+                                        "auto_dispatch": False,
                                     }
                                 ],
+                                "origin_thread_id": "thread_origin",
+                                "tags": ["demo"],
                             },
                         )
                     )
@@ -95,14 +98,21 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                     )
                     tail = content(await session.call_tool("job_tail", {"job_id": start["job_id"]}))
                     deliveries = content(await session.call_tool("job_deliveries", {"job_id": start["job_id"]}))
+                    view = content(await session.call_tool("job_view", {"thread_id": "thread_test"}))
+                    doctor = content(await session.call_tool("job_doctor", {}))
 
                     assert progress["event"]["type"] == "progress"
                     assert progress["event"]["data"]["current"] == 1
                     assert progress["status"] == "running"
                     assert status["progress"]["current"] >= 1
+                    assert status["origin_thread_id"] == "thread_origin"
+                    assert status["wake_thread_id"] == "thread_test"
+                    assert status["tags"] == ["demo"]
                     assert waited["event"]["message"] == "demo checkpoint"
                     assert deliveries["deliveries"][0]["target_type"] == "codex_thread"
                     assert deliveries["deliveries"][0]["payload"]["target"]["thread_id"] == "thread_test"
+                    assert view["jobs"][0]["job_id"] == start["job_id"]
+                    assert "jobs" in doctor["tables"]
                     assert "AGENT_EVENT" in tail["content"]
         finally:
             daemon.terminate()

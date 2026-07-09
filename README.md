@@ -50,10 +50,16 @@ job_wait(job_id, filters=["progress", "checkpoint", "failed", "completed"])
 Typical tool flow:
 
 ```text
-job_start(command="uv run python examples\\long_job.py", notify_on=["progress", "checkpoint", "failed", "completed"])
+job_start(
+  command="uv run python examples\\long_job.py",
+  notify_on=["progress", "checkpoint", "failed", "completed"],
+  origin_thread_id="019f...",
+  tags=["training", "gpu"]
+)
 job_wait(job_id="...", filters=["progress", "checkpoint", "failed", "completed"], timeout_seconds=3600)
 job_status(job_id="...")
-job_tail(job_id="...", stream="stdout", max_bytes=8192)
+job_tail(job_id="...", stream="stdout", max_bytes=8192, offset=0)
+job_view(thread_id="019f...")
 ```
 
 Codex wake target flow:
@@ -113,3 +119,20 @@ Example target:
 ```
 
 The command receives the delivery payload as JSON on stdin. Successful exit marks the delivery `delivered`; failure marks it `failed`.
+
+Delivery failures can be retried:
+
+```text
+job_retry_delivery(delivery_id="del_...")
+```
+
+Agent-facing status:
+
+```text
+job_view(thread_id="019f...")
+job_doctor()
+```
+
+`job_view` returns compact job summaries sorted by attention priority, including progress, the latest event, thread linkage, tags, and delivery counts. `job_doctor` reports the daemon state directory, database tables, delivery counts, and Codex command availability.
+
+Jobs are launched through a detached runner process. If the MCP server or HTTP daemon restarts while a job is running, the job can continue and the new manager instance will keep waiting on durable SQLite events. If the runner PID is gone during recovery, the job is marked `orphaned`.

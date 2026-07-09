@@ -22,6 +22,19 @@ def run(coro):
     return asyncio.run(wrapper())
 
 
+def poll_delivery(manager: JobManager, job_id: str, status: str, timeout: float = 5):
+    deadline = time.monotonic() + timeout
+    delivery = None
+    while time.monotonic() < deadline:
+        deliveries = manager.deliveries(job_id)["deliveries"]
+        if deliveries:
+            delivery = deliveries[0]
+            if delivery["status"] == status:
+                return delivery
+        time.sleep(0.05)
+    return delivery
+
+
 def test_parse_valid_inline_event():
     event = parse_agent_event_line('AGENT_EVENT {"type":"checkpoint","message":"done","data":{"x":1}}')
     assert event == {"type": "checkpoint", "message": "done", "data": {"x": 1}}
@@ -87,6 +100,10 @@ def test_checkpoint_progress_and_tail(tmp_path):
         tail = manager.tail(started["job_id"], max_bytes=4)
         assert tail["truncated"]
         assert len(tail["content"].encode()) <= 4
+        first = manager.tail(started["job_id"], max_bytes=5, offset=0)
+        second = manager.tail(started["job_id"], max_bytes=20, offset=first["next_offset"])
+        assert first["next_offset"] > first["offset"]
+        assert second["offset"] == first["next_offset"]
 
     run(main())
 
@@ -164,13 +181,7 @@ for line in sys.stdin:
             ],
         )
         await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
-        deadline = time.monotonic() + 5
-        delivery = None
-        while time.monotonic() < deadline:
-            delivery = manager.deliveries(started["job_id"])["deliveries"][0]
-            if delivery["status"] != "pending":
-                break
-            time.sleep(0.05)
+        delivery = poll_delivery(manager, started["job_id"], "delivered")
 
         assert delivery is not None
         assert delivery["status"] == "delivered"
@@ -212,9 +223,79 @@ def test_local_command_delivery_dispatches_immediately(tmp_path):
         assert sink.exists()
         payload = json.loads(sink.read_text())
         assert payload["event"]["message"] == "dispatch me"
-        delivery = manager.deliveries(started["job_id"])["deliveries"][0]
+        delivery = poll_delivery(manager, started["job_id"], "delivered")
         assert delivery["status"] == "delivered"
         assert delivery["attempts"] == 1
+
+    run(main())
+
+
+def test_thread_association_agent_view_and_doctor(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path / "state")
+        started = await manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'needs review'}), flush=True)"),
+            name="reviewable",
+            origin_thread_id="thread_origin",
+            tags=["training", "gpu"],
+            wake_targets=[
+                {
+                    "type": "codex_thread",
+                    "thread_id": "thread_wake",
+                    "events": ["checkpoint"],
+                    "auto_dispatch": False,
+                }
+            ],
+        )
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        status = manager.status(started["job_id"])
+        listed = manager.list(thread_id="thread_origin")["jobs"]
+        view = manager.agent_view(thread_id="thread_wake")["jobs"]
+        doctor = manager.doctor()
+
+        assert status["origin_thread_id"] == "thread_origin"
+        assert status["wake_thread_id"] == "thread_wake"
+        assert status["tags"] == ["training", "gpu"]
+        assert listed[0]["job_id"] == started["job_id"]
+        assert view[0]["job_id"] == started["job_id"]
+        assert view[0]["delivery_counts"]["pending"] == 1
+        assert view[0]["priority"] >= 50
+        assert {"jobs", "events", "wake_targets", "deliveries", "delivery_attempts"} <= set(doctor["tables"])
+        assert doctor["home"] == str(tmp_path / "state")
+
+    run(main())
+
+
+def test_delivery_retry_records_attempts_and_succeeds(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path / "state")
+        marker = tmp_path / "ready"
+        sink = tmp_path / "delivery.json"
+        retry_command = [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "marker=Path(sys.argv[1]); sink=Path(sys.argv[2]); data=sys.stdin.read(); "
+                "sys.exit(7) if not marker.exists() else sink.write_text(data)"
+            ),
+            str(marker),
+            str(sink),
+        ]
+        started = await manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'retry me'}), flush=True)"),
+            wake_targets=[{"type": "local_command", "events": ["checkpoint"], "command": retry_command}],
+        )
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        failed = poll_delivery(manager, started["job_id"], "failed")
+        assert failed["attempts"] == 1
+
+        marker.write_text("ok", encoding="utf-8")
+        retried = manager.retry_delivery(failed["delivery_id"])
+        assert retried["status"] == "retrying"
+        delivered = poll_delivery(manager, started["job_id"], "delivered")
+        assert delivered["attempts"] == 2
+        assert json.loads(sink.read_text())["event"]["message"] == "retry me"
 
     run(main())
 
@@ -230,6 +311,22 @@ def test_restart_persists_completed_job(tmp_path):
         assert restarted.status(started["job_id"])["status"] == "completed"
         assert restarted.events(started["job_id"], types=["completed"])["events"][0]["event_id"] == completed["event"]["event_id"]
         assert "hello" in restarted.tail(started["job_id"])["content"]
+        restarted.close()
+
+    run(main())
+
+
+def test_running_runner_survives_manager_restart(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        started = await manager.start(cmd("import time; print('before', flush=True); time.sleep(.5); print('after', flush=True)"))
+        manager.close()
+
+        restarted = JobManager(tmp_path)
+        assert restarted.status(started["job_id"])["status"] in {"running", "completed"}
+        completed = await restarted.wait(started["job_id"], ["completed"], timeout_seconds=5)
+        assert completed["event"]["type"] == "completed"
+        assert "after" in restarted.tail(started["job_id"])["content"]
         restarted.close()
 
     run(main())
