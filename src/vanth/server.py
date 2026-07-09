@@ -15,6 +15,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .client import VanthClient
+
 EVENT_PREFIX = "AGENT_EVENT "
 DEFAULT_MAX_EVENT_BYTES = 65536
 
@@ -214,18 +216,22 @@ class JobManager:
             events_path = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))["events_path"]
             with Path(events_path).open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, separators=(",", ":")) + "\n")
-            self._enqueue_deliveries(event)
+            deliveries = self._enqueue_deliveries(event)
         with self._condition(job_id):
             self._condition(job_id).notify_all()
+        for delivery in deliveries:
+            threading.Thread(target=self._dispatch_delivery, args=(delivery,), daemon=True).start()
         return event
 
-    def _enqueue_deliveries(self, event: dict[str, Any]) -> None:
+    def _enqueue_deliveries(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+        deliveries = []
         targets = self.db.execute("SELECT * FROM wake_targets WHERE job_id=?", (event["job_id"],)).fetchall()
         for target in targets:
             events = json.loads(target["events_json"] or "[]")
             if events and event["type"] not in events:
                 continue
             payload = self._delivery_payload(event, target)
+            delivery_id = "del_" + uuid.uuid4().hex[:16]
             self.db.execute(
                 """
                 INSERT OR IGNORE INTO deliveries(
@@ -234,7 +240,7 @@ class JobManager:
                 VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
-                    "del_" + uuid.uuid4().hex[:16],
+                    delivery_id,
                     event["event_id"],
                     target["target_id"],
                     event["job_id"],
@@ -243,7 +249,34 @@ class JobManager:
                     now_iso(),
                 ),
             )
+            row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
+            if row:
+                deliveries.append(self._delivery_dict(row))
         self.db.commit()
+        return deliveries
+
+    def _dispatch_delivery(self, delivery: dict[str, Any]) -> None:
+        payload = delivery["payload"]
+        target = payload.get("target", {})
+        command = target.get("command")
+        if not command:
+            return
+        try:
+            proc = subprocess.run(
+                command,
+                input=json.dumps(payload),
+                text=True,
+                shell=isinstance(command, str),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=int(target.get("timeout_seconds", 30)),
+            )
+            if proc.returncode == 0:
+                self.mark_delivery(delivery["delivery_id"], "delivered")
+            else:
+                self.mark_delivery(delivery["delivery_id"], "failed", (proc.stderr or "").strip())
+        except Exception as exc:
+            self.mark_delivery(delivery["delivery_id"], "failed", str(exc))
 
     def _delivery_payload(self, event: dict[str, Any], target: sqlite3.Row) -> dict[str, Any]:
         config = json.loads(target["config_json"] or "{}")
@@ -624,15 +657,16 @@ class JobManager:
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
 
 
-manager: JobManager | None = None
+client: VanthClient | None = None
 mcp = FastMCP("vanth")
 
 
-def get_manager() -> JobManager:
-    global manager
-    if manager is None:
-        manager = JobManager()
-    return manager
+def get_client() -> VanthClient:
+    global client
+    if client is None:
+        client = VanthClient()
+        client.ensure()
+    return client
 
 
 def tool_error(message: str) -> dict[str, Any]:
@@ -649,49 +683,48 @@ async def job_start(
     notify_on: list[str] | None = None,
     wake_targets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return await get_manager().start(command, cwd, name, env, timeout_seconds, notify_on, wake_targets)
+    return get_client().post(
+        "/jobs",
+        {
+            "command": command,
+            "cwd": cwd,
+            "name": name,
+            "env": env,
+            "timeout_seconds": timeout_seconds,
+            "notify_on": notify_on,
+            "wake_targets": wake_targets,
+        },
+    )
 
 
 @mcp.tool()
 def job_status(job_id: str) -> dict[str, Any]:
-    try:
-        return get_manager().status(job_id)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    return get_client().get(f"/jobs/{job_id}/status")
 
 
 @mcp.tool()
 def job_list(status: list[str] | None = None, limit: int = 50) -> dict[str, Any]:
-    return get_manager().list(status, limit)
+    return get_client().get("/jobs", {"status": status, "limit": limit})
 
 
 @mcp.tool()
 def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
-    try:
-        return get_manager().events(job_id, since_event_id, types, limit)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    return get_client().get(f"/jobs/{job_id}/events", {"since_event_id": since_event_id, "types": types, "limit": limit})
 
 
 @mcp.tool()
 def job_deliveries(job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
-    return get_manager().deliveries(job_id, status, limit)
+    return get_client().get("/deliveries", {"job_id": job_id, "status": status, "limit": limit})
 
 
 @mcp.tool()
 def job_mark_delivery(delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
-    try:
-        return get_manager().mark_delivery(delivery_id, status, error)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    return get_client().post(f"/deliveries/{delivery_id}/mark", {"status": status, "error": error})
 
 
 @mcp.tool()
 def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192) -> dict[str, Any]:
-    try:
-        return get_manager().tail(job_id, stream, max_bytes)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    return get_client().get(f"/jobs/{job_id}/tail", {"stream": stream, "max_bytes": max_bytes})
 
 
 @mcp.tool()
@@ -701,18 +734,15 @@ def job_wait(
     since_event_id: str | None = None,
     timeout_seconds: int = 3600,
 ) -> dict[str, Any]:
-    try:
-        return get_manager().wait_sync(job_id, filters, since_event_id, timeout_seconds)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    return get_client().post(
+        f"/jobs/{job_id}/wait",
+        {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds},
+    )
 
 
 @mcp.tool()
 def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
-    try:
-        return get_manager().stop_sync(job_id, signal, kill_after_seconds)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    return get_client().post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after_seconds})
 
 
 def main() -> None:

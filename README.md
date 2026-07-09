@@ -10,6 +10,12 @@ uv sync
 uv run vanth
 ```
 
+`vanth` is the MCP interface. It talks to the local daemon, starting it when needed:
+
+```cmd
+uv run vanthd
+```
+
 MCP stdio config:
 
 ```json
@@ -76,3 +82,21 @@ uv run python examples\long_job.py
 ```
 
 V0 jobs run with stdin closed (`DEVNULL`). Interactive input and `job_send` are intentionally not supported yet.
+
+Daemon-side wake dispatch:
+
+```text
+event inserted -> delivery inserted -> local_command adapter runs immediately
+```
+
+Example target:
+
+```json
+{
+  "type": "local_command",
+  "events": ["checkpoint", "failed", "completed"],
+  "command": ["python", "deliver.py"]
+}
+```
+
+The command receives the delivery payload as JSON on stdin. Successful exit marks the delivery `delivered`; failure marks it `failed`.

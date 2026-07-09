@@ -15,6 +15,7 @@ dev = [
 
 [project.scripts]
 vanth = "vanth.server:main"
+vanthd = "vanth.daemon:main"
 
 [build-system]
 requires = ["hatchling"]

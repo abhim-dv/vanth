@@ -1,7 +1,9 @@
 import asyncio
+import json
 import sqlite3
 import subprocess
 import sys
+import time
 
 from vanth.server import JobManager, normalize_event_payload, now_iso, parse_agent_event_line
 
@@ -116,6 +118,42 @@ def test_wake_target_enqueues_delivery(tmp_path):
         marked = manager.mark_delivery(deliveries[0]["delivery_id"], "delivered")
         assert marked["status"] == "delivered"
         assert marked["attempts"] == 1
+
+    run(main())
+
+
+def test_local_command_delivery_dispatches_immediately(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path / "state")
+        sink = tmp_path / "delivery.json"
+        code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'dispatch me'}), flush=True)"
+        command = [
+            sys.executable,
+            "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read())",
+            str(sink),
+        ]
+        started = await manager.start(
+            cmd(code),
+            wake_targets=[
+                {
+                    "type": "local_command",
+                    "events": ["checkpoint"],
+                    "command": command,
+                }
+            ],
+        )
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not sink.exists():
+            time.sleep(0.05)
+
+        assert sink.exists()
+        payload = json.loads(sink.read_text())
+        assert payload["event"]["message"] == "dispatch me"
+        delivery = manager.deliveries(started["job_id"])["deliveries"][0]
+        assert delivery["status"] == "delivered"
+        assert delivery["attempts"] == 1
 
     run(main())
 
