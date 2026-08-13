@@ -77,20 +77,45 @@ not published. Publishing, tagging, and pushing still require explicit approval.
 
 ## Go port status
 
-Phase 0 is underway. The module is initialized at the repository root
-(`go.mod`, `go 1.25.0`), the Bubble Tea v2 / Lip Gloss v2 / ntcharts v2
-compile spike passed, and `cmd/vanth` supports `--version [--json]`.
-`internal/config` (home resolution) and `internal/state` (schema-v5 typed
-queries) are implemented and tested. The design-blocker cross-language
-conformance tests pass in both directions:
+Phase 1 (read-only terminal monitor) is implemented and committed (`9bf3e7f`).
+The module is at the repository root (`go.mod`, `go 1.25.0`), the Bubble Tea v2
+/ Lip Gloss v2 / ntcharts v2 compile spike passed, and `cmd/vanth` supports
+`--version [--json]` and `monitor`. The monitor is a W&B-LEET-style dashboard:
+a summary header (status counts, needs-attention triage, job/event totals,
+mode/refresh badges), a jobs sidebar (3-line blocks with progress bars), a
+key-metrics panel, per-plot bordered tracking charts, and an event-table lower
+pane by default. `internal/config` (home resolution) and `internal/state`
+(schema-v5 typed queries) are implemented and tested. The design-blocker
+cross-language conformance tests pass in both directions:
 
 - Go opens and reads the Python-created schema-v5 fixture
-  (`testdata/state/jobs.sqlite`, deterministic and checked in).
+  (`testdata/state/jobs.sqlite`, checked in).
 - Go writes rows that Python's `sqlite3` verifies
   (`scripts/verify_go_write.py`).
 
 The CI workflow runs `gofmt`, `go vet`, `go test`, `go build`, fixture
-regeneration + conformance, and the Python wheel smoke on Windows and Linux.
+regeneration + semantic check, and the Python wheel smoke on Windows and Linux.
+
+## Dogfood validation on this machine (done)
+
+The Python v1 is wired into opencode as a local MCP server
+(`~/.config/opencode/opencode.json`, `mcp.vanth`). Verified end to end:
+
+- opencode connects to `vanth` MCP and discovers all 14 tools
+  (`job_start`, `job_wait`, `job_tail`, `job_view`, `job_doctor`, ...).
+- A full agent-style loop succeeded: start job -> wait progress -> wait
+  checkpoint -> status -> tail -> view -> doctor -> delivery dispatch.
+- The durable home (`%USERPROFILE%\.vanth`) persisted the job and delivery
+  across a daemon restart (job `completed`, delivery `delivered`).
+- Real wake smokes passed: Codex app-server `initialize -> thread/resume ->
+  turn/start` against a live thread returned a real `inProgress`/completed
+  turn; OpenCode `opencode run --session <id>` resumed a live session and the
+  daemon delivery prompt embedded `delivery_id`.
+
+Remaining for a defensible local testing candidate: run the daemon as a
+start-at-login service on `%USERPROFILE%\.vanth` (deploy/vanthd.cmd) and do a
+longer real-agent soak (a job that runs for minutes and wakes the agent). The
+Go `monitor` reads the same home read-only and renders the dashboard.
 
 ## Deferred / out of v1 scope
 
