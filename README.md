@@ -206,11 +206,12 @@ for i, img in enumerate(images, 1):
 | Tool | Purpose |
 |---|---|
 | `job_start` | Launch a command as a detached job |
+| `job_rerun` | Re-launch a job with its original command/env/cwd/targets |
 | `job_wait` | Block until a matching event (or timeout) — the preferred way to await jobs |
-| `job_status` | One job's status, progress, last event, linkage, tags |
-| `job_list` | Recent jobs, filterable by `status` / `thread_id` |
+| `job_status` | One job's status, command, env, progress, last event, linkage, tags |
+| `job_list` | Recent jobs, filterable by `status` / `thread_id` / `name` / `tags` |
 | `job_view` | Agent-facing summaries sorted by attention priority |
-| `job_events` | Structured events for a job (paged by `since_event_id`) |
+| `job_events` | Structured events for a job (forward via `since_event_id`, or latest-first via `reverse`) |
 | `job_tail` | Bounded stdout/stderr log tail with byte offsets |
 | `job_deliveries` | Wake deliveries for a job, filterable by `status` |
 | `job_mark_delivery` | Manually set a delivery's status |
@@ -237,6 +238,47 @@ job_start(
 ```
 
 Returns `job_id`, `status`, `worker_pid`, and the log/event paths.
+
+### job_status — see what a job is running
+
+```text
+job_status(job_id="job_...")
+```
+
+Returns status, **command**, **cwd**, **env**, **timeout_seconds**, progress,
+last event, thread linkage, tags, and exit code. This is the fastest way for an
+agent to answer "what is this job doing?"
+
+### job_rerun — relaunch a failed job
+
+```text
+job_rerun(job_id="job_...")
+```
+
+Re-launches the job with its **original command, cwd, env, timeout, name, tags,
+origin thread, and wake targets** — a new `job_id` is returned. Use it to retry
+a failed download, flaky processing batch, or transient failure without
+reconstructing the request.
+
+### job_list — filter by name or tag
+
+```text
+job_list(status=["running"], name="train", tags=["gpu"], limit=20)
+```
+
+Filters: `status` (list), `thread_id`, `name` (substring), `tags` (must contain
+all listed tags).
+
+### job_events — forward or latest-first
+
+```text
+job_events(job_id="job_...", since_event_id="evt_...", limit=20)      # events after the cursor
+job_events(job_id="job_...", reverse=true, limit=20)                   # the 20 newest events, newest first
+```
+
+`reverse: true` returns the most recent events (newest first) — ideal for "what
+happened recently?" — and can be combined with `since_event_id` to page
+backward.
 
 ### job_wait — the heart of agent usage
 
@@ -424,6 +466,7 @@ Environment variables (defaults live in `src/vanth/server.py`,
   jobs.sqlite      durable jobs/events/deliveries/targets/attempts/tombstones
   token            bearer token (owner-only permissions)
   daemon.lock      single-daemon OS lock
+  daemon.json      discovery metadata (url, pid, started_at, schema) — written atomically, removed on graceful shutdown
   logs/            daemon.log + per-job runner/stdout/stderr logs
   events/          per-job JSONL event mirrors (monitor fallback source)
   specs/           per-job launch specs (removed once the runner starts)
@@ -472,10 +515,11 @@ Authenticated with `Authorization: Bearer <token>`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`) |
+| GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`, `name`, `tags`) |
 | POST | `/jobs` | Start a job |
-| GET | `/jobs/{id}/status` | Job status |
-| GET | `/jobs/{id}/events` | Events (`since_event_id`, `types`, `limit`) |
+| POST | `/jobs/{id}/rerun` | Rerun a job with its original configuration |
+| GET | `/jobs/{id}/status` | Job status (includes command/env/cwd) |
+| GET | `/jobs/{id}/events` | Events (`since_event_id`, `types`, `limit`, `reverse`) |
 | GET | `/jobs/{id}/tail` | Log tail (`stream`, `max_bytes`, `offset`) |
 | POST | `/jobs/{id}/wait` | Wait for an event |
 | POST | `/jobs/{id}/stop` | Stop a job |
@@ -515,7 +559,18 @@ Authenticated with `Authorization: Bearer <token>`.
    even across daemon restarts.
 9. **Clean up old state** with `job_cleanup(older_than_seconds=..., dry_run=false)`
    so the SQLite store and log files stay bounded.
-10. **A job survives the daemon.** The runner is detached; jobs continue across
+10. **Rerun failed jobs, don't rebuild them.** `job_rerun(job_id=...)` relaunches
+    with the original command, env, cwd, and wake targets — ideal for retrying a
+    transiently failed download or batch.
+11. **Ask "what is this job?" with `job_status`.** It now returns the command,
+    cwd, env, and timeout, so you can explain a job to a user without reading
+    logs.
+12. **Filter lists by name/tag.** `job_list(name="train", tags=["gpu"])` narrows a
+    growing job list without paging through everything.
+13. **Use `reverse=true` for "what happened recently."** `job_events(job_id, reverse=true, limit=20)`
+    returns the newest events first, and you can page further back with
+    `since_event_id` set to the oldest id you've seen.
+14. **A job survives the daemon.** The runner is detached; jobs continue across
     daemon/MCP restarts. If a runner is gone at recovery, the job is marked
     `orphaned` (never silently dropped).
 

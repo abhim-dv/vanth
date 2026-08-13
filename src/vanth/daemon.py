@@ -203,11 +203,16 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/view":
                 ok(self, get_manager().agent_view(query.get("thread_id", [None])[0], int(query.get("limit", ["50"])[0])))
             elif parsed.path == "/jobs":
-                ok(self, get_manager().list(query.get("status") or None, int(query.get("limit", ["50"])[0]), query.get("thread_id", [None])[0]))
+                ok(self, get_manager().list(query.get("status") or None, int(query.get("limit", ["50"])[0]),
+                                            query.get("thread_id", [None])[0],
+                                            query.get("name", [None])[0],
+                                            query.get("tags") or None))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/status"):
                 ok(self, get_manager().status(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/events"):
-                ok(self, get_manager().events(parsed.path.split("/")[2], query.get("since_event_id", [None])[0], query.get("types") or None, int(query.get("limit", ["20"])[0])))
+                ok(self, get_manager().events(parsed.path.split("/")[2], query.get("since_event_id", [None])[0],
+                                              query.get("types") or None, int(query.get("limit", ["20"])[0]),
+                                              query.get("reverse", ["false"])[0].lower() in {"1", "true", "yes"}))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/tail"):
                 ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None))
             elif parsed.path == "/deliveries":
@@ -257,6 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/jobs":
                 ok(self, asyncio.run(get_manager().start(**payload)))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/rerun"):
+                ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2])))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wait"):
                 ok(self, get_manager().wait_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/stop"):
@@ -303,6 +310,30 @@ def _configure_logging(home: Path) -> logging.Logger:
     return logger
 
 
+def write_daemon_metadata(home: Path, url: str) -> None:
+    """Atomically write daemon discovery metadata for clients and the monitor."""
+    from .migrations import LATEST_SCHEMA_VERSION
+
+    payload = {
+        "url": url,
+        "home": str(home),
+        "pid": os.getpid(),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "schema_version": LATEST_SCHEMA_VERSION,
+    }
+    path = home / "daemon.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def remove_daemon_metadata(home: Path) -> None:
+    try:
+        (home / "daemon.json").unlink()
+    except FileNotFoundError:
+        pass
+
+
 def main() -> None:
     host = os.environ.get("VANTH_DAEMON_HOST", "127.0.0.1")
     if not _loopback(host):
@@ -319,6 +350,8 @@ def main() -> None:
         raise SystemExit("another vanthd already owns this VANTH_HOME")
     httpd = TrackingHTTPServer((host, port), Handler)
     shutdown_event.clear()
+    daemon_url = f"http://{host}:{port}"
+    write_daemon_metadata(home, daemon_url)
 
     def stop(*_: Any) -> None:
         if shutdown_event.is_set():
@@ -347,6 +380,7 @@ def main() -> None:
         if manager is not None:
             manager.close()
         lock.release()
+        remove_daemon_metadata(home)
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)

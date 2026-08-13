@@ -14,7 +14,7 @@ import (
 const DefaultBusyTimeoutMS = 30000
 
 // SchemaVersion is the current schema version (matches migrations.py).
-const LatestSchemaVersion = 5
+const LatestSchemaVersion = 6
 
 // Open opens the database read-write and applies the shared connection policy.
 func Open(path string) (*sql.DB, error) {
@@ -67,6 +67,7 @@ type JobRow struct {
 	UpdatedAt     string
 	ExitCode      sql.NullInt64
 	TagsJSON      string
+	EnvJSON       string
 	StdoutPath    string
 	StderrPath    string
 	EventsPath    string
@@ -76,12 +77,12 @@ type JobRow struct {
 func Job(db *sql.DB, jobID string) (JobRow, error) {
 	row := db.QueryRow(`
 		SELECT job_id, name, command, status, pid, worker_pid, stop_requested_at,
-		       created_at, updated_at, exit_code, tags_json, stdout_path, stderr_path, events_path
+		       created_at, updated_at, exit_code, tags_json, env_json, stdout_path, stderr_path, events_path
 		FROM jobs WHERE job_id=?`, jobID)
 	var j JobRow
 	if err := row.Scan(&j.JobID, &j.Name, &j.Command, &j.Status, &j.Pid, &j.WorkerPid,
 		&j.StopRequested, &j.CreatedAt, &j.UpdatedAt, &j.ExitCode,
-		&j.TagsJSON, &j.StdoutPath, &j.StderrPath, &j.EventsPath); err != nil {
+		&j.TagsJSON, &j.EnvJSON, &j.StdoutPath, &j.StderrPath, &j.EventsPath); err != nil {
 		return JobRow{}, err
 	}
 	return j, nil

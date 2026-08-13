@@ -44,9 +44,16 @@ def ensure_auth_token(home: str | os.PathLike[str] | None = None) -> str:
 
 class VanthClient:
     def __init__(self, url: str | None = None, home: str | os.PathLike[str] | None = None) -> None:
-        self.url = (url or os.environ.get("VANTH_DAEMON_URL") or DEFAULT_DAEMON_URL).rstrip("/")
         self.home = canonical_home(home)
+        self.url = (url or os.environ.get("VANTH_DAEMON_URL") or self._discover_url() or DEFAULT_DAEMON_URL).rstrip("/")
         self.token = ensure_auth_token(self.home)
+
+    def _discover_url(self) -> str | None:
+        try:
+            payload = json.loads((self.home / "daemon.json").read_text(encoding="utf-8"))
+            return payload.get("url")
+        except (OSError, ValueError):
+            return None
 
     def _ready(self) -> bool:
         payload = self.get("/doctor")

@@ -710,8 +710,8 @@ class JobManager:
             self.db.execute(
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
-                  timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, stdout_path, stderr_path, events_path)
-                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, stdout_path, stderr_path, events_path)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -727,6 +727,7 @@ class JobManager:
                     origin_thread_id,
                     wake_thread_id,
                     json.dumps(tags or [], separators=(",", ":")),
+                    json.dumps(env or {}, separators=(",", ":")),
                     str(stdout_path),
                     str(stderr_path),
                     str(events_path),
@@ -764,6 +765,40 @@ class JobManager:
             "events_path": str(events_path),
             "message": "Job started",
         }
+
+    async def rerun(self, job_id: str) -> dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(None, self.rerun_sync, job_id)
+
+    def rerun_sync(self, job_id: str) -> dict[str, Any]:
+        self._ensure_open()
+        row = self._row(
+            "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
+            "tags_json, name FROM jobs WHERE job_id=?",
+            (job_id,),
+        )
+        if not row:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        targets = []
+        for target in self.db.execute("SELECT * FROM wake_targets WHERE job_id=?", (job_id,)).fetchall():
+            config = json.loads(target["config_json"] or "{}")
+            targets.append({
+                "type": target["type"],
+                "events": json.loads(target["events_json"] or "[]"),
+                **config,
+            })
+        tags = json.loads(row["tags_json"] or "[]")
+        notify_on = json.loads(row["notify_on"] or "[]")
+        return asyncio.run(self.start(
+            command=row["command"],
+            cwd=row["cwd"],
+            name=row["name"],
+            env=json.loads(row["env_json"] or "{}"),
+            timeout_seconds=row["timeout_seconds"],
+            notify_on=notify_on or None,
+            wake_targets=targets or None,
+            origin_thread_id=row["origin_thread_id"],
+            tags=tags or None,
+        ))
 
     def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
@@ -936,19 +971,30 @@ class JobManager:
             self._emit(job_id, status, data=data)
         self.processes.pop(job_id, None)
 
-    def _event_query(self, job_id: str, types: list[str] | None, since_event_id: str | None, limit: int) -> list[dict[str, Any]]:
-        since_seq = 0
+    def _event_query(self, job_id: str, types: list[str] | None, since_event_id: str | None, limit: int,
+                     reverse: bool = False) -> list[dict[str, Any]]:
+        since_seq = None
         if since_event_id:
             row = self._row("SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, since_event_id))
-            since_seq = int(row["seq"]) if row else 0
-        args: list[Any] = [job_id, since_seq]
-        where = "job_id=? AND seq>?"
+            since_seq = int(row["seq"]) if row else None
+        args: list[Any] = [job_id]
+        if reverse:
+            if since_seq is not None:
+                where = "job_id=? AND seq<?"
+                args.append(since_seq)
+            else:
+                where = "job_id=?"
+            order = "seq DESC"
+        else:
+            where = "job_id=? AND seq>?"
+            args.append(since_seq if since_seq is not None else 0)
+            order = "seq"
         if types:
             where += " AND type IN (%s)" % ",".join("?" for _ in types)
             args.extend(types)
         with self.db_lock:
             rows = self.db.execute(
-                f"SELECT * FROM events WHERE {where} ORDER BY seq LIMIT ?",
+                f"SELECT * FROM events WHERE {where} ORDER BY {order} LIMIT ?",
                 (*args, limit),
             ).fetchall()
         return [self._event_dict(row) for row in rows]
@@ -1023,12 +1069,16 @@ class JobManager:
         result = {
             "job_id": job_id,
             "status": row["status"],
+            "command": row["command"],
+            "cwd": row["cwd"],
+            "timeout_seconds": row["timeout_seconds"],
             "pid": row["pid"],
             "worker_pid": row["worker_pid"],
             "name": row["name"],
             "origin_thread_id": row["origin_thread_id"],
             "wake_thread_id": row["wake_thread_id"],
             "tags": json.loads(row["tags_json"] or "[]"),
+            "env": json.loads(row["env_json"] or "{}"),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "exit_code": row["exit_code"],
@@ -1037,7 +1087,8 @@ class JobManager:
         result["progress"] = ({**json.loads(progress["data_json"] or "{}"), "updated_at": progress["created_at"]} if progress else None)
         return result
 
-    def list(self, status: list[str] | None = None, limit: int = 50, thread_id: str | None = None) -> dict[str, Any]:
+    def list(self, status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
+             name: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
         self._ensure_open()
         validate_limit(limit, "limit")
         args: list[Any] = []
@@ -1048,6 +1099,12 @@ class JobManager:
         if thread_id:
             filters.append("(origin_thread_id=? OR wake_thread_id=?)")
             args.extend([thread_id, thread_id])
+        if name:
+            filters.append("name LIKE ?")
+            args.append(f"%{name}%")
+        for tag in tags or []:
+            filters.append("tags_json LIKE ?")
+            args.append(f'%"{tag}"%')
         where = "WHERE " + " AND ".join(filters) if filters else ""
         with self.db_lock:
             rows = self.db.execute(
@@ -1064,12 +1121,13 @@ class JobManager:
             jobs.append(item)
         return {"jobs": jobs}
 
-    def events(self, job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+    def events(self, job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20,
+               reverse: bool = False) -> dict[str, Any]:
         self._ensure_open()
         validate_limit(limit, "limit")
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
             raise ValueError(f"Unknown job_id: {job_id}")
-        return {"events": self._event_query(job_id, types, since_event_id, limit)}
+        return {"events": self._event_query(job_id, types, since_event_id, limit, reverse=reverse)}
 
     def deliveries(self, job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
         self._ensure_open()
@@ -1459,13 +1517,19 @@ async def job_start(
 
 
 @mcp.tool()
+def job_rerun(job_id: str) -> dict[str, Any]:
+    return get_client().post(f"/jobs/{job_id}/rerun")
+
+
+@mcp.tool()
 def job_status(job_id: str) -> dict[str, Any]:
     return get_client().get(f"/jobs/{job_id}/status")
 
 
 @mcp.tool()
-def job_list(status: list[str] | None = None, limit: int = 50, thread_id: str | None = None) -> dict[str, Any]:
-    return get_client().get("/jobs", {"status": status, "limit": limit, "thread_id": thread_id})
+def job_list(status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
+             name: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
+    return get_client().get("/jobs", {"status": status, "limit": limit, "thread_id": thread_id, "name": name, "tags": tags})
 
 
 @mcp.tool()
@@ -1474,8 +1538,9 @@ def job_view(thread_id: str | None = None, limit: int = 50) -> dict[str, Any]:
 
 
 @mcp.tool()
-def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
-    return get_client().get(f"/jobs/{job_id}/events", {"since_event_id": since_event_id, "types": types, "limit": limit})
+def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20,
+               reverse: bool = False) -> dict[str, Any]:
+    return get_client().get(f"/jobs/{job_id}/events", {"since_event_id": since_event_id, "types": types, "limit": limit, "reverse": reverse})
 
 
 @mcp.tool()

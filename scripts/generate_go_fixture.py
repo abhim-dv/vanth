@@ -32,7 +32,7 @@ def seed(db_path: Path) -> None:
               runner_heartbeat_at TEXT, stop_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
               started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
               notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
-              stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL
+              env_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL
             );
             CREATE TABLE events (
               event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -65,15 +65,15 @@ def seed(db_path: Path) -> None:
               tombstone_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, artifacts_json TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
-            PRAGMA user_version=5;
+            PRAGMA user_version=6;
             """
         )
         stamp = "2026-01-01T00:00:00Z"
         with db:
             db.execute(
                 "INSERT INTO jobs(job_id, name, command, status, pid, worker_pid, runner_heartbeat_at, "
-                "created_at, updated_at, started_at, ended_at, exit_code, tags_json, stdout_path, stderr_path, events_path) "
-                "VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, updated_at, started_at, ended_at, exit_code, tags_json, env_json, stdout_path, stderr_path, events_path) "
+                "VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "job_completed",
                     "conformance complete",
@@ -87,6 +87,7 @@ def seed(db_path: Path) -> None:
                     stamp,
                     0,
                     json.dumps(["fixture"]),
+                    json.dumps({"FIXTURE_ENV": "1"}),
                     "logs/job_completed.stdout.log",
                     "logs/job_completed.stderr.log",
                     "events/job_completed.jsonl",
@@ -94,8 +95,8 @@ def seed(db_path: Path) -> None:
             )
             db.execute(
                 "INSERT INTO jobs(job_id, name, command, status, pid, worker_pid, runner_heartbeat_at, "
-                "created_at, updated_at, started_at, tags_json, stdout_path, stderr_path, events_path) "
-                "VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, updated_at, started_at, tags_json, env_json, stdout_path, stderr_path, events_path) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "job_running",
                     "conformance running",
@@ -107,6 +108,7 @@ def seed(db_path: Path) -> None:
                     stamp,
                     stamp,
                     json.dumps(["live"]),
+                    json.dumps({"FIXTURE_ENV": "2"}),
                     "logs/job_running.stdout.log",
                     "logs/job_running.stderr.log",
                     "events/job_running.jsonl",

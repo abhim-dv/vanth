@@ -24,8 +24,8 @@ func TestGoOpensPythonSchemaV5Fixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 5 {
-		t.Fatalf("schema version = %d, want 5", version)
+	if version != LatestSchemaVersion {
+		t.Fatalf("schema version = %d, want LatestSchemaVersion", version)
 	}
 }
 
@@ -70,7 +70,7 @@ func TestGoOpenReadOnlyDoesNotWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 5 {
-		t.Fatalf("schema version = %d, want 5", version)
+	if version != LatestSchemaVersion {
+		t.Fatalf("schema version = %d, want LatestSchemaVersion", version)
 	}
 }

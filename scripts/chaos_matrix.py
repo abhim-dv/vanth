@@ -33,6 +33,7 @@ import http.client
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -422,9 +423,118 @@ class StateScenario(Scenario):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class AgentFeatureScenario(Scenario):
+    """Stress the v1.1 agent-facing features under load: rerun across many
+    failed jobs, status/env exposure, list name/tag filters, and reverse event
+    paging. Also verifies daemon discovery metadata appears and is removed."""
+
+    name = "agent"
+
+    def run(self) -> None:
+        home = Path(tempfile.mkdtemp(prefix="vanth-agent-"))
+        manager = JobManager(home)
+        try:
+            rerun_marker = home / "rerun_marker"
+            # A batch of jobs that fail once (marker absent) then succeed.
+            batch_code = (
+                "from pathlib import Path; import os,sys; "
+                "Path(os.environ['RERUN_MARK']).touch(); "
+                "print('AGENT_EVENT '+__import__('json').dumps({'type':'checkpoint'}), flush=True); "
+                "sys.exit(0)"
+            )
+            started = []
+            for index in range(10):
+                started.append(
+                    asyncio.run(
+                        manager.start(
+                            cmd(batch_code),
+                            name=f"agent-job-{index}",
+                            cwd=str(home),
+                            env={"RERUN_MARK": str(rerun_marker / str(index))},
+                            tags=["agent", "chaos"],
+                            wake_targets=[
+                                {"type": "local_command", "events": ["checkpoint"],
+                                 "command": [sys.executable, "-c", "import sys; sys.exit(0)"]}
+                            ],
+                        )
+                    )["job_id"]
+                )
+            for job_id in started:
+                wait_for(lambda job_id=job_id: manager.status(job_id)["status"] in {"completed", "failed"}, 30,
+                         f"job {job_id} terminal")
+
+            # status exposes command/env/cwd/tags for every job.
+            for job_id in started:
+                status = manager.status(job_id)
+                assert "AGENT_EVENT" in status["command"], job_id
+                assert status["tags"] == ["agent", "chaos"], (job_id, status["tags"])
+                assert status["cwd"] == str(home), job_id
+                assert "RERUN_MARK" in status["env"], job_id
+
+            # list filters by name and tag under load.
+            by_tag = manager.list(tags=["chaos"])["jobs"]
+            assert len(by_tag) == 10, len(by_tag)
+            by_name = manager.list(name="agent-job-3")["jobs"]
+            assert len(by_name) == 1, by_name
+
+            # reverse paging returns the newest events first.
+            reverse = manager.events(started[0], limit=3, reverse=True)["events"]
+            seqs = [e["seq"] for e in reverse]
+            assert seqs == sorted(seqs, reverse=True), seqs
+
+            # rerun all failed jobs and confirm the reruns inherit config.
+            reruns = []
+            for job_id in started:
+                status = manager.status(job_id)
+                if status["status"] == "failed":
+                    reruns.append(manager.rerun_sync(job_id)["job_id"])
+            for rerun_id in reruns:
+                wait_for(lambda rerun_id=rerun_id: manager.status(rerun_id)["status"] in {"completed", "failed"}, 30,
+                         f"rerun {rerun_id} terminal")
+                status = manager.status(rerun_id)
+                assert status["tags"] == ["agent", "chaos"], rerun_id
+                assert status["env"]["RERUN_MARK"].startswith(str(home)), rerun_id
+            print(f"  {len(started)} jobs: status/env, list filters, reverse paging, {len(reruns)} reruns verified")
+
+            # Daemon discovery metadata via a live daemon.
+            import socket as _socket
+            with _socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            daemon_home = home / "dynhome"
+            daemon_home.mkdir(parents=True, exist_ok=True)
+            daemon = subprocess.Popen(
+                [sys.executable, "-m", "vanth.daemon"],
+                env={**os.environ, "VANTH_HOME": str(daemon_home), "VANTH_DAEMON_PORT": str(port)},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            meta = daemon_home / "daemon.json"
+            try:
+                wait_for(lambda: meta.exists(), 15, "daemon.json write")
+                payload = json.loads(meta.read_text(encoding="utf-8"))
+                assert payload["url"] == f"http://127.0.0.1:{port}", payload
+                assert payload["home"] == str(daemon_home.resolve()), payload
+            finally:
+                if sys.platform == "win32":
+                    daemon.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    daemon.terminate()
+                try:
+                    daemon.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait(timeout=10)
+            wait_for(lambda: not meta.exists(), 5, "daemon.json removal")
+            print("  daemon discovery metadata written atomically and removed on graceful shutdown")
+        finally:
+            manager.close()
+            shutil.rmtree(home, ignore_errors=True)
+
+
 SCENARIOS = {
     scenario.name: scenario
-    for scenario in (BurstScenario, AdapterScenario, DaemonKillScenario, RunnerKillScenario, InputScenario, StateScenario)
+    for scenario in (BurstScenario, AdapterScenario, DaemonKillScenario, RunnerKillScenario, InputScenario, StateScenario, AgentFeatureScenario)
 }
 
 
