@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"math"
@@ -460,6 +461,19 @@ func (m Model) renderMetrics(r rect) string {
 		meta += fmt.Sprintf(" · exit %d", *job.ExitCode)
 	}
 	lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(meta), innerW))
+
+	// Run overview (W&B-style): notes, author@host, runtime, git branch.
+	if job.Notes != "" {
+		lines = append(lines, fillLine(lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b")).Render(truncate("notes: "+job.Notes, innerW)), innerW))
+	}
+	if overview := parseRunOverview(job.RunJSON); len(overview) > 0 {
+		for _, row := range overview {
+			if len(lines) >= contentH {
+				break
+			}
+			lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(truncate(row, innerW)), innerW))
+		}
+	}
 
 	if len(job.Tags) > 0 {
 		lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(truncate("tags "+strings.Join(job.Tags, ", "), innerW)), innerW))
@@ -1076,6 +1090,62 @@ func (m Model) centered(msg string) string {
 }
 
 // compactFmt renders a number with compact SI suffixes for quiet axes.
+// parseRunOverview renders the run-overview metadata (W&B overview tab) into a
+// compact list of display rows: author@host, runtime, git branch, hardware.
+func parseRunOverview(runJSON string) []string {
+	if runJSON == "" || runJSON == "null" {
+		return nil
+	}
+	var run map[string]any
+	if err := json.Unmarshal([]byte(runJSON), &run); err != nil {
+		return nil
+	}
+	var rows []string
+	author, _ := run["author"].(string)
+	host, _ := run["hostname"].(string)
+	if author != "" && host != "" {
+		rows = append(rows, fmt.Sprintf("%s@%s", author, host))
+	} else if host != "" {
+		rows = append(rows, host)
+	}
+	if git, ok := run["git"].(map[string]any); ok {
+		branch, _ := git["branch"].(string)
+		commit, _ := git["commit"].(string)
+		repo, _ := git["repository"].(string)
+		if branch != "" {
+			b := branch
+			if commit != "" && len(commit) >= 7 {
+				b += " @" + commit[:7]
+			}
+			if repo != "" {
+				b += " · " + shortRepo(repo)
+			}
+			rows = append(rows, b)
+		}
+	}
+	if cpu, ok := run["cpu_count"].(float64); ok && cpu > 0 {
+		gpus := ""
+		if g, ok := run["gpus"].([]any); ok && len(g) > 0 {
+			if first, ok := g[0].(map[string]any); ok {
+				if name, ok := first["name"].(string); ok && name != "" {
+					gpus = " · " + name
+				}
+			}
+		}
+		rows = append(rows, fmt.Sprintf("%.0f cpu%s", cpu, gpus))
+	}
+	return rows
+}
+
+// shortRepo trims git remote URLs to a readable name.
+func shortRepo(repo string) string {
+	repo = strings.TrimSuffix(repo, ".git")
+	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		return repo[i+1:]
+	}
+	return repo
+}
+
 func compactFmt(v float64) string {
 	if v == math.Trunc(v) && math.Abs(v) < 1e15 {
 		return strconv.FormatInt(int64(v), 10)

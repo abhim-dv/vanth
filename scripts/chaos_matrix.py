@@ -470,6 +470,9 @@ class AgentFeatureScenario(Scenario):
                 assert status["tags"] == ["agent", "chaos"], (job_id, status["tags"])
                 assert status["cwd"] == str(home), job_id
                 assert "RERUN_MARK" in status["env"], job_id
+                assert status["run"].get("hostname"), job_id
+                assert status["run"].get("os"), job_id
+                assert status["runtime_seconds"] is not None, job_id
 
             # list filters by name and tag under load.
             by_tag = manager.list(tags=["chaos"])["jobs"]

@@ -24,6 +24,7 @@ from .codex_bridge import send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import send_delivery_to_opencode
 from .paths import canonical_home
+from .runtime_info import capture_run_metadata, serialize_run_metadata
 
 EVENT_PREFIX = "AGENT_EVENT "
 DEFAULT_MAX_EVENT_BYTES = 65536
@@ -35,6 +36,22 @@ TERMINAL_STATUSES = {"completed", "failed", "timeout", "cancelled", "orphaned"}
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_seconds(started_at: str | None, ended_at: str | None) -> float | None:
+    start = _parse_iso(started_at) if started_at else None
+    if start is None:
+        return None
+    end = _parse_iso(ended_at) if ended_at else datetime.now(timezone.utc)
+    seconds = (end - start).total_seconds()
+    return max(0.0, seconds)
 
 
 def parse_agent_event_line(line: str) -> dict[str, Any] | None:
@@ -669,6 +686,7 @@ class JobManager:
         wake_targets: list[dict[str, Any]] | None = None,
         origin_thread_id: str | None = None,
         tags: list[str] | None = None,
+        notes: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         validate_wake_targets(wake_targets)
@@ -706,12 +724,14 @@ class JobManager:
             ),
             encoding="utf-8",
         )
+        run_info = capture_run_metadata(cwd=cwd, notes=notes)
         with self.db_lock:
             self.db.execute(
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
-                  timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, stdout_path, stderr_path, events_path)
-                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
+                  stdout_path, stderr_path, events_path)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -728,6 +748,8 @@ class JobManager:
                     wake_thread_id,
                     json.dumps(tags or [], separators=(",", ":")),
                     json.dumps(env or {}, separators=(",", ":")),
+                    notes,
+                    serialize_run_metadata(run_info),
                     str(stdout_path),
                     str(stderr_path),
                     str(events_path),
@@ -773,7 +795,7 @@ class JobManager:
         self._ensure_open()
         row = self._row(
             "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
-            "tags_json, name FROM jobs WHERE job_id=?",
+            "tags_json, name, notes FROM jobs WHERE job_id=?",
             (job_id,),
         )
         if not row:
@@ -798,6 +820,7 @@ class JobManager:
             wake_targets=targets or None,
             origin_thread_id=row["origin_thread_id"],
             tags=tags or None,
+            notes=row["notes"],
         ))
 
     def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
@@ -1079,6 +1102,9 @@ class JobManager:
             "wake_thread_id": row["wake_thread_id"],
             "tags": json.loads(row["tags_json"] or "[]"),
             "env": json.loads(row["env_json"] or "{}"),
+            "notes": row["notes"],
+            "run": json.loads(row["run_json"] or "{}"),
+            "runtime_seconds": _runtime_seconds(row["started_at"], row["ended_at"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "exit_code": row["exit_code"],
@@ -1499,6 +1525,7 @@ async def job_start(
     wake_targets: list[dict[str, Any]] | None = None,
     origin_thread_id: str | None = None,
     tags: list[str] | None = None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     return get_client().post(
         "/jobs",
@@ -1512,6 +1539,7 @@ async def job_start(
             "wake_targets": wake_targets,
             "origin_thread_id": origin_thread_id,
             "tags": tags,
+            "notes": notes,
         },
     )
 

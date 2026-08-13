@@ -2,6 +2,28 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased
+
+### Agent-facing features (schema v7)
+
+- `job_status` / `job_view` now return the job's `command`, `cwd`, `env`,
+  `timeout_seconds`, `notes`, a `run` overview (author, hostname, OS, Python
+  version, CPU/GPU, git repo/branch/commit), and `runtime_seconds` — so an
+  agent can answer "what is this job?" without reading logs.
+- `job_list` accepts `name` (substring) and `tags` filters.
+- `job_events` accepts `reverse=true` to return the newest events first, with
+  backward paging via `since_event_id`.
+- `job_rerun(job_id)` relaunches a job with its original command, cwd, env,
+  timeout, name, tags, notes, origin thread, and wake targets.
+- The daemon writes `daemon.json` discovery metadata atomically on start
+  (url, pid, started_at, schema) and removes it on graceful shutdown; the MCP
+  client discovers the daemon URL from it.
+- `vanth.agent_logger` routes loguru records into structured `AGENT_EVENT`
+  log events (timestamped, level-aware, with context) persisted in the event
+  table.
+- SQLite schema bumped to v7 (adds `notes`, `run_json` columns); existing homes
+  migrate with a backup. Go fixture/conformance updated to v7.
+
 ## 1.0.0 - unreleased
 
 First supported v1 release. Vanth is a localhost background-job daemon and MCP

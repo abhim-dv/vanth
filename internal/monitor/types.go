@@ -54,6 +54,8 @@ type JobSummary struct {
 	EventsPath string
 	Tags       []string
 	EventCount int64
+	Notes      string
+	RunJSON    string
 }
 
 // DisplayName returns the human-friendly job label.

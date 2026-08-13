@@ -199,6 +199,26 @@ for i, img in enumerate(images, 1):
     progress(i, len(images), unit="images", stage="process", message=img.name)
 ```
 
+### Timestamped, leveled logging with `loguru`
+
+Vanth ships a loguru wrapper that routes every record into a structured
+`AGENT_EVENT` log line, so logs appear as timestamped, level-aware events in
+the event table (with the level badge and exact timestamps) instead of bare
+text:
+
+```python
+from vanth.agent_logger import logger, log_with_context
+
+logger.info("training started", lr=8e-5, batch_size=8)     # event type "log", level info
+logger.warning("low disk", free_gb=2.5)
+log_with_context("error", "failed to load checkpoint", path="best.pt")
+```
+
+Each call emits `AGENT_EVENT {"type":"log","level":"info","message":"...","data":{...}}`
+which the daemon persists as a durable event. `data` carries extra context. The
+monitor shows these in the exact event table alongside `metric`/`progress`
+events.
+
 ---
 
 ## Tool reference (all 14 MCP tools)
@@ -245,9 +265,14 @@ Returns `job_id`, `status`, `worker_pid`, and the log/event paths.
 job_status(job_id="job_...")
 ```
 
-Returns status, **command**, **cwd**, **env**, **timeout_seconds**, progress,
-last event, thread linkage, tags, and exit code. This is the fastest way for an
-agent to answer "what is this job doing?"
+Returns status, **command**, **cwd**, **env**, **timeout_seconds**, **notes**,
+**run** (author, hostname, OS, Python version, CPU/GPU, git repo/branch/commit),
+**runtime_seconds**, progress, last event, thread linkage, tags, and exit code.
+This is the fastest way for an agent to answer "what is this job doing?" — and
+mirrors the run-overview you'd see for a run in W&B.
+
+Pass `notes="..."` to `job_start` to annotate a run ("what makes this run
+special?"), which is preserved on `job_rerun` and shown in the monitor.
 
 ### job_rerun — relaunch a failed job
 
@@ -463,7 +488,7 @@ Environment variables (defaults live in `src/vanth/server.py`,
 
 ```
 ~/.vanth/
-  jobs.sqlite      durable jobs/events/deliveries/targets/attempts/tombstones
+  jobs.sqlite      durable jobs (incl. env, notes, run-overview) / events / deliveries / targets / attempts / tombstones
   token            bearer token (owner-only permissions)
   daemon.lock      single-daemon OS lock
   daemon.json      discovery metadata (url, pid, started_at, schema) — written atomically, removed on graceful shutdown

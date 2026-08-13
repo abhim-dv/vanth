@@ -179,3 +179,55 @@ def test_rerun_preserves_wake_targets_and_origin(tmp_path):
         assert status["wake_thread_id"] == "thread_wake"
     finally:
         manager.close()
+
+
+def test_run_overview_metadata_captured_at_start(tmp_path):
+    import os
+    import platform
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = start_job(
+            manager, "print('run')", name="run overview",
+            cwd=str(tmp_path), notes="this run is special",
+            env={"MODE": "probe"}, tags=["sav-transfer"],
+        )
+        wait_event(manager, job_id, "completed")
+        status = manager.status(job_id)
+        run = status["run"]
+        assert status["notes"] == "this run is special"
+        assert run["hostname"] == platform.node()
+        assert run["os"] == platform.system()
+        assert run["python_version"] == platform.python_version()
+        assert run["cwd"] == str(tmp_path)
+        assert run["author"] is not None
+        assert status["runtime_seconds"] is not None and status["runtime_seconds"] >= 0
+    finally:
+        manager.close()
+
+
+def test_rerun_preserves_notes(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = start_job(manager, "print('x')", name="noted", notes="keep this note")
+        wait_event(manager, job_id, "completed")
+        reran = manager.rerun_sync(job_id)
+        assert manager.status(reran["job_id"])["notes"] == "keep this note"
+    finally:
+        manager.close()
+
+
+def test_runtime_seconds_increases_for_running_job(tmp_path):
+    import time as _time
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = start_job(manager, "import time; time.sleep(1.2)")
+        wait_event(manager, job_id, "started")
+        first = manager.status(job_id)["runtime_seconds"]
+        _time.sleep(0.5)
+        second = manager.status(job_id)["runtime_seconds"]
+        assert second >= first
+        wait_event(manager, job_id, "completed")
+        done = manager.status(job_id)["runtime_seconds"]
+        assert done >= second
+    finally:
+        manager.close()

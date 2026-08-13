@@ -32,7 +32,7 @@ def test_daemon_writes_and_removes_discovery_metadata(tmp_path):
         assert payload["url"] == f"http://127.0.0.1:{port}"
         assert payload["home"] == str(tmp_path.resolve())
         assert isinstance(payload["pid"], int) and payload["pid"] > 0
-        assert payload["schema_version"] == 6
+        assert payload["schema_version"] == 7
         assert payload["started_at"]
     finally:
         if sys.platform == "win32":
