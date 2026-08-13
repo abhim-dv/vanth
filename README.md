@@ -2,26 +2,119 @@
 
 Event-driven background jobs for agents.
 
-Vanth is a supported v1 localhost background-job daemon and MCP interface. It
-manages one state root per user, keeps durable SQLite state across restarts,
-and wakes Codex or OpenCode sessions when a job needs attention. Remote access,
-multi-user tenancy, and interactive stdin are out of scope.
+Vanth is a localhost background-job daemon with a Model Context Protocol (MCP)
+interface. It runs detached, non-interactive shell commands; captures their
+output durably; parses optional `AGENT_EVENT` structured events into progress
+bars, metric series, and checkpoints; and can wake a Codex or OpenCode session
+when a job needs attention. It is built for one trusted user on one machine.
+
+- **Any command**: downloads, image/audio processing, ETL, ML training — if it
+  runs in a shell, Vanth can run it detached and track it.
+- **Durable**: jobs and events live in SQLite (`WAL`, busy-timeout) and survive
+  daemon, MCP, and machine restarts.
+- **Event-first**: agents `job_wait` for meaningful events instead of polling
+  logs.
+- **Wake-on-attention**: durable at-least-once deliveries resume a Codex thread
+  or OpenCode session when a job needs a human or agent.
+- **Terminal dashboard**: the native Go `monitor` renders a live
+  W&B-LEET-style dashboard of jobs, metrics, and plots.
+
+Out of scope for v1: remote network access, TLS, multi-user tenancy/RBAC,
+quotas, interactive stdin, and a web UI.
+
+---
+
+## Quick start
 
 ```cmd
+git clone <repo> && cd vanth
 uv sync
 ```
 
-```cmd
-uv run vanth
-```
-
-`vanth` is the MCP interface. It talks to the authenticated local daemon, starting it when needed:
+Start the daemon (keep this terminal open):
 
 ```cmd
 uv run vanthd
 ```
 
-MCP stdio config:
+In a second terminal, start a tracked job through the MCP server:
+
+```cmd
+uv run vanth
+```
+
+or use the tools directly from an MCP client (see [MCP integration](#mcp-integration)).
+
+Verify everything is healthy:
+
+```text
+job_doctor()
+```
+
+---
+
+## How it works
+
+```
+MCP client / HTTP client
+        |
+        v
+   vanthd (localhost HTTP daemon, bearer-token auth)
+        |                 |                    |
+        |                 |                    +---> wake adapters
+        |                 |                          (local_command / codex_thread / opencode_thread)
+        |                 |
+        |                 +----> jobs.sqlite (durable source of truth)
+        |
+        +----> vanth.runner (detached worker process)
+                    |
+                    +----> your command (own process group)
+                              |
+                              +----> stdout/stderr -> logs/ + AGENT_EVENT parsing
+```
+
+Ownership rules:
+
+- the **runner** owns the real command, its timeout, and stream draining;
+- the **daemon** owns maintenance, delivery dispatch, API requests, and recovery;
+- **SQLite is the source of truth** across process restarts;
+- the **MCP and HTTP clients** never need to stay alive for jobs to continue.
+
+A job is not considered terminal until both output streams have reached EOF and
+all structured events have been persisted.
+
+---
+
+## Installing the MCP server
+
+`vanth` is the MCP stdio server. It talks to the daemon, starting it
+automatically on first use if it is not already running.
+
+### opencode
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vanth": {
+      "type": "local",
+      "command": ["uv", "run", "--directory", "F:\\git\\vanth", "vanth"],
+      "enabled": true,
+      "timeout": 15000
+    }
+  }
+}
+```
+
+Verify the connection and tools:
+
+```cmd
+opencode mcp list
+```
+
+### Claude-style MCP clients (`mcpServers`)
 
 ```json
 {
@@ -29,108 +122,156 @@ MCP stdio config:
     "vanth": {
       "command": "uv",
       "args": ["--directory", "F:/git/vanth", "run", "vanth"],
-      "env": {
-        "VANTH_HOME": "F:/git/vanth/.vanth"
-      }
+      "env": { "VANTH_HOME": "C:/Users/you/.vanth" }
     }
   }
 }
 ```
 
-Jobs can emit events on stdout or stderr:
+### Configuring the daemon home
+
+Both the MCP server and the daemon resolve the same state root from `VANTH_HOME`
+(default `%USERPROFILE%\.vanth` on Windows, `~/.vanth` on Unix; `AGENT_BG_HOME`
+is accepted as an alias). If both are set they must resolve to the same
+directory.
+
+---
+
+## Instrumenting jobs with `agent_event`
+
+Any Python script can emit structured events to stdout (or stderr) that Vanth
+parses and the monitor charts. This is optional — plain scripts still run and
+log — but it is what turns a job into a first-class tracked object.
 
 ```python
-from vanth.agent_events import agent_event
+from vanth.agent_events import agent_event, progress
 
-agent_event("progress", "10/100", current=10, total=100, unit="epoch")
+# A checkpoint: something meaningful happened.
 agent_event("checkpoint", "epoch complete", epoch=10, val_loss=0.42)
+
+# A progress update: drives the progress bar and progress.* plots.
+progress(10, 100, unit="epoch", stage="train", message="10/100 epochs")
+
+# Arbitrary scalar metrics: become their own line plots.
+agent_event("metric", _step=10, loss=0.42, acc=0.88, mbps=12.4)
 ```
 
-Agents should wait for meaningful events instead of polling logs:
+Notes:
 
-```text
-job_wait(job_id, filters=["progress", "checkpoint", "failed", "completed"])
+- the helper prints `AGENT_EVENT {json}` with `flush=True` (flush matters);
+- `progress(current, total, unit=..., stage=...)` computes `percent` for you;
+- `metric` payloads: numeric fields become series; `_step` (if present and
+  numeric) is the x-axis, otherwise the event sequence number is used; keys
+  starting with `_` other than `_step` are ignored; booleans are not metrics;
+  NaN/Infinity/null values are skipped and counted in the monitor's warning
+  badge;
+- any other field (e.g. `file`, `stage`, `phase`) is preserved and visible in
+  the exact event table.
+
+### Example: a tracked downloader
+
+```python
+# downloader.py
+import os
+from vanth.agent_events import agent_event, progress
+
+files = ["a.bin", "b.bin", "c.bin"]
+total = sum(os.path.getsize(f) for f in files)
+done = 0
+
+for f in files:
+    agent_event("checkpoint", f"starting {f}", file=f)
+    # ... download f ...
+    done += os.path.getsize(f)
+    progress(done, total, unit="bytes", stage="download",
+             message=f"{done}/{total} bytes")
 ```
 
-Typical tool flow:
+### Example: an image-processing batch
+
+```python
+from vanth.agent_events import agent_event, progress
+
+images = list(find_images("input/"))
+for i, img in enumerate(images, 1):
+    out = process(img)                    # resize, denoise, ...
+    agent_event("metric", _step=i, sharpness=out.sharpness, size_mb=out.size_mb)
+    progress(i, len(images), unit="images", stage="process", message=img.name)
+```
+
+---
+
+## Tool reference (all 14 MCP tools)
+
+| Tool | Purpose |
+|---|---|
+| `job_start` | Launch a command as a detached job |
+| `job_wait` | Block until a matching event (or timeout) — the preferred way to await jobs |
+| `job_status` | One job's status, progress, last event, linkage, tags |
+| `job_list` | Recent jobs, filterable by `status` / `thread_id` |
+| `job_view` | Agent-facing summaries sorted by attention priority |
+| `job_events` | Structured events for a job (paged by `since_event_id`) |
+| `job_tail` | Bounded stdout/stderr log tail with byte offsets |
+| `job_deliveries` | Wake deliveries for a job, filterable by `status` |
+| `job_mark_delivery` | Manually set a delivery's status |
+| `job_retry_delivery` | Requeue a failed delivery for dispatch |
+| `job_delivery_attempts` | Attempt/lease history for one delivery |
+| `job_stop` | Stop a running job (terminate process tree) |
+| `job_doctor` | Daemon health, schema, tables, binary availability |
+| `job_cleanup` | Dry-run or real removal of old terminal jobs |
+
+### job_start
 
 ```text
 job_start(
   command="uv run python examples\\long_job.py",
-  notify_on=["progress", "checkpoint", "failed", "completed"],
-  origin_thread_id="019f...",
-  tags=["training", "gpu"]
-)
-job_wait(job_id="...", filters=["progress", "checkpoint", "failed", "completed"], timeout_seconds=3600)
-job_status(job_id="...")
-job_tail(job_id="...", stream="stdout", max_bytes=8192, offset=0)
-job_view(thread_id="019f...")
-```
-
-Codex wake target flow:
-
-```text
-job_start(
-  command="uv run python examples\\long_job.py",
-  wake_targets=[
-    {
-      "type": "codex_thread",
-      "thread_id": "019f...",
-      "events": ["checkpoint", "failed", "completed"]
-    }
-  ]
+  name="training run",
+  cwd="F:\\git\\project",            # optional
+  env={"CUDA_VISIBLE_DEVICES": "0"}, # optional
+  timeout_seconds=3600,              # optional; None = no timeout
+  notify_on=["progress","checkpoint","failed","completed"],
+  origin_thread_id="019f...",        # the agent thread that launched it
+  tags=["training","gpu"],           # optional
+  wake_targets=[...]                 # optional, see below
 )
 ```
 
-For `codex_thread` targets, the daemon calls Codex's local app-server over stdio:
+Returns `job_id`, `status`, `worker_pid`, and the log/event paths.
+
+### job_wait — the heart of agent usage
 
 ```text
-initialize -> thread/resume -> turn/start
+job_wait(job_id="job_...", filters=["checkpoint","failed","completed"], timeout_seconds=3600)
 ```
 
-Use `auto_dispatch: false` if an agent should inspect pending deliveries manually. Use `codex_command` to point at a non-default Codex binary.
+- waits for the **first event matching any filter**, returning it with the
+  current status;
+- pass `since_event_id` to wait only for events newer than one you already saw;
+- on timeout returns `result: "timeout"`; on daemon shutdown returns
+  `result: "shutdown"`.
 
-```json
-{
-  "type": "codex_thread",
-  "thread_id": "019f...",
-  "events": ["checkpoint"],
-  "codex_command": ["C:\\codex\\codex.exe"]
-}
-```
-
-OpenCode wake targets use the same shape and resume the requested session with
-`opencode run --session`:
-
-```json
-{
-  "type": "opencode_thread",
-  "thread_id": "ses_...",
-  "events": ["checkpoint", "failed", "completed"],
-  "cwd": "F:\\git\\project"
-}
-```
-
-Use `opencode_command` to override the binary and `attach` to submit through an
-existing `opencode serve` instance. `auto_dispatch: false` leaves deliveries
-pending for manual inspection, just like `codex_thread`. Increase
-`timeout_seconds` when an OpenCode turn may take longer than the 30-second default.
-
-Example job:
-
-```cmd
-uv run python examples\long_job.py
-```
-
-Jobs run with stdin closed (`DEVNULL`). Interactive input and `job_send` are intentionally not supported.
-
-Daemon-side wake dispatch:
+### job_view — what to show the user
 
 ```text
-event inserted -> delivery inserted -> local_command adapter runs immediately
+job_view(thread_id="019f...", limit=20)
 ```
 
-Example target:
+Returns compact summaries sorted by attention priority: running and failed jobs
+first, then jobs with pending/failed deliveries, then everything else. Each
+entry includes status, progress, the latest event, thread linkage, tags, and
+delivery counts.
+
+---
+
+## Wake targets (wake an agent when a job needs attention)
+
+When a job emits a matching event, the daemon creates a durable delivery and
+dispatches it through the adapter. Delivery is **at-least-once**; every payload
+carries a `delivery_id` for deduplication.
+
+### local_command
+
+Runs an arbitrary command, passing the delivery payload as JSON on stdin:
 
 ```json
 {
@@ -140,71 +281,298 @@ Example target:
 }
 ```
 
-The command receives the delivery payload as JSON on stdin. Successful exit marks the delivery `delivered`; failure marks it `failed`.
+Exit 0 marks the delivery `delivered`; any other exit marks it `failed`.
 
-Delivery failures can be retried:
+### codex_thread
 
-```text
-job_retry_delivery(delivery_id="del_...")
+Resumes a Codex thread through the local app-server:
+
+```json
+{
+  "type": "codex_thread",
+  "thread_id": "019f...",
+  "events": ["checkpoint", "failed", "completed"],
+  "codex_command": ["C:\\codex\\codex.exe"]
+}
 ```
 
-Agent-facing status:
+Protocol: `initialize -> thread/resume -> turn/start`.
+
+### opencode_thread
+
+Resumes an OpenCode session:
+
+```json
+{
+  "type": "opencode_thread",
+  "thread_id": "ses_...",
+  "events": ["checkpoint", "failed", "completed"],
+  "cwd": "F:\\git\\project",
+  "opencode_command": ["opencode"],     # override the binary
+  "attach": "http://127.0.0.1:4096",    # submit via an opencode serve instance
+  "timeout_seconds": 120
+}
+```
+
+The default OpenCode turn timeout is 30 seconds; raise it for long turns.
+
+### Shared delivery options
+
+```json
+{
+  "type": "codex_thread",
+  "thread_id": "019f...",
+  "events": ["checkpoint"],
+  "auto_dispatch": false,      // leave the delivery pending for manual inspection
+  "max_attempts": 3,           // default 1
+  "retry_delay_seconds": 5,    // default 5
+  "timeout_seconds": 30        // adapter timeout; also sizes the delivery lease
+}
+```
+
+With `auto_dispatch: false`, deliveries stay `pending` until an agent either
+dispatches them manually or changes the target.
+
+### Delivery operations
 
 ```text
-job_view(thread_id="019f...")
+job_deliveries(job_id="job_...")
+job_delivery_attempts(delivery_id="del_...")
+job_retry_delivery(delivery_id="del_...")     # requeue a failed delivery
+job_mark_delivery(delivery_id="del_...", status="delivered")
+```
+
+Attempt history records the claim token, start/end times, status, and whether
+the attempt was reclaimed after an expired lease. If the daemon crashes after an
+adapter accepts a wake but before Vanth records success, the delivery is
+reclaimed and retried — surfaced as a `reclaimed` attempt rather than claimed as
+exactly-once delivery.
+
+---
+
+## Running the daemon
+
+Foreground (for development or diagnosis):
+
+```cmd
+uv run vanthd
+```
+
+Start-at-login templates are in `deploy/`:
+
+- `deploy/vanthd.cmd` — Windows Task Scheduler action;
+- `deploy/vanthd.service` — Unix systemd user service.
+
+Enable only one daemon per `VANTH_HOME`. A second daemon for the same home
+exits immediately (OS-level lock). The daemon binds only to loopback
+(`127.0.0.1` / `::1` / `localhost`); a non-loopback `VANTH_DAEMON_HOST` is
+rejected.
+
+### The Go terminal monitor
+
+The native Go dashboard reads the same home **read-only** and renders live
+plots, progress bars, the exact event table, and log tails:
+
+```cmd
+set VANTH_HOME=%USERPROFILE%\.vanth
+go build -o bin\vanth.exe ./cmd\vanth
+bin\vanth.exe monitor
+```
+
+Keys: `up/down` or `j/k` select jobs · `enter` pins a job's series · `e` event
+table · `l` log tail · `+`/`-` zoom a chart · `[`/`]` pan · `t` back to live
+tail · `?` help · `q` or `Ctrl+C` quit.
+
+---
+
+## Configuration reference
+
+Environment variables (defaults live in `src/vanth/server.py`,
+`src/vanth/daemon.py`, `src/vanth/migrations.py`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VANTH_HOME` | `~/.vanth` | State root (alias: `AGENT_BG_HOME`) |
+| `VANTH_DAEMON_URL` | `http://127.0.0.1:8765` | Where clients reach the daemon |
+| `VANTH_DAEMON_HOST` | `127.0.0.1` | Bind address (loopback only) |
+| `VANTH_DAEMON_PORT` | `8765` | Bind port |
+| `VANTH_MAX_REQUEST_BYTES` | `1 MiB` | HTTP request body cap |
+| `VANTH_MAX_RESPONSE_BYTES` | `4 MiB` | HTTP response cap |
+| `VANTH_MAX_EVENT_BYTES` | `64 KiB` | Single event payload cap |
+| `VANTH_MAX_EVENT_LINE_BYTES` | `1 MiB` | AGENT_EVENT line cap |
+| `VANTH_MAX_LOG_BYTES` | `10 MiB` | Per-stream log cap (drain continues) |
+| `VANTH_MAX_EVENTS_PER_JOB` | `100000` | Structured event cap per job |
+| `VANTH_DELIVERY_POLL_INTERVAL` | `0.2s` | Maintenance loop cadence |
+| `VANTH_DELIVERY_LEASE_MARGIN` | `5s` | Extra lease time beyond adapter timeout |
+| `VANTH_RUNNER_HEARTBEAT_INTERVAL` | `1s` | Runner liveness heartbeat |
+| `VANTH_RUNNER_HEARTBEAT_STALE_AFTER` | `10s` | Heartbeat staleness threshold |
+| `VANTH_CODEX_BIN` | `codex` / `C:\codex\codex.exe` | Codex binary |
+| `VANTH_OPENCODE_BIN` | `opencode` (via `shutil.which`) | OpenCode binary |
+| `VANTH_LOG_LEVEL` | `INFO` | Daemon log level |
+| `VANTH_LOG_MAX_BYTES` | `5 MiB` | Rotating daemon log size |
+| `VANTH_LOG_BACKUP_COUNT` | `3` | Daemon log rotation count |
+| `VANTH_BUSY_TIMEOUT_MS` | `30000` | SQLite write-lock wait |
+
+---
+
+## Operations
+
+### State layout
+
+```
+~/.vanth/
+  jobs.sqlite      durable jobs/events/deliveries/targets/attempts/tombstones
+  token            bearer token (owner-only permissions)
+  daemon.lock      single-daemon OS lock
+  logs/            daemon.log + per-job runner/stdout/stderr logs
+  events/          per-job JSONL event mirrors (monitor fallback source)
+  specs/           per-job launch specs (removed once the runner starts)
+  backups/         pre-migration SQLite backups
+```
+
+### Health, readiness, and diagnosis
+
+```text
 job_doctor()
 ```
 
-`job_view` returns compact job summaries sorted by attention priority, including progress, the latest event, thread linkage, tags, and delivery counts. `job_doctor` reports the daemon state directory, database tables, delivery counts, and Codex command availability.
+Reports the state directory, database tables, delivery counts by status, schema
+version, `PRAGMA quick_check`, stale delivery leases, free disk, token path, and
+whether the Codex/OpenCode binaries resolve. It never reveals the token.
 
-Jobs are launched through a detached runner process. If the MCP server or HTTP daemon restarts while a job is running, the job can continue and the new manager instance will keep waiting on durable SQLite events. If the runner PID is gone during recovery, the job is marked `orphaned`.
+The HTTP daemon also exposes:
 
-## v1 operations
+- `GET /health` — cheap, unauthenticated liveness probe for supervisors;
+- `GET /ready` — authenticated readiness (doctor report; 503 when not ok).
 
-State lives under `VANTH_HOME` (default `%USERPROFILE%\.vanth` on Windows or
-`~/.vanth` on Unix): `jobs.sqlite`, `token`, `daemon.lock`, `logs/`, `events/`,
-`specs/`, and `backups/`. The daemon binds only to loopback. Every data or
-mutation request uses `Authorization: Bearer <token>`; `job_doctor` reports the
-token path and health details but never the token itself. The cheap `/health`
-probe is intentionally unauthenticated for process supervisors.
+### Cleanup
 
-Schema changes use ordered SQLite migrations and make a backup through SQLite's
-backup API before changing an existing database. SQLite uses WAL mode with a
-5-second busy timeout by default. A second daemon for the same `VANTH_HOME`
-exits without taking ownership of the state.
+```text
+job_cleanup(older_than_seconds=86400, dry_run=true)   # preview
+job_cleanup(older_than_seconds=86400, dry_run=false)  # delete
+```
 
-Wake delivery is durable at-least-once delivery. Each payload contains a
-`delivery_id`, which adapters should deduplicate when duplicate side effects are
-unacceptable. Claims have leases and attempt history; inspect them with
-`job_delivery_attempts(delivery_id=...)` and retry failed rows with
-`job_retry_delivery`. A daemon crash after an adapter accepts a wake but before
-Vanth records success remains inherently ambiguous; it is surfaced as a
-reclaimed or failed attempt rather than claimed as exactly-once delivery.
+Removes terminal jobs older than the cutoff: logs, event mirrors, specs,
+deliveries, attempts, wake targets, events, then the job row. Running jobs are
+never selected. Dry-run is fully read-only. Cleanup is safe to repeat.
 
-Useful configuration includes `VANTH_HOME` (with legacy `AGENT_BG_HOME` accepted
-as the same alias), `VANTH_DAEMON_URL`,
-`VANTH_DAEMON_HOST`, `VANTH_DAEMON_PORT`, `VANTH_MAX_REQUEST_BYTES`,
-`VANTH_MAX_RESPONSE_BYTES`, `VANTH_MAX_EVENT_BYTES`,
-`VANTH_MAX_EVENT_LINE_BYTES`, `VANTH_MAX_LOG_BYTES`, `VANTH_DELIVERY_POLL_INTERVAL`,
-`VANTH_DELIVERY_LEASE_MARGIN`, `VANTH_RUNNER_HEARTBEAT_INTERVAL`,
-`VANTH_RUNNER_HEARTBEAT_STALE_AFTER`, `VANTH_CODEX_BIN`,
-`VANTH_OPENCODE_BIN`, `VANTH_LOG_LEVEL`, `VANTH_LOG_MAX_BYTES`, and
-`VANTH_LOG_BACKUP_COUNT`, `VANTH_MAX_EVENTS_PER_JOB`, and
-`VANTH_BUSY_TIMEOUT_MS` (default 30000; the SQLite write-lock wait). Defaults
-are defined in `src/vanth/server.py`, `src/vanth/daemon.py`, and
-`src/vanth/migrations.py`.
+### Upgrades and backups
 
-If both home variables are set, they must resolve to the same directory;
-different values are rejected so the daemon lock cannot be bypassed.
+Schema changes are ordered SQLite migrations. Before the first migration of an
+existing database, a timestamped backup is written under `backups/` via
+SQLite's backup API (never a raw file copy while WAL is active). To upgrade
+manually, copy the latest `backups/*.sqlite` first. A future database schema is
+rejected without touching the files.
 
-Use `job_cleanup(older_than_seconds=..., dry_run=true)` to preview removal of
-old terminal jobs and `dry_run=false` to delete their database rows and files.
-Running jobs are never selected. Cleanup is safe to repeat.
+---
 
-Interactive stdin and `job_send` remain unsupported. For a foreground
-diagnostic daemon, run `uv run vanthd`. The repository includes
-`deploy/vanthd.cmd` for a Windows Task Scheduler action and
-`deploy/vanthd.service` for a Unix systemd user service; adjust the project path
-and `uv` location for the machine, then enable only one daemon per
-`VANTH_HOME`. Keep upgrades reversible by copying the documented `backups/`
-database backup before replacing the wheel.
+## HTTP API (equivalent of the MCP tools)
+
+Authenticated with `Authorization: Bearer <token>`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`) |
+| POST | `/jobs` | Start a job |
+| GET | `/jobs/{id}/status` | Job status |
+| GET | `/jobs/{id}/events` | Events (`since_event_id`, `types`, `limit`) |
+| GET | `/jobs/{id}/tail` | Log tail (`stream`, `max_bytes`, `offset`) |
+| POST | `/jobs/{id}/wait` | Wait for an event |
+| POST | `/jobs/{id}/stop` | Stop a job |
+| GET | `/view` | Agent view (`thread_id`, `limit`) |
+| GET | `/deliveries` | Deliveries (`job_id`, `status`, `limit`) |
+| GET | `/deliveries/{id}/attempts` | Attempt history |
+| POST | `/deliveries/{id}/mark` | Mark a delivery |
+| POST | `/deliveries/{id}/retry` | Retry a delivery |
+| POST | `/cleanup` | Cleanup (`older_than_seconds`, `dry_run`) |
+| GET | `/doctor` | Health report |
+| GET | `/health` | Unauthenticated liveness |
+
+---
+
+## Agent usage tips
+
+1. **Wait, don't poll.** Use `job_wait(job_id, filters=[...], timeout_seconds=...)`
+   instead of looping `job_status`. The daemon wakes the wait immediately when a
+   matching event is persisted.
+2. **Pass `since_event_id`** to the next `job_wait` after handling an event, so
+   you never re-process an old one.
+3. **Tag and thread your jobs.** Set `origin_thread_id` (the agent thread that
+   launched the job) and `tags`; use `job_view(thread_id=...)` to summarize.
+4. **Prefer `job_view` over `job_status`** when presenting a situation to a
+   user — it is already sorted by attention priority.
+5. **Make jobs self-describing.** Emit `AGENT_EVENT progress` / `checkpoint` /
+   `metric` lines (see [above](#instrumenting-jobs-with-agent_event)). Jobs that
+   are silent still work, but tracked jobs are far easier to reason about.
+6. **Use wake targets for long jobs.** If a training run or long download needs
+   a decision at a checkpoint, add a `codex_thread` or `opencode_thread` target
+   with `events: ["checkpoint", "failed", "completed"]` so the agent is resumed
+   instead of polling.
+7. **Inspect delivery failures.** `job_delivery_attempts` shows the lease/claim
+   history; `job_retry_delivery` requeues a failed one after fixing the cause.
+8. **Set a sane `timeout_seconds`** on `job_start` so a hung command becomes a
+   `timeout` (terminal) state instead of running forever; the runner enforces it
+   even across daemon restarts.
+9. **Clean up old state** with `job_cleanup(older_than_seconds=..., dry_run=false)`
+   so the SQLite store and log files stay bounded.
+10. **A job survives the daemon.** The runner is detached; jobs continue across
+    daemon/MCP restarts. If a runner is gone at recovery, the job is marked
+    `orphaned` (never silently dropped).
+
+---
+
+## Examples
+
+```text
+uv run python examples\long_job.py    # emits progress + checkpoints
+```
+
+`examples/long_job.py` is a small reference job that uses `vanth.agent_events`.
+Start it through `job_start` and watch it in `vanth monitor`.
+
+---
+
+## Troubleshooting
+
+- **`Unauthorized` (401)**: the bearer token in `~/.vanth/token` is what the
+  daemon expects. Confirm `VANTH_HOME` is the same for the daemon and client.
+- **Second daemon won't start**: `another vanthd already owns this VANTH_HOME`.
+  One daemon per home by design.
+- **Job stuck `running` then `orphaned`**: the runner process died. Check
+  `logs/<job_id>.runner.log` and the heartbeat thresholds.
+- **No charts in the monitor**: the job isn't emitting `AGENT_EVENT` `metric` or
+  `progress` lines — add them (optional).
+- **OpenCode wake timing out**: increase `timeout_seconds` on the wake target
+  beyond the expected turn length.
+- **Monitor shows nothing / empty state**: confirm `VANTH_HOME` points at the
+  daemon's home, and that `jobs.sqlite` exists there.
+
+---
+
+## Development
+
+```cmd
+uv run pytest -q                 # Python suite (72 passed, 1 Linux-only skip)
+uv run python -m compileall -q src tests examples
+uv build
+go vet ./... && go test ./...    # Go: config, state, monitor
+```
+
+Release-gate automation lives in `scripts/`:
+
+- `scripts/chaos_matrix.py` — heavy synthetic workloads and kill/restart matrix;
+- `scripts/real_adapter_smoke.py` — opt-in live Codex/OpenCode wake smokes
+  (set `VANTH_SMOKE_CODEX_THREAD` / `VANTH_SMOKE_OPENCODE_SESSION`);
+- `scripts/generate_go_fixture.py` — regenerates the deterministic schema-v5
+  conformance fixture in `testdata/`;
+- `scripts/demo_jobs.py` — starts demo jobs (training run, quick task, failing
+  task) for the monitor.
+
+## Limitations (v1)
+
+- Interactive stdin and `job_send` are not implemented; jobs run with stdin
+  closed (use non-interactive flags on commands).
+- Delivery is at-least-once; a crash after an adapter accepts a wake but before
+  Vanth records success is a documented, surfaced ambiguity.
+- Remote access, TLS, multi-user policy, quotas, distributed workers, and a
+  custom service manager are out of scope.
