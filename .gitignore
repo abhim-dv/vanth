@@ -4,3 +4,10 @@ __pycache__/
 *.py[cod]
 .vanth/
 dist/
+bin/
+*.exe
+*.test
+testdata/state/logs/
+testdata/state/events/
+testdata/state/*.sqlite-wal
+testdata/state/*.sqlite-shm

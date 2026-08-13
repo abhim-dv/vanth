@@ -1,0 +1,170 @@
+"""Small, ordered SQLite migrations for Vanth state."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+LATEST_SCHEMA_VERSION = 5
+DEFAULT_BUSY_TIMEOUT_MS = 30000
+
+
+def busy_timeout_ms() -> int:
+    try:
+        return max(1000, int(os.environ.get("VANTH_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS)))
+    except ValueError:
+        return DEFAULT_BUSY_TIMEOUT_MS
+
+
+def configure_connection(db: sqlite3.Connection) -> None:
+    db.execute(f"PRAGMA busy_timeout={busy_timeout_ms()}")
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA foreign_keys=ON")
+
+
+def _column_names(db: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_missing(db: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = _column_names(db, table)
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _backup_before_migration(db: sqlite3.Connection, home: Path) -> Path:
+    backups = home / "backups"
+    backups.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = backups / f"jobs-{stamp}.sqlite"
+    destination = sqlite3.connect(path)
+    try:
+        db.backup(destination)
+    finally:
+        destination.close()
+    return path
+
+
+def _create_latest_schema(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+          job_id TEXT PRIMARY KEY, name TEXT, command TEXT NOT NULL, cwd TEXT,
+          status TEXT NOT NULL, pid INTEGER, worker_pid INTEGER,
+          runner_heartbeat_at TEXT, stop_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
+          notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
+          stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS events (
+          event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          type TEXT NOT NULL, level TEXT, message TEXT, data_json TEXT,
+          source TEXT, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_job_seq ON events(job_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_events_job_type_seq ON events(job_id, type, seq);
+        CREATE TABLE IF NOT EXISTS wake_targets (
+          target_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, type TEXT NOT NULL,
+          events_json TEXT NOT NULL, config_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wake_targets_job ON wake_targets(job_id);
+        CREATE TABLE IF NOT EXISTS deliveries (
+          delivery_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, target_id TEXT NOT NULL,
+          job_id TEXT NOT NULL, target_type TEXT NOT NULL, status TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, next_attempt_at TEXT, delivered_at TEXT,
+          last_error TEXT, claim_token TEXT, claimed_at TEXT, lease_expires_at TEXT,
+          UNIQUE(event_id, target_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status, next_attempt_at, created_at);
+        CREATE TABLE IF NOT EXISTS delivery_attempts (
+          attempt_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL, attempt INTEGER NOT NULL,
+          claim_token TEXT, target_type TEXT, started_at TEXT, ended_at TEXT,
+          status TEXT NOT NULL, error TEXT, reclaimed INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cleanup_tombstones (
+          tombstone_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, artifacts_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        PRAGMA user_version=5;
+        """
+    )
+
+
+def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
+    """Create the latest schema or migrate an existing v0 database transactionally."""
+    home = Path(home)
+    version = int(db.execute("PRAGMA user_version").fetchone()[0])
+    if version > LATEST_SCHEMA_VERSION:
+        raise RuntimeError(f"database schema version {version} is newer than this Vanth binary supports ({LATEST_SCHEMA_VERSION})")
+    has_jobs = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone())
+    if not has_jobs:
+        _create_latest_schema(db)
+        db.commit()
+        return None
+
+    backup = None
+    if version < LATEST_SCHEMA_VERSION:
+        backup = _backup_before_migration(db, home)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            if version < 1:
+                _add_missing(
+                    db,
+                    "jobs",
+                    {
+                        "worker_pid": "INTEGER",
+                        "origin_thread_id": "TEXT",
+                        "wake_thread_id": "TEXT",
+                        "tags_json": "TEXT",
+                    },
+                )
+                _add_missing(db, "deliveries", {"next_attempt_at": "TEXT"})
+                db.execute("PRAGMA user_version=1")
+                version = 1
+            if version < 2:
+                _add_missing(db, "jobs", {"runner_heartbeat_at": "TEXT"})
+                _add_missing(
+                    db,
+                    "deliveries",
+                    {"claim_token": "TEXT", "claimed_at": "TEXT", "lease_expires_at": "TEXT"},
+                )
+                db.execute("PRAGMA user_version=2")
+                version = 2
+            if version < 3:
+                _add_missing(
+                    db,
+                    "delivery_attempts",
+                    {
+                        "claim_token": "TEXT",
+                        "target_type": "TEXT",
+                        "started_at": "TEXT",
+                        "ended_at": "TEXT",
+                        "reclaimed": "INTEGER NOT NULL DEFAULT 0",
+                    },
+                )
+                db.execute("PRAGMA user_version=3")
+                version = 3
+            if version < 4:
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cleanup_tombstones (
+                      tombstone_id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                      artifacts_json TEXT NOT NULL, created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                db.execute("PRAGMA user_version=4")
+                version = 4
+            if version < 5:
+                _add_missing(db, "jobs", {"stop_requested_at": "TEXT"})
+                db.execute("PRAGMA user_version=5")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    return backup

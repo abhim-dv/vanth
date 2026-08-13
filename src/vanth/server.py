@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import secrets
+import shutil
 import subprocess
 import sqlite3
 import sys
@@ -12,14 +15,22 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from logging.handlers import RotatingFileHandler
 
 from mcp.server.fastmcp import FastMCP
 
 from .client import VanthClient
 from .codex_bridge import send_delivery_to_codex
+from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
+from .opencode_bridge import send_delivery_to_opencode
+from .paths import canonical_home
 
 EVENT_PREFIX = "AGENT_EVENT "
 DEFAULT_MAX_EVENT_BYTES = 65536
+DEFAULT_MAX_EVENT_LINE_BYTES = 1024 * 1024
+DEFAULT_MAX_LOG_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_ERROR_BYTES = 4096
+TERMINAL_STATUSES = {"completed", "failed", "timeout", "cancelled", "orphaned"}
 
 
 def now_iso() -> str:
@@ -33,7 +44,13 @@ def parse_agent_event_line(line: str) -> dict[str, Any] | None:
         payload = json.loads(line[len(EVENT_PREFIX) :])
     except json.JSONDecodeError:
         return None
-    return payload if isinstance(payload, dict) and isinstance(payload.get("type"), str) else None
+    if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+        return None
+    if payload.get("message") is not None and not isinstance(payload["message"], str):
+        return None
+    if payload.get("level") is not None and not isinstance(payload["level"], str):
+        return None
+    return payload
 
 
 def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -56,119 +73,102 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked"}
+WAKE_TARGET_TYPES = {"local_command", "codex_thread", "opencode_thread"}
+
+
+def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
+    if targets is None:
+        return
+    if not isinstance(targets, list):
+        raise ValueError("wake_targets must be a list")
+    for target in targets:
+        if not isinstance(target, dict):
+            raise ValueError("each wake target must be an object")
+        target_type = target.get("type")
+        if target_type not in WAKE_TARGET_TYPES:
+            raise ValueError(f"unsupported wake target type: {target_type!r}")
+        events = target.get("events", target.get("notify_on", []))
+        if not isinstance(events, list) or not all(isinstance(event, str) for event in events):
+            raise ValueError("wake target events must be a list of strings")
+        command = target.get("command")
+        if command is not None and not (
+            (isinstance(command, str) and command) or (isinstance(command, list) and command)
+        ):
+            raise ValueError("wake target command must be a non-empty string or argv list")
+        if target_type == "local_command" and command is None:
+            raise ValueError("local_command target requires command")
+        if target_type != "local_command" and command is None:
+            thread_id = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
+            if not isinstance(thread_id, str) or not thread_id:
+                raise ValueError(f"{target_type} target requires thread_id")
+        for key, minimum in (("timeout_seconds", 1), ("max_attempts", 1), ("retry_delay_seconds", 0)):
+            if key in target and (not isinstance(target[key], int) or isinstance(target[key], bool) or target[key] < minimum):
+                raise ValueError(f"wake target {key} must be an integer >= {minimum}")
+
+
+def validate_limit(value: int, name: str, maximum: int = 1000) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > maximum:
+        raise ValueError(f"{name} must be an integer between 1 and {maximum}")
+    return value
 
 
 class JobManager:
     def __init__(self, home: str | Path | None = None, *, recover: bool = True) -> None:
-        self.home = Path(home or os.environ.get("VANTH_HOME") or os.environ.get("AGENT_BG_HOME") or Path.home() / ".vanth")
+        self.home = canonical_home(home)
         self.max_event_bytes = int(
             os.environ.get("VANTH_MAX_EVENT_BYTES")
             or os.environ.get("AGENT_BG_MAX_EVENT_BYTES")
             or DEFAULT_MAX_EVENT_BYTES
         )
+        self.max_event_line_bytes = int(os.environ.get("VANTH_MAX_EVENT_LINE_BYTES", DEFAULT_MAX_EVENT_LINE_BYTES))
+        self.max_log_bytes = int(os.environ.get("VANTH_MAX_LOG_BYTES", DEFAULT_MAX_LOG_BYTES))
+        self.delivery_lease_margin = int(os.environ.get("VANTH_DELIVERY_LEASE_MARGIN", "5"))
+        self.heartbeat_interval = float(os.environ.get("VANTH_RUNNER_HEARTBEAT_INTERVAL", "1"))
+        self.heartbeat_stale_after = float(os.environ.get("VANTH_RUNNER_HEARTBEAT_STALE_AFTER", "10"))
+        self.recovery_kill_timeout = max(0, int(os.environ.get("VANTH_RECOVERY_KILL_TIMEOUT", "10")))
         self.logs = self.home / "logs"
         self.events_dir = self.home / "events"
         self.logs.mkdir(parents=True, exist_ok=True)
         self.events_dir.mkdir(parents=True, exist_ok=True)
+        self.backup_path = None
         self.db = sqlite3.connect(self.home / "jobs.sqlite", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        configure_connection(self.db)
         self.db_lock = threading.RLock()
+        self._closed = False
+        self._close_lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes]] = {}
         self.reader_threads: dict[str, list[threading.Thread]] = {}
         self.conditions: dict[str, threading.Condition] = {}
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-              job_id TEXT PRIMARY KEY,
-              name TEXT,
-              command TEXT NOT NULL,
-              cwd TEXT,
-              status TEXT NOT NULL,
-              pid INTEGER,
-              worker_pid INTEGER,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              started_at TEXT,
-              ended_at TEXT,
-              exit_code INTEGER,
-              timeout_seconds INTEGER,
-              notify_on TEXT,
-              origin_thread_id TEXT,
-              wake_thread_id TEXT,
-              tags_json TEXT,
-              stdout_path TEXT NOT NULL,
-              stderr_path TEXT NOT NULL,
-              events_path TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-              event_id TEXT PRIMARY KEY,
-              job_id TEXT NOT NULL,
-              seq INTEGER NOT NULL,
-              type TEXT NOT NULL,
-              level TEXT,
-              message TEXT,
-              data_json TEXT,
-              source TEXT,
-              created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_job_seq ON events(job_id, seq);
-            CREATE INDEX IF NOT EXISTS idx_events_job_type_seq ON events(job_id, type, seq);
-            CREATE TABLE IF NOT EXISTS wake_targets (
-              target_id TEXT PRIMARY KEY,
-              job_id TEXT NOT NULL,
-              type TEXT NOT NULL,
-              events_json TEXT NOT NULL,
-              config_json TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS deliveries (
-              delivery_id TEXT PRIMARY KEY,
-              event_id TEXT NOT NULL,
-              target_id TEXT NOT NULL,
-              job_id TEXT NOT NULL,
-              target_type TEXT NOT NULL,
-              status TEXT NOT NULL,
-              attempts INTEGER NOT NULL DEFAULT 0,
-              payload_json TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              next_attempt_at TEXT,
-              delivered_at TEXT,
-              last_error TEXT,
-              UNIQUE(event_id, target_id)
-            );
-            CREATE TABLE IF NOT EXISTS delivery_attempts (
-              attempt_id TEXT PRIMARY KEY,
-              delivery_id TEXT NOT NULL,
-              attempt INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              error TEXT,
-              created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_wake_targets_job ON wake_targets(job_id);
-            CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status, created_at);
-            """
-        )
-        self._migrate_columns()
+        self._log_truncated: set[tuple[str, str]] = set()
+        self._delivery_threads: set[threading.Thread] = set()
+        self._delivery_threads_lock = threading.Lock()
+        self.shutdown_requested = threading.Event()
+        self.max_events_per_job = max(1, int(os.environ.get("VANTH_MAX_EVENTS_PER_JOB", "100000")))
+        self._events_truncated: set[str] = set()
+        self.logger = logging.getLogger(f"vanth.manager.{id(self)}")
+        self.logger.setLevel(os.environ.get("VANTH_LOG_LEVEL", "INFO").upper())
+        self.logger.propagate = False
+        if not self.logger.handlers:
+            handler = RotatingFileHandler(
+                self.logs / "daemon.log",
+                maxBytes=int(os.environ.get("VANTH_LOG_MAX_BYTES", str(5 * 1024 * 1024))),
+                backupCount=int(os.environ.get("VANTH_LOG_BACKUP_COUNT", "3")),
+                encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s pid=%(process)d component=manager %(message)s"))
+            self.logger.addHandler(handler)
+        self.dispatch_enabled = recover
+        self.dispatcher_stop = threading.Event()
+        self.dispatcher_thread: threading.Thread | None = None
+        self.backup_path = migrate(self.db, self.home)
         if recover:
             self._recover_jobs()
-        self.db.commit()
+            self._reconcile_running_jobs()
         if recover:
             self._dispatch_due_deliveries()
-
-    def _migrate_columns(self) -> None:
-        job_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)").fetchall()}
-        for name, sql_type in {
-            "worker_pid": "INTEGER",
-            "origin_thread_id": "TEXT",
-            "wake_thread_id": "TEXT",
-            "tags_json": "TEXT",
-        }.items():
-            if name not in job_columns:
-                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}")
-        delivery_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(deliveries)").fetchall()}
-        if "next_attempt_at" not in delivery_columns:
-            self.db.execute("ALTER TABLE deliveries ADD COLUMN next_attempt_at TEXT")
+            self.dispatcher_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
+            self.dispatcher_thread.start()
 
     def _pid_alive(self, pid: int | None) -> bool:
         if not pid:
@@ -189,28 +189,133 @@ class JobManager:
             return False
 
     def _recover_jobs(self) -> None:
-        rows = self.db.execute("SELECT job_id, worker_pid FROM jobs WHERE status='running'").fetchall()
-        stale = [row["job_id"] for row in rows if not self._pid_alive(row["worker_pid"])]
-        if stale:
-            for job_id in stale:
-                self.db.execute("UPDATE jobs SET status='orphaned', updated_at=? WHERE job_id=?", (now_iso(), job_id))
-                self.db.commit()
-                self._emit(job_id, "orphaned", message="Job runner was not alive during recovery")
+        rows = self.db.execute("SELECT job_id, worker_pid, stop_requested_at FROM jobs WHERE status='running'").fetchall()
+        for row in rows:
+            if self._pid_alive(row["worker_pid"]):
+                continue
+            workload = self._row("SELECT pid FROM jobs WHERE job_id=?", (row["job_id"],))
+            if workload and workload["pid"]:
+                if not self._terminate_pid(int(workload["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                    self.logger.error("recovery could not terminate workload job_id=%s pid=%s", row["job_id"], workload["pid"])
+                    continue
+            terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
+            if self._transition_terminal(row["job_id"], terminal):
+                self._emit(row["job_id"], terminal, message="Job runner was not alive during recovery")
 
-    def _dispatch_due_deliveries(self) -> None:
+    def _reconcile_running_jobs(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_stale_after)
+        cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
         rows = self.db.execute(
-            """
-            SELECT * FROM deliveries
-            WHERE status IN ('pending', 'retrying')
-              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-            """,
-            (now_iso(),),
+            "SELECT job_id, worker_pid, pid, stop_requested_at FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < ?)",
+            (cutoff_text,),
         ).fetchall()
         for row in rows:
-            threading.Thread(target=self._dispatch_delivery, args=(self._delivery_dict(row),), daemon=True).start()
+            if self._pid_alive(row["worker_pid"]):
+                continue
+            if row["pid"]:
+                if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                    self.logger.error("heartbeat reconciliation could not terminate workload job_id=%s pid=%s", row["job_id"], row["pid"])
+                    continue
+            terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
+            if self._transition_terminal(row["job_id"], terminal):
+                self._emit(row["job_id"], terminal, message="Runner heartbeat is stale and the runner is not alive")
+
+    def begin_shutdown(self) -> None:
+        self.shutdown_requested.set()
+        for condition in self.conditions.values():
+            with condition:
+                condition.notify_all()
+
+    def _transition_terminal(self, job_id: str, status: str, exit_code: int | None = None) -> bool:
+        if status not in TERMINAL_STATUSES:
+            raise ValueError(f"invalid terminal status: {status}")
+        self._ensure_open()
+        stamp = now_iso()
+
+        def transition() -> bool:
+            with self.db_lock:
+                changed = self.db.execute(
+                    "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=? AND status='running'",
+                    (status, exit_code, stamp, stamp, job_id),
+                ).rowcount
+                self.db.commit()
+            return bool(changed)
+
+        return self._retry_locked(transition)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("JobManager is closed")
+
+    def _retry_locked(self, fn, *args, attempts: int = 5):
+        """Run fn, retrying transient SQLite write-lock contention.
+
+        The per-process db_lock serializes threads inside one process, but
+        runners and the daemon are separate processes sharing one database.
+        A short retry loop keeps a transient ``database is locked`` from
+        killing a runner thread or abandoning a critical write.
+        """
+        for attempt in range(attempts):
+            try:
+                return fn(*args)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _dispatch_loop(self) -> None:
+        while not self.dispatcher_stop.wait(float(os.environ.get("VANTH_DELIVERY_POLL_INTERVAL", "0.2"))):
+            try:
+                self._dispatch_due_deliveries()
+                self._reconcile_running_jobs()
+            except Exception:
+                self.logger.exception("maintenance iteration failed")
+
+    def _dispatch_due_deliveries(self) -> None:
+        self._ensure_open()
+        with self.db_lock:
+            rows = self.db.execute(
+                """
+                SELECT * FROM deliveries
+                WHERE (status IN ('pending', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                   OR (status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                """,
+                (now_iso(), now_iso()),
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if payload.get("target", {}).get("auto_dispatch") is False:
+                continue
+            thread = threading.Thread(target=self._dispatch_delivery, args=(self._delivery_dict(row),), daemon=True)
+            with self._delivery_threads_lock:
+                self._delivery_threads.add(thread)
+            thread.start()
 
     def close(self) -> None:
-        self.db.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self.begin_shutdown()
+            self._closed = True
+            self.dispatcher_stop.set()
+            if self.dispatcher_thread and self.dispatcher_thread is not threading.current_thread():
+                self.dispatcher_thread.join(timeout=2)
+            deadline = time.monotonic() + float(os.environ.get("VANTH_SHUTDOWN_TIMEOUT", "10"))
+            with self._delivery_threads_lock:
+                workers = list(self._delivery_threads)
+            for thread in workers:
+                remaining = max(0, deadline - time.monotonic())
+                if remaining:
+                    thread.join(timeout=remaining)
+            with self.db_lock:
+                self.db.close()
+            for handler in self.logger.handlers[:]:
+                handler.close()
+                self.logger.removeHandler(handler)
 
     @property
     def specs_dir(self) -> Path:
@@ -223,6 +328,7 @@ class JobManager:
         return self.conditions[job_id]
 
     def _row(self, sql: str, args: tuple[Any, ...]) -> sqlite3.Row | None:
+        self._ensure_open()
         with self.db_lock:
             return self.db.execute(sql, args).fetchone()
 
@@ -249,6 +355,7 @@ class JobManager:
         level: str = "info",
         source: str = "server",
     ) -> dict[str, Any]:
+        self._ensure_open()
         payload = normalize_event_payload({"type": event_type, "message": message, "data": data or {}, "level": level})
         data_json = json.dumps(payload["data"], separators=(",", ":"))
         if len(data_json.encode()) > self.max_event_bytes:
@@ -257,7 +364,57 @@ class JobManager:
             payload["level"] = "warning"
             data_json = json.dumps(payload["data"], separators=(",", ":"))
         with self.db_lock:
-            row = self._row("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,))
+            for attempt in range(4):
+                try:
+                    event = self._emit_transactional(
+                        job_id, payload, data_json, event_type, level, source, message
+                    )
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 3:
+                        raise
+                    self.logger.warning("event write contended, retrying job_id=%s attempt=%s", job_id, attempt + 1)
+                    time.sleep(0.05 * (attempt + 1))
+            else:  # pragma: no cover - loop always breaks
+                raise RuntimeError("event write failed")
+        if event is not None and event.get("persisted") is not False:
+            self._append_event_mirror(event, job_id)
+        with self._condition(job_id):
+            self._condition(job_id).notify_all()
+        return event
+
+    def _emit_transactional(
+        self,
+        job_id: str,
+        payload: dict[str, Any],
+        data_json: str,
+        event_type: str,
+        level: str,
+        source: str,
+        message: str | None,
+    ) -> dict[str, Any]:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if event_type not in TERMINAL_STATUSES:
+                count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                if count >= self.max_events_per_job:
+                    self.db.rollback()
+                    if job_id not in self._events_truncated:
+                        self._events_truncated.add(job_id)
+                        self.logger.warning("structured event cap reached job_id=%s max_events=%s", job_id, self.max_events_per_job)
+                    return {
+                        "event_id": None,
+                        "job_id": job_id,
+                        "seq": count + 1,
+                        "type": event_type,
+                        "level": "warning",
+                        "message": "Structured event cap reached",
+                        "data": {"max_events": self.max_events_per_job, "truncated": True},
+                        "source": source,
+                        "created_at": now_iso(),
+                        "persisted": False,
+                    }
+            row = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,)).fetchone()
             seq = int(row["seq"])
             created_at = now_iso()
             event_id = "evt_" + uuid.uuid4().hex[:16]
@@ -289,26 +446,39 @@ class JobManager:
                 "source": source,
                 "created_at": created_at,
             }
-            events_path = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))["events_path"]
-            with Path(events_path).open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, separators=(",", ":")) + "\n")
-            deliveries = self._enqueue_deliveries(event)
+            self._enqueue_deliveries_uncommitted(event)
             self.db.commit()
-        with self._condition(job_id):
-            self._condition(job_id).notify_all()
-        for delivery in deliveries:
-            self._dispatch_delivery(delivery)
+        except BaseException:
+            self.db.rollback()
+            raise
         return event
 
+    def _append_event_mirror(self, event: dict[str, Any], job_id: str) -> None:
+        try:
+            row = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))
+            if not row:
+                return
+            with Path(row["events_path"]).open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        except OSError:
+            self.logger.exception("event mirror write failed job_id=%s event_id=%s", job_id, event.get("event_id"))
+        except (sqlite3.Error, RuntimeError):
+            self.logger.exception("event mirror path lookup failed job_id=%s", job_id)
+
     def _enqueue_deliveries(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+        deliveries = self._enqueue_deliveries_uncommitted(event)
+        self.db.commit()
+        return deliveries
+
+    def _enqueue_deliveries_uncommitted(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         deliveries = []
         targets = self.db.execute("SELECT * FROM wake_targets WHERE job_id=?", (event["job_id"],)).fetchall()
         for target in targets:
             events = json.loads(target["events_json"] or "[]")
             if events and event["type"] not in events:
                 continue
-            payload = self._delivery_payload(event, target)
             delivery_id = "del_" + uuid.uuid4().hex[:16]
+            payload = self._delivery_payload(event, target, delivery_id)
             self.db.execute(
                 """
                 INSERT OR IGNORE INTO deliveries(
@@ -329,48 +499,112 @@ class JobManager:
             row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
             if row:
                 deliveries.append(self._delivery_dict(row))
-        self.db.commit()
         return deliveries
 
+    def _claim_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        with self.db_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            now = now_iso()
+            row = self.db.execute("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+            if not row:
+                self.db.rollback()
+                return None
+            target = json.loads(row["payload_json"] or "{}").get("target", {})
+            timeout = int(target.get("timeout_seconds", 30))
+            lease_seconds = timeout + max(1, self.delivery_lease_margin)
+            due = (
+                row["status"] in {"pending", "retrying"}
+                and (row["next_attempt_at"] is None or row["next_attempt_at"] <= now)
+            ) or (row["status"] == "dispatching" and row["lease_expires_at"] and row["lease_expires_at"] <= now)
+            if not due:
+                self.db.rollback()
+                return None
+            token = secrets.token_urlsafe(24)
+            lease_expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat().replace("+00:00", "Z")
+            attempt = int(row["attempts"]) + 1
+            reclaimed = int(row["status"] == "dispatching")
+            changed = self.db.execute(
+                """
+                UPDATE deliveries SET status='dispatching', attempts=?, claim_token=?, claimed_at=?, lease_expires_at=?
+                WHERE delivery_id=? AND (status IN ('pending','retrying') OR (status='dispatching' AND lease_expires_at<=?))
+                """,
+                (attempt, token, now, lease_expires, delivery_id, now),
+            ).rowcount
+            if not changed:
+                self.db.rollback()
+                return None
+            if reclaimed:
+                self.db.execute(
+                    "UPDATE delivery_attempts SET status='reclaimed', ended_at=?, error=? WHERE delivery_id=? AND ended_at IS NULL",
+                    (now, "delivery lease expired", delivery_id),
+                )
+            self.db.execute(
+                """
+                INSERT INTO delivery_attempts(attempt_id, delivery_id, attempt, claim_token, target_type,
+                  started_at, status, reclaimed, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)
+                """,
+                (
+                    "att_" + uuid.uuid4().hex[:16], delivery_id, attempt, token,
+                    row["target_type"], now, reclaimed, now,
+                ),
+            )
+            self.db.commit()
+            claimed = self.db.execute("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+        return self._delivery_dict(claimed)
+
     def _dispatch_delivery(self, delivery: dict[str, Any]) -> None:
-        row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],))
-        if not row or row["status"] == "delivered":
-            return
-        delivery = self._delivery_dict(row)
-        payload = delivery["payload"]
-        target = payload.get("target", {})
-        command = target.get("command")
-        if not command and target.get("type") == "codex_thread":
-            if target.get("auto_dispatch") is False:
+        try:
+            target = delivery["payload"].get("target", {})
+            command = target.get("command")
+            target_type = target.get("type")
+            if not command and target_type in {"codex_thread", "opencode_thread"} and target.get("auto_dispatch") is False:
+                return
+            if not command and target_type not in {"codex_thread", "opencode_thread"}:
+                return
+            delivery = self._claim_delivery(delivery["delivery_id"])
+            if not delivery:
+                return
+            payload = delivery["payload"]
+            if not command and target_type == "codex_thread":
+                try:
+                    send_delivery_to_codex(payload)
+                    self._complete_delivery(delivery, "delivered")
+                except Exception as exc:
+                    self._complete_delivery(delivery, "failed", str(exc))
+                return
+            if not command and target_type == "opencode_thread":
+                try:
+                    send_delivery_to_opencode(payload)
+                    self._complete_delivery(delivery, "delivered")
+                except Exception as exc:
+                    self._complete_delivery(delivery, "failed", str(exc))
                 return
             try:
-                send_delivery_to_codex(payload)
-                self._complete_delivery(delivery, "delivered")
+                proc = subprocess.run(
+                    command,
+                    input=json.dumps(payload),
+                    text=True,
+                    shell=isinstance(command, str),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=int(target.get("timeout_seconds", 30)),
+                )
+                if proc.returncode == 0:
+                    self._complete_delivery(delivery, "delivered")
+                else:
+                    self._complete_delivery(delivery, "failed", (proc.stderr or "").strip())
             except Exception as exc:
                 self._complete_delivery(delivery, "failed", str(exc))
-            return
-        if not command:
-            return
-        try:
-            proc = subprocess.run(
-                command,
-                input=json.dumps(payload),
-                text=True,
-                shell=isinstance(command, str),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=int(target.get("timeout_seconds", 30)),
-            )
-            if proc.returncode == 0:
-                self._complete_delivery(delivery, "delivered")
-            else:
-                self._complete_delivery(delivery, "failed", (proc.stderr or "").strip())
-        except Exception as exc:
-            self._complete_delivery(delivery, "failed", str(exc))
+        finally:
+            with self._delivery_threads_lock:
+                self._delivery_threads.discard(threading.current_thread())
 
     def _complete_delivery(self, delivery: dict[str, Any], status: str, error: str | None = None) -> dict[str, Any]:
+        if status not in {"delivered", "failed"}:
+            raise ValueError("delivery completion status must be delivered or failed")
         target = delivery["payload"].get("target", {})
-        attempt = int(delivery["attempts"]) + 1
+        attempt = int(delivery["attempts"])
         final_status = status
         next_attempt_at = None
         if status == "failed" and attempt < int(target.get("max_attempts", 1)):
@@ -378,36 +612,36 @@ class JobManager:
             final_status = "retrying"
             next_attempt_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
         delivered_at = now_iso() if final_status == "delivered" else None
+        error = (error or "")[:DEFAULT_MAX_ERROR_BYTES] or None
         with self.db_lock:
-            self.db.execute(
+            stamp = now_iso()
+            changed = self.db.execute(
                 """
-                UPDATE deliveries
-                SET status=?, attempts=?, delivered_at=COALESCE(?, delivered_at), last_error=?, next_attempt_at=?
-                WHERE delivery_id=?
+                UPDATE deliveries SET status=?, delivered_at=COALESCE(?, delivered_at), last_error=?, next_attempt_at=?,
+                  claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                WHERE delivery_id=? AND status='dispatching' AND claim_token=?
                 """,
-                (final_status, attempt, delivered_at, error, next_attempt_at, delivery["delivery_id"]),
-            )
-            self.db.execute(
-                """
-                INSERT INTO delivery_attempts(attempt_id, delivery_id, attempt, status, error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                ("att_" + uuid.uuid4().hex[:16], delivery["delivery_id"], attempt, final_status, error, now_iso()),
-            )
+                (final_status, delivered_at, error, next_attempt_at, delivery["delivery_id"], delivery["claim_token"]),
+            ).rowcount
+            if changed:
+                self.db.execute(
+                    """
+                    UPDATE delivery_attempts SET status=?, error=?, ended_at=?
+                    WHERE delivery_id=? AND claim_token=? AND ended_at IS NULL
+                    """,
+                    (final_status, error, stamp, delivery["delivery_id"], delivery["claim_token"]),
+                )
             self.db.commit()
-            row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],))
-        result = self._delivery_dict(row)
-        if final_status == "retrying" and next_attempt_at:
-            delay = max(0, (datetime.fromisoformat(next_attempt_at.replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds())
-            threading.Timer(delay, self._dispatch_delivery, args=(result,)).start()
-        return result
+            row = self.db.execute("SELECT * FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)).fetchone()
+        return self._delivery_dict(row)
 
-    def _delivery_payload(self, event: dict[str, Any], target: sqlite3.Row) -> dict[str, Any]:
+    def _delivery_payload(self, event: dict[str, Any], target: sqlite3.Row, delivery_id: str) -> dict[str, Any]:
         config = json.loads(target["config_json"] or "{}")
         prompt = config.get("prompt")
         if not prompt:
             prompt = (
                 "vanth event\n"
+                f"delivery_id: {delivery_id}\n"
                 f"job_id: {event['job_id']}\n"
                 f"event: {event['type']}\n"
                 f"message: {event.get('message') or ''}\n"
@@ -421,6 +655,7 @@ class JobManager:
             },
             "event": event,
             "prompt": prompt,
+            "delivery_id": delivery_id,
         }
 
     async def start(
@@ -435,6 +670,12 @@ class JobManager:
         origin_thread_id: str | None = None,
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
+        self._ensure_open()
+        validate_wake_targets(wake_targets)
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
+            raise ValueError("timeout_seconds must be an integer >= 1")
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
         stderr_path = self.logs / f"{job_id}.stderr.log"
@@ -444,7 +685,7 @@ class JobManager:
             (
                 target.get("thread_id") or target.get("threadId")
                 for target in (wake_targets or [])
-                if target.get("type") == "codex_thread"
+                if target.get("type") in {"codex_thread", "opencode_thread"}
             ),
             None,
         )
@@ -457,6 +698,7 @@ class JobManager:
                     "cwd": cwd,
                     "env": env or {},
                     "timeout_seconds": timeout_seconds,
+                    "max_log_bytes": self.max_log_bytes,
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                 },
@@ -467,15 +709,16 @@ class JobManager:
         with self.db_lock:
             self.db.execute(
                 """
-                INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at,
+                INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
                   timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, stdout_path, stderr_path, events_path)
-                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     name,
                     command,
                     cwd,
+                    created_at,
                     created_at,
                     created_at,
                     created_at,
@@ -495,14 +738,20 @@ class JobManager:
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "vanth.runner", str(self.home), job_id],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+        runner_log = (self.logs / f"{job_id}.runner.log").open("ab")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "vanth.runner", str(self.home), job_id],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=runner_log,
+                creationflags=creationflags,
+                start_new_session=sys.platform != "win32",
+            )
+        finally:
+            runner_log.close()
         self.processes[job_id] = proc
+        threading.Thread(target=self._watch_runner, args=(job_id, proc), daemon=True).start()
         with self.db_lock:
             self.db.execute("UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=?", (proc.pid, now_iso(), job_id))
             self.db.commit()
@@ -515,6 +764,21 @@ class JobManager:
             "events_path": str(events_path),
             "message": "Job started",
         }
+
+    def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
+        proc.wait()
+        try:
+            row = self._row("SELECT status, pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+            if not row or row["status"] != "running":
+                return
+            if row["pid"] and not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                return
+            terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
+            if self._transition_terminal(job_id, terminal):
+                self._emit(job_id, terminal, message="Job runner exited before recording a terminal status")
+        except (sqlite3.Error, RuntimeError):
+            return
 
     def _insert_wake_targets(self, job_id: str, targets: list[dict[str, Any]], created_at: str) -> None:
         for target in targets:
@@ -547,14 +811,44 @@ class JobManager:
     ) -> None:
         if stream is None:
             return
+        max_bytes = self.max_log_bytes
+        written = path.stat().st_size if path.exists() else 0
         with path.open("ab") as f:
-            while line := stream.readline():
-                f.write(line)
-                f.flush()
-                payload = parse_agent_event_line(line.decode(errors="replace").rstrip("\r\n"))
+            while line := stream.readline(self.max_event_line_bytes + 1):
+                if written < max_bytes:
+                    chunk = line[: max_bytes - written]
+                    f.write(chunk)
+                    f.flush()
+                    written += len(chunk)
+                if written >= max_bytes and (job_id, source) not in self._log_truncated:
+                    self._log_truncated.add((job_id, source))
+                    self._emit_safely(
+                        job_id,
+                        "log_truncated",
+                        message=f"{source} log reached its configured byte cap",
+                        data={"stream": source, "max_bytes": max_bytes},
+                        level="warning",
+                        source="server",
+                    )
+                if len(line) > self.max_event_line_bytes:
+                    while line and not line.endswith(b"\n"):
+                        line = stream.readline(self.max_event_line_bytes + 1)
+                    self._emit_safely(
+                        job_id,
+                        "event_rejected",
+                        message="AGENT_EVENT line exceeded the configured byte limit",
+                        data={"max_bytes": self.max_event_line_bytes},
+                        level="warning",
+                        source=source,
+                    )
+                    continue
+                try:
+                    payload = parse_agent_event_line(line.decode(errors="replace").rstrip("\r\n"))
+                except Exception:
+                    payload = None
                 if payload:
                     event = normalize_event_payload(payload)
-                    self._emit(
+                    self._emit_safely(
                         job_id,
                         event["type"],
                         message=event["message"],
@@ -562,6 +856,21 @@ class JobManager:
                         level=event["level"],
                         source=source,
                     )
+
+    def _emit_safely(
+        self,
+        job_id: str,
+        event_type: str,
+        *,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+        level: str = "info",
+        source: str = "server",
+    ) -> None:
+        try:
+            self._emit(job_id, event_type, message=message, data=data, level=level, source=source)
+        except (sqlite3.Error, RuntimeError):
+            self.logger.exception("structured event persisted failed job_id=%s type=%s", job_id, event_type)
 
     def _watch(self, job_id: str, proc: subprocess.Popen[bytes], timeout_seconds: int | None) -> None:
         try:
@@ -580,11 +889,14 @@ class JobManager:
 
     def _readers_done(self, job_id: str) -> None:
         for thread in self.reader_threads.pop(job_id, []):
-            thread.join(timeout=2)
+            thread.join()
 
     def _kill_process(self, proc: subprocess.Popen[bytes], force: bool) -> None:
-        if sys.platform == "win32" and proc.pid:
-            args = ["taskkill", "/PID", str(proc.pid), "/T"]
+        self._kill_pid(proc.pid, force)
+
+    def _kill_pid(self, pid: int, force: bool) -> None:
+        if sys.platform == "win32":
+            args = ["taskkill", "/PID", str(pid), "/T"]
             if force:
                 args.append("/F")
             subprocess.run(
@@ -593,17 +905,35 @@ class JobManager:
                 stderr=subprocess.DEVNULL,
             )
             return
-        proc.kill() if force else proc.terminate()
+        signal_number = 9 if force else 15
+        try:
+            os.killpg(pid, signal_number)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal_number)
+            except ProcessLookupError:
+                return
+
+    def _terminate_pid(self, pid: int, force: bool, deadline: float) -> bool:
+        if not pid or not self._pid_alive(pid):
+            return True
+        self._kill_pid(pid, force=force)
+        while self._pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self._pid_alive(pid):
+            self._kill_pid(pid, force=True)
+            force_deadline = min(deadline + 1, time.monotonic() + 1)
+            while self._pid_alive(pid) and time.monotonic() < force_deadline:
+                time.sleep(0.05)
+        return not self._pid_alive(pid)
 
     def _finish(self, job_id: str, status: str, exit_code: int | None = None) -> None:
-        with self.db_lock:
-            self.db.execute(
-                "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=? WHERE job_id=?",
-                (status, exit_code, now_iso(), now_iso(), job_id),
-            )
-            self.db.commit()
-        data = {"exit_code": exit_code} if exit_code is not None else {}
-        self._emit(job_id, status, data=data)
+        row = self._row("SELECT stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+        if row and row["stop_requested_at"]:
+            status = "cancelled"
+        if self._transition_terminal(job_id, status, exit_code):
+            data = {"exit_code": exit_code} if exit_code is not None else {}
+            self._emit(job_id, status, data=data)
         self.processes.pop(job_id, None)
 
     def _event_query(self, job_id: str, types: list[str] | None, since_event_id: str | None, limit: int) -> list[dict[str, Any]]:
@@ -655,11 +985,18 @@ class JobManager:
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
     ) -> dict[str, Any]:
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 0 or timeout_seconds > 86400:
+            raise ValueError("timeout_seconds must be between 0 and 86400")
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
             raise ValueError(f"Unknown job_id: {job_id}")
         deadline = time.monotonic() + timeout_seconds
         while True:
-            events = self._event_query(job_id, filters, since_event_id, 1)
+            if self.shutdown_requested.is_set():
+                return {"result": "shutdown", "job_id": job_id, "message": "Vanth is shutting down"}
+            try:
+                events = self._event_query(job_id, filters, since_event_id, 1)
+            except RuntimeError:
+                return {"result": "shutdown", "job_id": job_id, "message": "Vanth is shutting down"}
             if events:
                 return {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]}
             remaining = deadline - time.monotonic()
@@ -701,6 +1038,8 @@ class JobManager:
         return result
 
     def list(self, status: list[str] | None = None, limit: int = 50, thread_id: str | None = None) -> dict[str, Any]:
+        self._ensure_open()
+        validate_limit(limit, "limit")
         args: list[Any] = []
         filters = []
         if status:
@@ -726,9 +1065,15 @@ class JobManager:
         return {"jobs": jobs}
 
     def events(self, job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20) -> dict[str, Any]:
+        self._ensure_open()
+        validate_limit(limit, "limit")
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown job_id: {job_id}")
         return {"events": self._event_query(job_id, types, since_event_id, limit)}
 
     def deliveries(self, job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
+        self._ensure_open()
+        validate_limit(limit, "limit")
         where = []
         args: list[Any] = []
         if job_id:
@@ -759,9 +1104,43 @@ class JobManager:
             "next_attempt_at": row["next_attempt_at"],
             "delivered_at": row["delivered_at"],
             "last_error": row["last_error"],
+            "claim_token": row["claim_token"],
+            "claimed_at": row["claimed_at"],
+            "lease_expires_at": row["lease_expires_at"],
+        }
+
+    def delivery_attempts(self, delivery_id: str, limit: int = 20) -> dict[str, Any]:
+        validate_limit(limit, "limit")
+        if not self._row("SELECT delivery_id FROM deliveries WHERE delivery_id=?", (delivery_id,)):
+            raise ValueError(f"Unknown delivery_id: {delivery_id}")
+        with self.db_lock:
+            rows = self.db.execute(
+                "SELECT * FROM delivery_attempts WHERE delivery_id=? ORDER BY attempt DESC LIMIT ?",
+                (delivery_id, limit),
+            ).fetchall()
+        return {
+            "attempts": [
+                {
+                    "attempt_id": row["attempt_id"],
+                    "delivery_id": row["delivery_id"],
+                    "attempt": row["attempt"],
+                    "claim_token": row["claim_token"],
+                    "target_type": row["target_type"],
+                    "started_at": row["started_at"],
+                    "ended_at": row["ended_at"],
+                    "status": row["status"],
+                    "error": row["error"],
+                    "reclaimed": bool(row["reclaimed"]),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
         }
 
     def mark_delivery(self, delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
+        if status not in {"pending", "retrying", "delivered", "failed"}:
+            raise ValueError("invalid delivery status")
+        error = (error or "")[:DEFAULT_MAX_ERROR_BYTES] or None
         delivered_at = now_iso() if status == "delivered" else None
         with self.db_lock:
             current = self._row("SELECT attempts FROM deliveries WHERE delivery_id=?", (delivery_id,))
@@ -778,10 +1157,10 @@ class JobManager:
             )
             self.db.execute(
                 """
-                INSERT INTO delivery_attempts(attempt_id, delivery_id, attempt, status, error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO delivery_attempts(attempt_id, delivery_id, attempt, target_type, started_at, ended_at, status, error, created_at)
+                SELECT ?, delivery_id, ?, target_type, ?, ?, ?, ?, ? FROM deliveries WHERE delivery_id=?
                 """,
-                ("att_" + uuid.uuid4().hex[:16], delivery_id, attempt, status, error, now_iso()),
+                ("att_" + uuid.uuid4().hex[:16], attempt, now_iso(), now_iso(), status, error, now_iso(), delivery_id),
             )
             self.db.commit()
             row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
@@ -792,17 +1171,22 @@ class JobManager:
         if not row:
             raise ValueError(f"Unknown delivery_id: {delivery_id}")
         with self.db_lock:
-            self.db.execute(
-                "UPDATE deliveries SET status='retrying', next_attempt_at=NULL, last_error=NULL WHERE delivery_id=?",
+            changed = self.db.execute(
+                """
+                UPDATE deliveries SET status='retrying', next_attempt_at=NULL, last_error=NULL
+                WHERE delivery_id=? AND status='failed'
+                """,
                 (delivery_id,),
-            )
+            ).rowcount
             self.db.commit()
             row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
         delivery = self._delivery_dict(row)
-        threading.Thread(target=self._dispatch_delivery, args=(delivery,), daemon=True).start()
         return delivery
 
     def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None) -> dict[str, Any]:
+        validate_limit(max_bytes, "max_bytes", max(self.max_log_bytes, 8192))
+        if offset is not None and (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0):
+            raise ValueError("offset must be a non-negative integer")
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be stdout or stderr")
         row = self._row(f"SELECT {stream}_path AS path FROM jobs WHERE job_id=?", (job_id,))
@@ -865,11 +1249,12 @@ class JobManager:
         return {"jobs": jobs}
 
     def doctor(self) -> dict[str, Any]:
+        self._ensure_open()
         tables = {
             row["name"]
             for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
-        required = {"jobs", "events", "wake_targets", "deliveries", "delivery_attempts"}
+        required = {"jobs", "events", "wake_targets", "deliveries", "delivery_attempts", "cleanup_tombstones"}
         delivery_counts = {
             row["status"]: row["count"]
             for row in self.db.execute("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status").fetchall()
@@ -879,11 +1264,21 @@ class JobManager:
         if missing:
             warnings.append({"type": "missing_tables", "tables": missing})
         codex_bin = os.environ.get("VANTH_CODEX_BIN") or (r"C:\codex\codex.exe" if sys.platform == "win32" else "codex")
-        codex_available = Path(codex_bin).exists() if ("\\" in codex_bin or "/" in codex_bin) else True
+        codex_available = bool(Path(codex_bin).exists() if ("\\" in codex_bin or "/" in codex_bin) else shutil.which(codex_bin))
         if not codex_available:
             warnings.append({"type": "codex_unavailable", "command": codex_bin})
+        opencode_bin = os.environ.get("VANTH_OPENCODE_BIN", "opencode")
+        opencode_available = bool(shutil.which(opencode_bin) or Path(opencode_bin).exists())
+        if not opencode_available:
+            warnings.append({"type": "opencode_unavailable", "command": opencode_bin})
+        quick_check = self.db.execute("PRAGMA quick_check").fetchone()[0]
+        stale_leases = self.db.execute(
+            "SELECT COUNT(*) FROM deliveries WHERE status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+            (now_iso(),),
+        ).fetchone()[0]
+        disk = shutil.disk_usage(self.home)
         return {
-            "ok": not warnings,
+            "ok": not warnings and quick_check == "ok",
             "home": str(self.home),
             "db_path": str(self.home / "jobs.sqlite"),
             "logs_dir": str(self.logs),
@@ -891,8 +1286,74 @@ class JobManager:
             "tables": sorted(tables),
             "delivery_counts": delivery_counts,
             "codex": {"command": codex_bin, "available": codex_available},
+            "opencode": {"command": opencode_bin, "available": opencode_available},
+            "schema_version": int(self.db.execute("PRAGMA user_version").fetchone()[0]),
+            "quick_check": quick_check,
+            "maintenance_alive": bool(self.dispatcher_thread and self.dispatcher_thread.is_alive()),
+            "stale_delivery_leases": stale_leases,
+            "disk_free_bytes": disk.free,
+            "token_path": str(self.home / "token"),
             "warnings": warnings,
         }
+
+    def cleanup(self, older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
+        self._ensure_open()
+        if isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0:
+            raise ValueError("older_than_seconds must be a non-negative integer")
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+        with self.db_lock:
+            rows = self.db.execute(
+                "SELECT job_id, stdout_path, stderr_path, events_path FROM jobs WHERE status IN ('completed','failed','timeout','cancelled','orphaned') AND updated_at<=?",
+                (cutoff,),
+            ).fetchall()
+            job_ids = [row["job_id"] for row in rows]
+            if not dry_run and job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                self.db.execute("BEGIN IMMEDIATE")
+                for row in rows:
+                    job_id = row["job_id"]
+                    artifacts = [
+                        row["stdout_path"],
+                        row["stderr_path"],
+                        row["events_path"],
+                        str(self.logs / f"{job_id}.runner.log"),
+                        str(self.home / "specs" / f"{job_id}.json"),
+                    ]
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO cleanup_tombstones(tombstone_id, job_id, artifacts_json, created_at) VALUES (?, ?, ?, ?)",
+                        ("clean_" + uuid.uuid4().hex[:16], job_id, json.dumps(artifacts, separators=(",", ":")), now_iso()),
+                    )
+                self.db.execute(f"DELETE FROM delivery_attempts WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE job_id IN ({placeholders}))", job_ids)
+                self.db.execute(f"DELETE FROM deliveries WHERE job_id IN ({placeholders})", job_ids)
+                self.db.execute(f"DELETE FROM wake_targets WHERE job_id IN ({placeholders})", job_ids)
+                self.db.execute(f"DELETE FROM events WHERE job_id IN ({placeholders})", job_ids)
+                self.db.execute(f"DELETE FROM jobs WHERE job_id IN ({placeholders}) AND status!='running'", job_ids)
+                self.db.commit()
+        if not dry_run:
+            self._drain_cleanup_tombstones()
+        return {"dry_run": dry_run, "older_than_seconds": older_than_seconds, "jobs": job_ids, "count": len(job_ids)}
+
+    def _drain_cleanup_tombstones(self) -> None:
+        with self.db_lock:
+            tombstones = self.db.execute("SELECT tombstone_id, artifacts_json FROM cleanup_tombstones").fetchall()
+        for tombstone in tombstones:
+            failed = False
+            for raw_path in json.loads(tombstone["artifacts_json"] or "[]"):
+                for attempt in range(3):
+                    try:
+                        Path(raw_path).unlink()
+                        break
+                    except FileNotFoundError:
+                        break
+                    except OSError:
+                        if attempt == 2:
+                            failed = True
+                        else:
+                            time.sleep(0.05)
+            if not failed:
+                with self.db_lock:
+                    self.db.execute("DELETE FROM cleanup_tombstones WHERE tombstone_id=?", (tombstone["tombstone_id"],))
+                    self.db.commit()
 
     async def stop(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(None, self.stop_sync, job_id, signal, kill_after_seconds)
@@ -901,36 +1362,55 @@ class JobManager:
         return self._stop(job_id, signal, kill_after_seconds)
 
     def _stop(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
+        if isinstance(kill_after_seconds, bool) or not isinstance(kill_after_seconds, int) or kill_after_seconds < 0 or kill_after_seconds > 86400:
+            raise ValueError("kill_after_seconds must be between 0 and 86400")
         proc = self.processes.get(job_id)
-        row = self._row("SELECT status, worker_pid FROM jobs WHERE job_id=?", (job_id,))
-        if not proc and not row:
+        row = self._row("SELECT status, worker_pid, pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+        if not row:
             raise ValueError(f"Job is not running in this server: {job_id}")
         if row and row["status"] != "running":
             raise ValueError(f"Job is not running: {job_id}")
+        deadline = time.monotonic() + kill_after_seconds
+        stop_token = now_iso()
         with self.db_lock:
-            self.db.execute(
-                "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=?",
-                (now_iso(), now_iso(), job_id),
-            )
+            requested = self.db.execute(
+                "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status='running'",
+                (stop_token, job_id),
+            ).rowcount
             self.db.commit()
+        if not requested:
+            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
+        row = self._row("SELECT status, worker_pid, pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+        if not row or row["status"] != "running":
+            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
+        workload_pid = int(row["pid"]) if row["pid"] else None
+        if workload_pid and not self._terminate_pid(workload_pid, signal == "kill", deadline):
+            with self.db_lock:
+                self.db.execute(
+                    "UPDATE jobs SET stop_requested_at=NULL WHERE job_id=? AND status='running' AND stop_requested_at=?",
+                    (job_id, stop_token),
+                )
+                self.db.commit()
+            raise RuntimeError(f"Failed to stop workload process tree: {workload_pid}")
+        changed = self._transition_terminal(job_id, "cancelled")
+        if not changed:
+            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
         self._emit(job_id, "cancelled")
-        if proc:
-            self._kill_process(proc, force=signal == "kill")
+        failures = []
+        runner_pid = int(row["worker_pid"]) if row["worker_pid"] else None
+        if runner_pid and not self._terminate_pid(runner_pid, signal == "kill", deadline):
+            failures.append(runner_pid)
+        if proc and proc.pid != runner_pid:
+            if not self._terminate_pid(proc.pid, signal == "kill", deadline):
+                failures.append(proc.pid)
             try:
-                proc.wait(timeout=kill_after_seconds)
+                proc.wait(timeout=max(0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                self._kill_process(proc, force=True)
-                proc.wait()
-            self._readers_done(job_id)
-            self.processes.pop(job_id, None)
-        elif row and row["worker_pid"]:
-            if sys.platform == "win32":
-                args = ["taskkill", "/PID", str(row["worker_pid"]), "/T"]
-                if signal == "kill":
-                    args.append("/F")
-                subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                os.kill(int(row["worker_pid"]), 9 if signal == "kill" else 15)
+                failures.append(proc.pid)
+        self._readers_done(job_id)
+        self.processes.pop(job_id, None)
+        if failures:
+            raise RuntimeError(f"Failed to stop process tree(s): {failures}")
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
 
 
@@ -1014,6 +1494,11 @@ def job_retry_delivery(delivery_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def job_delivery_attempts(delivery_id: str, limit: int = 20) -> dict[str, Any]:
+    return get_client().get(f"/deliveries/{delivery_id}/attempts", {"limit": limit})
+
+
+@mcp.tool()
 def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None) -> dict[str, Any]:
     return get_client().get(f"/jobs/{job_id}/tail", {"stream": stream, "max_bytes": max_bytes, "offset": offset})
 
@@ -1039,6 +1524,11 @@ def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 1
 @mcp.tool()
 def job_doctor() -> dict[str, Any]:
     return get_client().get("/doctor")
+
+
+@mcp.tool()
+def job_cleanup(older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
+    return get_client().post("/cleanup", {"older_than_seconds": older_than_seconds, "dry_run": dry_run})
 
 
 def main() -> None:

@@ -3,6 +3,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 from vanth.server import JobManager, normalize_event_payload, now_iso, parse_agent_event_line
@@ -108,6 +109,19 @@ def test_checkpoint_progress_and_tail(tmp_path):
     run(main())
 
 
+def test_reader_drain_finishes_before_job_cleanup(tmp_path):
+    manager = JobManager(tmp_path)
+    drained = threading.Event()
+    reader = threading.Thread(target=lambda: (time.sleep(2.1), drained.set()))
+    manager.reader_threads["job_test"] = [reader]
+    reader.start()
+
+    manager._readers_done("job_test")
+
+    assert drained.is_set()
+    manager.close()
+
+
 def test_wake_target_enqueues_delivery(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
@@ -190,6 +204,47 @@ for line in sys.stdin:
         assert [request["method"] for request in requests] == ["initialize", "thread/resume", "turn/start"]
         assert requests[1]["params"]["threadId"] == "thread_test"
         assert requests[2]["params"]["input"][0]["text"] == delivery["payload"]["prompt"]
+
+    run(main())
+
+
+def test_opencode_thread_delivery_dispatches_via_cli(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path / "state")
+        calls = tmp_path / "opencode_args.json"
+        fake_opencode = tmp_path / "fake_opencode.py"
+        fake_opencode.write_text(
+            "import json,sys; open(sys.argv[1], 'w').write(json.dumps(sys.argv[2:]))",
+            encoding="utf-8",
+        )
+        code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'opencode dispatch'}), flush=True)"
+        started = await manager.start(
+            cmd(code),
+            wake_targets=[
+                {
+                    "type": "opencode_thread",
+                    "events": ["checkpoint"],
+                    "thread_id": "ses_test",
+                    "cwd": str(tmp_path),
+                    "opencode_command": [sys.executable, str(fake_opencode), str(calls)],
+                }
+            ],
+        )
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        delivery = poll_delivery(manager, started["job_id"], "delivered")
+
+        assert delivery is not None
+        assert delivery["attempts"] == 1
+        assert json.loads(calls.read_text(encoding="utf-8")) == [
+            "run",
+            "--session",
+            "ses_test",
+            "--dir",
+            str(tmp_path),
+            "--format",
+            "json",
+            delivery["payload"]["prompt"],
+        ]
 
     run(main())
 

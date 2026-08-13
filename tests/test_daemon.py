@@ -24,7 +24,7 @@ def test_daemon_http_job_flow(tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    client = VanthClient(f"http://127.0.0.1:{port}")
+    client = VanthClient(f"http://127.0.0.1:{port}", tmp_path / "state")
     try:
         deadline = time.monotonic() + 5
         while True:

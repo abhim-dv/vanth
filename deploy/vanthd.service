@@ -1,0 +1,14 @@
+[Unit]
+Description=Vanth local background-job daemon
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/vanth
+Environment=VANTH_HOME=%h/.vanth
+ExecStart=%h/.local/bin/uv run --directory %h/vanth vanthd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
