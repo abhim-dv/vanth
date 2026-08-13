@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .vanth/
+.vanth-demo/
 dist/
 bin/
 *.exe

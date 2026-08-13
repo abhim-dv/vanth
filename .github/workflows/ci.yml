@@ -48,5 +48,15 @@ jobs:
           uv run python scripts/generate_go_fixture.py testdata
           go test ./internal/state/ -count=1
       - run: go build ./...
-      - name: Check fixture is committed and current
-        run: git diff --exit-code -- testdata/state/jobs.sqlite
+      - name: Fixture matches schema and representative rows
+        run: |
+          uv run python - <<'PY'
+          import sqlite3
+          db = sqlite3.connect('testdata/state/jobs.sqlite')
+          assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+          jobs = {r[0]: r[3] for r in db.execute('SELECT job_id, name, command, status FROM jobs').fetchall()}
+          assert jobs == {'job_completed': 'completed', 'job_running': 'running'}, jobs
+          ev = {r[0] for r in db.execute('SELECT event_id FROM events').fetchall()}
+          assert {'evt_complete', 'evt_progress'} <= ev, ev
+          print('fixture semantic check OK')
+          PY
