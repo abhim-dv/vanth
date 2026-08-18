@@ -1985,6 +1985,30 @@ def job_dashboard(job_ids: list[str] | None = None, limit: int = 5000) -> dict[s
     return get_client().get("/dashboard", {"job_ids": job_ids, "limit": limit})
 
 
+def _hint_setup() -> None:
+    """Print a stderr hint on MCP startup when a known client still lacks the
+    Vanth MCP entry. stdout is the JSON-RPC protocol, so hints go to stderr
+    (harmless to the transport). Suppress with VANTH_NO_SETUP_HINT=1."""
+    if os.environ.get("VANTH_NO_SETUP_HINT") in {"1", "true", "yes"}:
+        return
+    try:
+        from .setup import _is_configured, client_config_paths
+
+        found = client_config_paths()
+        missing = []
+        for client, paths in found.items():
+            if not any(_is_configured(client, path) for path in paths):
+                missing.append(client)
+        if missing:
+            print(
+                "vanth: MCP server not configured in " + ", ".join(missing)
+                + " — run `vanth setup` to register (or set VANTH_NO_SETUP_HINT=1)",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     from .cli import main as cli_main
 
@@ -1994,4 +2018,5 @@ def main(argv: list[str] | None = None) -> None:
     # which is what MCP clients expect from `uv run vanth`.
     if args and args[0] in {"status", "doctor", "restart", "setup"}:
         raise SystemExit(cli_main(args))
+    _hint_setup()
     mcp.run()

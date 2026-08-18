@@ -139,7 +139,37 @@ def cmd_status(home: Path, *, json_out: bool = False) -> int:
                 print(f"    - {warning.get('type')}: {warning}")
     elif up:
         print("  doctor:   unreachable (auth/schema problem)")
+
+    _print_setup_status()
     return 0 if up else 1
+
+
+def _print_setup_status() -> None:
+    """Show which MCP clients have the Vanth MCP server configured, so a user
+    can see onboarding state at a glance and is pointed at `vanth setup`."""
+    try:
+        from .setup import client_config_paths, _is_configured
+
+        found = client_config_paths()
+        if not found:
+            print("  mcp:      no known client configs found — run `vanth setup`")
+            return
+        parts = []
+        for client in ("opencode", "codex", "claude"):
+            paths = found.get(client) or []
+            if not paths:
+                continue
+            configured = any(_is_configured(client, path) for path in paths)
+            parts.append(f"{client}={('configured' if configured else 'not configured')}")
+        if not parts:
+            print("  mcp:      no known client configs found — run `vanth setup`")
+            return
+        state = "  mcp:      " + ", ".join(parts)
+        print(state)
+        if any("not configured" in part for part in parts):
+            print("            run `vanth setup` to register")
+    except Exception:
+        pass
 
 
 def cmd_doctor(home: Path, *, json_out: bool = False) -> int:
@@ -165,6 +195,7 @@ def cmd_doctor(home: Path, *, json_out: bool = False) -> int:
         print(f"  disk_free:     {_fmt_bytes(report.get('disk_free_bytes', 0))}")
         for warning in report.get("warnings", []):
             print(f"  WARNING:       {warning}")
+        _print_setup_status()
     return 0 if report.get("ok") else 1
 
 

@@ -4,6 +4,14 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.1.1 - 2026-08-18
+
+- `vanth status` and `vanth doctor` now show MCP client registration state
+  (`opencode=configured, codex=not configured, ...`) and point at `vanth setup`
+  when something is missing.
+- The MCP server prints a one-line stderr hint on startup when a known client
+  isn't configured yet (suppress with `VANTH_NO_SETUP_HINT=1`).
+
 ## 1.1.0 - 2026-08-18
 
 ### MCP client setup

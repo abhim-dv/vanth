@@ -110,3 +110,48 @@ def test_no_configs_found_returns_one(tmp_path):
     home.mkdir()
     setup.client_config_paths = lambda home=None: {}
     assert setup.run_setup(None, home=home, assume_yes=True) == 1
+
+
+def test_mcp_startup_hint_mentions_unconfigured_clients(tmp_path, capsys):
+    import vanth.server as server
+
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    setup.client_config_paths = lambda home=None: {"claude": [claude_path]}
+    server._hint_setup()
+    captured = capsys.readouterr()
+    assert "vanth setup" in captured.err
+
+
+def test_mcp_startup_hint_silent_when_all_configured(tmp_path, capsys):
+    import vanth.server as server
+
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    setup.run_setup(None, home=canonical_home(), assume_yes=True)
+    setup.client_config_paths = lambda home=None: {"opencode": [opencode_path]}
+    server._hint_setup()
+    captured = capsys.readouterr()
+    assert "vanth setup" not in captured.err
+
+
+def test_mcp_startup_hint_respects_env_opt_out(tmp_path, capsys, monkeypatch):
+    import vanth.server as server
+
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    setup.client_config_paths = lambda home=None: {"opencode": [opencode_path]}
+    monkeypatch.setenv("VANTH_NO_SETUP_HINT", "1")
+    server._hint_setup()
+    captured = capsys.readouterr()
+    assert "vanth setup" not in captured.err
+
+
+def test_status_line_prints_client_states(tmp_path, capsys):
+    from vanth.cli import _print_setup_status
+
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    _print_setup_status()
+    captured = capsys.readouterr()
+    assert "opencode=not configured" in captured.out
+    setup.run_setup(None, home=canonical_home(), assume_yes=True)
+    _print_setup_status()
+    captured = capsys.readouterr()
+    assert "opencode=configured" in captured.out
