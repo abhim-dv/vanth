@@ -250,6 +250,28 @@ def cmd_restart(home: Path, *, json_out: bool = False) -> int:
     return 0
 
 
+def cmd_setup(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    from .setup import run_setup
+
+    if "-h" in argv or "--help" in argv:
+        print(
+            "usage: vanth setup [opencode] [codex] [claude] [--remove] [--yes]\n"
+            "\n"
+            "Register (or remove) the Vanth MCP server in the given clients' configs.\n"
+            "With no client names, detects and configures every known client found.\n"
+            "\n"
+            "options:\n"
+            "  --remove, -r   remove the Vanth MCP entry instead of adding it\n"
+            "  --yes, -y      do not prompt; apply immediately\n"
+            "  --json         machine-readable output\n"
+        )
+        return 0
+    remove = "--remove" in argv or "-r" in argv
+    assume_yes = "--yes" in argv or "-y" in argv
+    clients = [arg for arg in argv if arg in {"opencode", "codex", "claude"}]
+    return run_setup(clients or None, home=home, remove=remove, assume_yes=assume_yes, json_out=json_out)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     home = canonical_home()
@@ -265,6 +287,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(home, json_out=json_out)
     if command == "restart":
         return cmd_restart(home, json_out=json_out)
+    if command == "setup":
+        return cmd_setup(argv[1:], home, json_out=json_out)
     print(f"vanth: unknown command {command!r}", file=sys.stderr)
     return 2
 

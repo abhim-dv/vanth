@@ -4,6 +4,26 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.1.0 - 2026-08-18
+
+### MCP client setup
+
+- New `vanth setup` command that connects the MCP server to the clients
+  installed on the machine in one step. It detects opencode, Codex, and
+  generic `mcpServers`-style clients (Claude Code / Cursor), backs up each
+  config it touches (`*.vanth-setup-<ts>.bak`), and upserts the Vanth MCP
+  entry without disturbing anything else in the file.
+  - `vanth setup` — detect and configure everything found (prompts before
+    changing).
+  - `vanth setup --yes` — apply without prompting (scripts/CI).
+  - `vanth setup opencode codex` — only specific clients.
+  - `vanth setup --json` — machine-readable result.
+  - `vanth setup --remove` — remove the Vanth MCP entries instead.
+  - `vanth setup --help` — usage.
+- MCP stdio tests now spawn `python -m vanth` instead of `uv run vanth`,
+  so they don't trip over a running daemon locking the venv's entry-point
+  scripts on Windows.
+
 ## 1.0.1 - 2026-08-18
 
 - Packaging: add Apache-2.0 `LICENSE`, production PyPI metadata (classifiers,

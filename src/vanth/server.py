@@ -1989,9 +1989,9 @@ def main(argv: list[str] | None = None) -> None:
     from .cli import main as cli_main
 
     args = list(sys.argv[1:] if argv is None else argv)
-    # Human-facing subcommands (status/doctor/restart) are dispatched to the
-    # CLI; anything else (including no args) runs the MCP stdio server, which
-    # is what MCP clients expect from `uv run vanth`.
-    if args and args[0] in {"status", "doctor", "restart"}:
+    # Human-facing subcommands (status/doctor/restart/setup) are dispatched to
+    # the CLI; anything else (including no args) runs the MCP stdio server,
+    # which is what MCP clients expect from `uv run vanth`.
+    if args and args[0] in {"status", "doctor", "restart", "setup"}:
         raise SystemExit(cli_main(args))
     mcp.run()

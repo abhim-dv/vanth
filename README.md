@@ -110,6 +110,8 @@ uv run vanth status              # is the daemon up? pid, schema, running jobs, 
 uv run vanth status --json       # machine-readable version
 uv run vanth doctor              # full health report (same as job_doctor, human-readable)
 uv run vanth restart             # gracefully stop + start the daemon (jobs survive)
+uv run vanth setup               # register the MCP server in your clients' configs
+uv run vanth setup --remove      # unregister it
 ```
 
 `vanth restart` is the reliable way to pick up a code/version update: it sends
@@ -173,12 +175,38 @@ requested) or `orphaned` (if not) — never left as a zombie `running` row.
 `vanth` is the MCP stdio server. It talks to the daemon, starting it
 automatically on first use if it is not already running.
 
-Two ways to install it:
+### One-shot setup
 
-- **From the published wheel** (recommended for agents/users):
-  `uv tool install vanth`, then configure `vanth` as the command.
-- **From a source checkout** (development): point `uv --directory <repo>` at
-  the checkout, as in the examples below.
+After installing the tool, connect it to the MCP clients on your machine in a
+single step:
+
+```cmd
+uv tool install vanth
+vanth setup
+```
+
+`vanth setup` detects your installed clients (opencode, Codex, and generic
+`mcpServers`-style clients such as Claude Code / Cursor), shows what it found,
+backs up each config before touching it (`.vanth-setup-<ts>.bak`), and upserts
+the Vanth MCP entry — leaving every other setting and comment untouched.
+
+```cmd
+vanth setup                  # detect + configure everything found (prompts)
+vanth setup --yes            # apply without prompting (scripts/CI)
+vanth setup opencode codex   # only specific clients
+vanth setup --json           # machine-readable result
+vanth setup --remove         # remove the Vanth MCP entries instead
+```
+
+Configs it manages:
+
+| Client | File | Section |
+|---|---|---|
+| opencode | `~/.config/opencode/opencode.json` | `mcp.vanth` |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.vanth]` |
+| Claude Code / Cursor | `~/.claude.json` | `mcpServers.vanth` |
+
+Manually, the same entries are:
 
 ### opencode
 

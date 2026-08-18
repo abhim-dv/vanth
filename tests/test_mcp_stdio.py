@@ -44,8 +44,8 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
         daemon, url = start_daemon(tmp_path)
         env = {**os.environ, "VANTH_DAEMON_URL": url, "VANTH_HOME": str(tmp_path)}
         server = StdioServerParameters(
-            command="uv",
-            args=["run", "vanth"],
+            command=sys.executable,
+            args=["-m", "vanth"],
             cwd=str(Path(__file__).parents[1]),
             env=env,
         )
@@ -126,8 +126,8 @@ def test_mcp_stdio_errors_and_event_cap(tmp_path):
         daemon, url = start_daemon(tmp_path, {"VANTH_MAX_EVENT_BYTES": "20"})
         env = {**os.environ, "VANTH_DAEMON_URL": url, "VANTH_HOME": str(tmp_path)}
         server = StdioServerParameters(
-            command="uv",
-            args=["run", "vanth"],
+            command=sys.executable,
+            args=["-m", "vanth"],
             cwd=str(Path(__file__).parents[1]),
             env=env,
         )
