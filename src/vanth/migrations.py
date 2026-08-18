@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -90,7 +90,19 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           tombstone_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, artifacts_json TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
-        PRAGMA user_version=5;
+        CREATE TABLE IF NOT EXISTS metric_series (
+          series_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, metric TEXT NOT NULL,
+          x REAL NOT NULL, y REAL NOT NULL, stage TEXT, event_id TEXT NOT NULL,
+          seq INTEGER NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_metric_series_job_metric ON metric_series(job_id, metric, seq);
+        CREATE TABLE IF NOT EXISTS artifacts (
+          artifact_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, name TEXT NOT NULL,
+          uri TEXT NOT NULL, kind TEXT, size_bytes INTEGER, sha256 TEXT, meta_json TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at);
+        PRAGMA user_version=8;
         """
     )
 
@@ -172,6 +184,29 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 _add_missing(db, "jobs", {"notes": "TEXT", "run_json": "TEXT"})
                 db.execute("PRAGMA user_version=7")
                 version = 7
+            if version < 8:
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS metric_series (
+                      series_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, metric TEXT NOT NULL,
+                      x REAL NOT NULL, y REAL NOT NULL, stage TEXT, event_id TEXT NOT NULL,
+                      seq INTEGER NOT NULL, created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                db.execute("CREATE INDEX IF NOT EXISTS idx_metric_series_job_metric ON metric_series(job_id, metric, seq)")
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS artifacts (
+                      artifact_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, name TEXT NOT NULL,
+                      uri TEXT NOT NULL, kind TEXT, size_bytes INTEGER, sha256 TEXT, meta_json TEXT,
+                      created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                db.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at)")
+                db.execute("PRAGMA user_version=8")
+                version = 8
             db.commit()
         except Exception:
             db.rollback()

@@ -65,7 +65,19 @@ def seed(db_path: Path) -> None:
               tombstone_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, artifacts_json TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
-            PRAGMA user_version=7;
+            CREATE TABLE metric_series (
+              series_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, metric TEXT NOT NULL,
+              x REAL NOT NULL, y REAL NOT NULL, stage TEXT, event_id TEXT NOT NULL,
+              seq INTEGER NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_metric_series_job_metric ON metric_series(job_id, metric, seq);
+            CREATE TABLE artifacts (
+              artifact_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, name TEXT NOT NULL,
+              uri TEXT NOT NULL, kind TEXT, size_bytes INTEGER, sha256 TEXT, meta_json TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_artifacts_job ON artifacts(job_id, created_at);
+            PRAGMA user_version=8;
             """
         )
         stamp = "2026-01-01T00:00:00Z"
@@ -154,6 +166,17 @@ def seed(db_path: Path) -> None:
                 "INSERT INTO cleanup_tombstones(tombstone_id, job_id, artifacts_json, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 ("clean_1", "job_completed", json.dumps(["logs/gone.log"]), stamp),
+            )
+            db.execute(
+                "INSERT INTO metric_series(series_id, job_id, metric, x, y, stage, event_id, seq, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("ser_1", "job_running", "loss", 1.0, 0.42, "train", "evt_progress", 1, stamp),
+            )
+            db.execute(
+                "INSERT INTO artifacts(artifact_id, job_id, name, uri, kind, size_bytes, sha256, meta_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("art_1", "job_completed", "best.pt", "file:///tmp/best.pt", "checkpoint",
+                 123, "abc123", json.dumps({"epoch": 5}), stamp),
             )
         schema = db.execute("PRAGMA user_version").fetchone()[0]
         assert schema == LATEST_SCHEMA_VERSION, schema

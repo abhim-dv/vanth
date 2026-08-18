@@ -312,7 +312,7 @@ events.
 
 ---
 
-## Tool reference (all 14 MCP tools)
+## Tool reference (all 20 MCP tools)
 
 | Tool | Purpose |
 |---|---|
@@ -324,6 +324,12 @@ events.
 | `job_view` | Agent-facing summaries sorted by attention priority |
 | `job_events` | Structured events for a job (forward via `since_event_id`, or latest-first via `reverse`) |
 | `job_tail` | Bounded stdout/stderr log tail with byte offsets |
+| `job_metrics_query` | Read stored scalar metric series (loss, acc, progress.percent, ...) |
+| `job_metric_compare` | Compare one metric across jobs (latest/mean/min/max/sum/count) |
+| `job_run_summary` | One-call "did it work?" — status, runtime, progress, metrics, artifacts |
+| `job_artifact_add` | Attach an artifact (checkpoint, CSV, output) to a job |
+| `job_artifacts` | List artifacts attached to a job |
+| `job_dashboard` | Downsampled chart-data view for any renderer |
 | `job_deliveries` | Wake deliveries for a job, filterable by `status` |
 | `job_mark_delivery` | Manually set a delivery's status |
 | `job_retry_delivery` | Requeue a failed delivery for dispatch |
@@ -451,6 +457,60 @@ job_cleanup(older_than_seconds=86400, dry_run=false)  # delete
 Removes terminal jobs older than the cutoff: logs, event mirrors, specs,
 deliveries, attempts, wake targets, events, then the job row. Running jobs are
 never selected. Dry-run is fully read-only. Cleanup is safe to repeat.
+
+### job_metrics_query — read stored scalar series
+
+```text
+job_metrics_query(job_id="job_...", metric="loss", from_ms=..., to_ms=..., limit=1000)
+```
+
+Returns the stored series for one job, grouped by metric name. `metric`
+filters to a single series (e.g. `loss`, `acc`, `progress.percent`);
+`from_ms`/`to_ms` filter by event timestamp (epoch milliseconds). Points are
+ordered by event sequence. This is the read side of the terminal monitor's
+data.
+
+### job_metric_compare — compare a metric across runs
+
+```text
+job_metric_compare(job_ids=["job_a", "job_b"], metric="val_loss", aggregation="min")
+```
+
+Compares one metric across jobs (e.g. val_loss across seeds or configs).
+`aggregation` is `latest`, `mean`, `min`, `max`, `sum`, or `count`; the result
+includes the per-job value plus the first/last points. This is the W&B-style
+"which run won?" primitive.
+
+### job_run_summary — did it work?
+
+```text
+job_run_summary(job_id="job_...")
+```
+
+One call returns status, name, runtime, exit code, latest progress, notes,
+per-metric overview (latest/first/min/max/count), and attached artifacts — the
+fastest way for an agent to report on a finished job.
+
+### job_artifact_add / job_artifacts — attach outputs
+
+```text
+job_artifact_add(job_id="job_...", name="best.pt", uri="file:///...", kind="checkpoint",
+                 size_bytes=..., sha256="...", meta={"epoch": 5})
+job_artifacts(job_id="job_...")
+```
+
+Attach artifacts (checkpoints, CSVs, rendered outputs) to a job so they are
+listed in `job_run_summary` and retrievable later. `meta` is free-form JSON.
+
+### job_dashboard — chart data for any renderer
+
+```text
+job_dashboard(job_ids=["job_..."], limit=5000)
+```
+
+Returns the job list plus every stored metric series, downsampled to `limit`
+points per series — the same data the Go terminal monitor charts, exposed over
+HTTP/MCP so any client (a future web/cloud dashboard) can render it.
 
 ---
 
@@ -665,6 +725,12 @@ Authenticated with `Authorization: Bearer <token>`.
 | POST | `/jobs/{id}/rerun` | Rerun a job with its original configuration |
 | GET | `/jobs/{id}/status` | Job status (includes command/env/cwd) |
 | GET | `/jobs/{id}/events` | Events (`since_event_id`, `types`, `limit`, `reverse`) |
+| GET | `/jobs/{id}/metrics` | Metric series (`metric`, `from_ms`, `to_ms`, `limit`) |
+| GET | `/jobs/{id}/summary` | Run summary (status, runtime, metrics, artifacts) |
+| GET | `/jobs/{id}/artifacts` | Artifacts (`limit`) |
+| POST | `/jobs/{id}/artifacts` | Add an artifact |
+| GET | `/metrics/compare` | Compare metric across jobs (`job_ids`, `metric`, `aggregation`) |
+| GET | `/dashboard` | Chart data (`job_ids`, `limit`) |
 | GET | `/jobs/{id}/tail` | Log tail (`stream`, `max_bytes`, `offset`) |
 | POST | `/jobs/{id}/wait` | Wait for an event |
 | POST | `/jobs/{id}/stop` | Stop a job |

@@ -38,6 +38,31 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _ms_to_iso(ms: int) -> str:
+    """Convert epoch milliseconds to the RFC3339 text Vanth stores."""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        raise ValueError("timestamp must be epoch milliseconds (int)") from None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _downsample(points: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Uniformly reduce a series to at most ``limit`` points.
+
+    When the series is larger than ``limit``, points are sampled by index to
+    keep an even spread across the whole series (same idea as the Go
+    monitor's downsample). The first and last points are always retained.
+    """
+    n = len(points)
+    if n <= limit or limit <= 0:
+        return points
+    if limit == 1:
+        return [points[0]]
+    indices = sorted(set(int(round(i * (n - 1) / (limit - 1))) for i in range(limit)))
+    return [points[i] for i in indices]
+
+
 def _parse_iso(value: str) -> datetime | None:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -464,6 +489,7 @@ class JobManager:
                 "created_at": created_at,
             }
             self._enqueue_deliveries_uncommitted(event)
+            self._persist_metric_series_uncommitted(event)
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -517,6 +543,79 @@ class JobManager:
             if row:
                 deliveries.append(self._delivery_dict(row))
         return deliveries
+
+    def _is_finite_number(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return value == value and value not in (float("inf"), float("-inf"))
+        return False
+
+    def _metric_x(self, data: dict[str, Any], seq: int) -> float:
+        step = data.get("_step")
+        if self._is_finite_number(step):
+            return float(step)
+        return float(seq)
+
+    def _persist_metric_series_uncommitted(self, event: dict[str, Any]) -> None:
+        """Mirror scalar fields of metric/progress events into metric_series.
+
+        Mirrors the Go monitor's transform: numeric `metric` payload fields
+        become series named after the field; `progress` events produce
+        ``progress.current`` / ``progress.total`` / ``progress.percent``.
+        ``_step`` (when finite numeric) is the x value, otherwise the event
+        sequence. Keys prefixed with ``_`` and the ``stage``/``phase`` keys are
+        skipped as series names.
+        """
+        if event.get("persisted") is False or not event.get("event_id"):
+            return
+        event_type = event["type"]
+        data = event["data"]
+        if event_type not in ("metric", "progress"):
+            return
+        stage = data.get("stage") or data.get("phase")
+        if not isinstance(stage, str):
+            stage = None
+        rows: list[tuple[str, str, float, float]] = []
+        if event_type == "metric":
+            for key, value in data.items():
+                if key.startswith("_") or key in ("stage", "phase"):
+                    continue
+                if not self._is_finite_number(value):
+                    continue
+                rows.append((key, float(value), float(self._metric_x(data, event["seq"])), stage))
+        else:
+            current = data.get("current")
+            total = data.get("total")
+            percent = data.get("percent")
+            if self._is_finite_number(current):
+                rows.append(("progress.current", float(current), float(self._metric_x(data, event["seq"])), stage))
+            if self._is_finite_number(total):
+                rows.append(("progress.total", float(total), float(self._metric_x(data, event["seq"])), stage))
+            if self._is_finite_number(percent):
+                rows.append(("progress.percent", float(percent), float(self._metric_x(data, event["seq"])), stage))
+        x = float(self._metric_x(data, event["seq"]))
+        for metric, y, seq_value, series_stage in rows:
+            series_id = "ser_" + uuid.uuid4().hex[:16]
+            self.db.execute(
+                """
+                INSERT INTO metric_series(series_id, job_id, metric, x, y, stage, event_id, seq, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    series_id,
+                    event["job_id"],
+                    metric,
+                    x,
+                    y,
+                    series_stage,
+                    event["event_id"],
+                    event["seq"],
+                    event["created_at"],
+                ),
+            )
+        if rows:
+            self.logger.debug("persisted %d metric points job_id=%s event_id=%s", len(rows), event["job_id"], event["event_id"])
 
     def _claim_delivery(self, delivery_id: str) -> dict[str, Any] | None:
         with self.db_lock:
@@ -1174,6 +1273,213 @@ class JobManager:
             ).fetchall()
         return {"deliveries": [self._delivery_dict(row) for row in rows]}
 
+    def metrics_query(self, job_id: str, metric: str | None = None, from_ms: int | None = None,
+                      to_ms: int | None = None, limit: int = 1000) -> dict[str, Any]:
+        """Return stored scalar series for one job.
+
+        Series come from ``metric``/``progress`` AGENT_EVENT payloads mirrored
+        into ``metric_series``. ``metric`` filters to one name (e.g.
+        ``loss`` or ``progress.percent``); without it all metrics for the job
+        are returned grouped by name. ``from_ms``/``to_ms`` filter by event
+        timestamp (milliseconds since epoch). Points are ordered by seq.
+        """
+        self._ensure_open()
+        validate_limit(limit, "limit", 10000)
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown job_id: {job_id}")
+        where = ["job_id=?"]
+        args: list[Any] = [job_id]
+        if metric:
+            where.append("metric=?")
+            args.append(metric)
+        if from_ms is not None:
+            where.append("created_at >= ?")
+            args.append(_ms_to_iso(from_ms))
+        if to_ms is not None:
+            where.append("created_at <= ?")
+            args.append(_ms_to_iso(to_ms))
+        with self.db_lock:
+            rows = self.db.execute(
+                f"""
+                SELECT metric, x, y, stage, event_id, seq, created_at
+                FROM metric_series WHERE {' AND '.join(where)}
+                ORDER BY metric, seq ASC LIMIT ?
+                """,
+                (*args, limit),
+            ).fetchall()
+        series: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            point = {
+                "x": row["x"],
+                "y": row["y"],
+                "stage": row["stage"],
+                "event_id": row["event_id"],
+                "seq": row["seq"],
+                "at": row["created_at"],
+            }
+            series.setdefault(row["metric"], []).append(point)
+        return {"job_id": job_id, "series": series, "metrics": list(series.keys())}
+
+    def metric_compare(self, job_ids: list[str], metric: str, aggregation: str = "latest",
+                       from_ms: int | None = None, to_ms: int | None = None) -> dict[str, Any]:
+        """Compare one metric across jobs.
+
+        ``aggregation`` is one of ``latest`` (last point), ``mean``, ``min``,
+        ``max``, ``sum``, or ``count``. Returns per-job summary values plus the
+        raw series points so agents can reason about the comparison.
+        """
+        self._ensure_open()
+        valid_aggs = {"latest", "mean", "min", "max", "sum", "count"}
+        if aggregation not in valid_aggs:
+            raise ValueError(f"aggregation must be one of {sorted(valid_aggs)}")
+        if not isinstance(job_ids, list) or not job_ids or len(job_ids) > 50:
+            raise ValueError("job_ids must be a non-empty list of at most 50 ids")
+        if not isinstance(metric, str) or not metric:
+            raise ValueError("metric must be a non-empty string")
+        for job_id in job_ids:
+            if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+                raise ValueError(f"Unknown job_id: {job_id}")
+        result: dict[str, Any] = {"metric": metric, "aggregation": aggregation, "jobs": {}}
+        for job_id in job_ids:
+            points = self.metrics_query(job_id, metric, from_ms, to_ms, limit=10000)["series"].get(metric, [])
+            values = [p["y"] for p in points]
+            summary: Any = None
+            if values:
+                if aggregation == "latest":
+                    summary = values[-1]
+                elif aggregation == "mean":
+                    summary = sum(values) / len(values)
+                elif aggregation == "min":
+                    summary = min(values)
+                elif aggregation == "max":
+                    summary = max(values)
+                elif aggregation == "sum":
+                    summary = sum(values)
+                elif aggregation == "count":
+                    summary = len(values)
+            result["jobs"][job_id] = {
+                "value": summary,
+                "points": len(points),
+                "first": points[0] if points else None,
+                "last": points[-1] if points else None,
+            }
+        return result
+
+    def run_summary(self, job_id: str) -> dict[str, Any]:
+        """One-call summary of a job: status, runtime, progress, top metrics.
+
+        Computes the latest value of every stored metric series plus the last
+        progress event, so an agent can answer "did it work?" in a single call.
+        """
+        status = self.status(job_id)
+        series = self.metrics_query(job_id, limit=10000)["series"]
+        latest_metrics = {metric: points[-1]["y"] for metric, points in series.items() if points}
+        # Build per-metric latest + a compact metric overview.
+        overview = []
+        for metric, points in sorted(series.items()):
+            if not points:
+                continue
+            overview.append(
+                {
+                    "metric": metric,
+                    "latest": points[-1]["y"],
+                    "first": points[0]["y"],
+                    "min": min(p["y"] for p in points),
+                    "max": max(p["y"] for p in points),
+                    "count": len(points),
+                    "stage": points[-1].get("stage"),
+                }
+            )
+        artifacts = self.artifacts(job_id)["artifacts"]
+        return {
+            "job_id": job_id,
+            "status": status["status"],
+            "name": status.get("name"),
+            "runtime_seconds": status.get("runtime_seconds"),
+            "exit_code": status.get("exit_code"),
+            "progress": status.get("progress"),
+            "notes": status.get("notes"),
+            "metrics": overview,
+            "latest_metrics": latest_metrics,
+            "artifacts": artifacts,
+        }
+
+    def artifacts(self, job_id: str, limit: int = 50) -> dict[str, Any]:
+        self._ensure_open()
+        validate_limit(limit, "limit", 1000)
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown job_id: {job_id}")
+        with self.db_lock:
+            rows = self.db.execute(
+                "SELECT * FROM artifacts WHERE job_id=? ORDER BY created_at ASC LIMIT ?",
+                (job_id, limit),
+            ).fetchall()
+        return {
+            "artifacts": [
+                {
+                    "artifact_id": row["artifact_id"],
+                    "job_id": row["job_id"],
+                    "name": row["name"],
+                    "uri": row["uri"],
+                    "kind": row["kind"],
+                    "size_bytes": row["size_bytes"],
+                    "sha256": row["sha256"],
+                    "meta": json.loads(row["meta_json"] or "{}"),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        }
+
+    def artifact_add(self, job_id: str, name: str, uri: str, kind: str | None = None,
+                     size_bytes: int | None = None, sha256: str | None = None,
+                     meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._ensure_open()
+        if not isinstance(name, str) or not name:
+            raise ValueError("name must be a non-empty string")
+        if not isinstance(uri, str) or not uri:
+            raise ValueError("uri must be a non-empty string")
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown job_id: {job_id}")
+        artifact_id = "art_" + uuid.uuid4().hex[:16]
+        created_at = now_iso()
+        with self.db_lock:
+            self.db.execute(
+                """
+                INSERT INTO artifacts(artifact_id, job_id, name, uri, kind, size_bytes, sha256, meta_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (artifact_id, job_id, name, uri, kind, size_bytes, sha256,
+                 json.dumps(meta or {}, separators=(",", ":")), created_at),
+            )
+            self.db.commit()
+        return {"artifact_id": artifact_id, "job_id": job_id, "name": name, "uri": uri,
+                "kind": kind, "size_bytes": size_bytes, "sha256": sha256,
+                "meta": meta or {}, "created_at": created_at}
+
+    def dashboard(self, job_ids: list[str] | None = None, limit: int = 5000) -> dict[str, Any]:
+        """Chart-data view for one or more jobs, mirroring the Go monitor.
+
+        Returns every stored metric series (downsampled to ``limit`` points
+        per series) plus the job list, so any client can render charts the way
+        the terminal monitor does.
+        """
+        self._ensure_open()
+        validate_limit(limit, "limit", 50000)
+        jobs = self.list(limit=100)["jobs"]
+        if job_ids is None:
+            job_ids = [j["job_id"] for j in jobs]
+        elif not isinstance(job_ids, list) or not job_ids or len(job_ids) > 50:
+            raise ValueError("job_ids must be a non-empty list of at most 50 ids")
+        for job_id in job_ids:
+            if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+                raise ValueError(f"Unknown job_id: {job_id}")
+        series: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for job_id in job_ids:
+            q = self.metrics_query(job_id, limit=limit)["series"]
+            series[job_id] = {metric: _downsample(points, limit) for metric, points in q.items()}
+        return {"jobs": jobs, "series": series, "series_count": sum(len(v) for v in series.values())}
+
     def _delivery_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "delivery_id": row["delivery_id"],
@@ -1622,6 +1928,48 @@ def job_doctor() -> dict[str, Any]:
 @mcp.tool()
 def job_cleanup(older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
     return get_client().post("/cleanup", {"older_than_seconds": older_than_seconds, "dry_run": dry_run})
+
+
+@mcp.tool()
+def job_metrics_query(job_id: str, metric: str | None = None, from_ms: int | None = None,
+                      to_ms: int | None = None, limit: int = 1000) -> dict[str, Any]:
+    """Return stored scalar metric series for a job (loss, accuracy, progress.percent, ...)."""
+    return get_client().get(f"/jobs/{job_id}/metrics", {"metric": metric, "from_ms": from_ms, "to_ms": to_ms, "limit": limit})
+
+
+@mcp.tool()
+def job_metric_compare(job_ids: list[str], metric: str, aggregation: str = "latest",
+                       from_ms: int | None = None, to_ms: int | None = None) -> dict[str, Any]:
+    """Compare one metric across jobs (e.g. val_loss across training runs)."""
+    return get_client().get("/metrics/compare", {"job_ids": job_ids, "metric": metric, "aggregation": aggregation,
+                                                 "from_ms": from_ms, "to_ms": to_ms})
+
+
+@mcp.tool()
+def job_run_summary(job_id: str) -> dict[str, Any]:
+    """One-call summary of a job: status, runtime, progress, latest metrics, artifacts."""
+    return get_client().get(f"/jobs/{job_id}/summary")
+
+
+@mcp.tool()
+def job_artifact_add(job_id: str, name: str, uri: str, kind: str | None = None,
+                     size_bytes: int | None = None, sha256: str | None = None,
+                     meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Attach an artifact (checkpoint, CSV, rendered output) to a job."""
+    return get_client().post(f"/jobs/{job_id}/artifacts", {"name": name, "uri": uri, "kind": kind,
+                                                           "size_bytes": size_bytes, "sha256": sha256, "meta": meta})
+
+
+@mcp.tool()
+def job_artifacts(job_id: str, limit: int = 50) -> dict[str, Any]:
+    """List artifacts attached to a job."""
+    return get_client().get(f"/jobs/{job_id}/artifacts", {"limit": limit})
+
+
+@mcp.tool()
+def job_dashboard(job_ids: list[str] | None = None, limit: int = 5000) -> dict[str, Any]:
+    """Chart-data view (downsampled series per job + job list) for any chart renderer."""
+    return get_client().get("/dashboard", {"job_ids": job_ids, "limit": limit})
 
 
 def main() -> None:

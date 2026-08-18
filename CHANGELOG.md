@@ -4,6 +4,25 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+### Telemetry (schema v8)
+
+- `metric_series` table: scalar fields of `metric`/`progress` AGENT_EVENTs are
+  mirrored into queryable series (job, metric, x/y, stage, event id, seq,
+  timestamp), matching the Go monitor's transform semantics (`_step` as x,
+  `progress.current`/`total`/`percent` derived).
+- `artifacts` table: jobs can carry named artifacts (checkpoints, CSVs,
+  rendered outputs) with uri, kind, size, sha256, and meta.
+- New MCP tools + HTTP routes:
+  - `job_metrics_query(job_id, metric?, from_ms?, to_ms?, limit?)` — read scalar series.
+  - `job_metric_compare(job_ids, metric, aggregation)` — compare a metric across runs
+    (latest/mean/min/max/sum/count).
+  - `job_run_summary(job_id)` — one-call "did it work?" (status, runtime, progress,
+    latest metrics, artifacts).
+  - `job_artifact_add(job_id, name, uri, ...)` and `job_artifacts(job_id)`.
+  - `job_dashboard(job_ids?, limit?)` — downsampled chart-data view for any renderer.
+- SQLite schema bumped to v8 (adds `metric_series`, `artifacts` tables);
+  existing homes migrate with a backup. Go fixture/conformance updated to v8.
+
 ### Agent-facing features (schema v7)
 
 - `job_status` / `job_view` now return the job's `command`, `cwd`, `env`,

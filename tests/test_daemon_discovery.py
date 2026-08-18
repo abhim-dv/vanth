@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+from vanth.migrations import LATEST_SCHEMA_VERSION
+
 
 def free_port():
     with socket.socket() as sock:
@@ -32,7 +34,7 @@ def test_daemon_writes_and_removes_discovery_metadata(tmp_path):
         assert payload["url"] == f"http://127.0.0.1:{port}"
         assert payload["home"] == str(tmp_path.resolve())
         assert isinstance(payload["pid"], int) and payload["pid"] > 0
-        assert payload["schema_version"] == 7
+        assert payload["schema_version"] == LATEST_SCHEMA_VERSION
         assert payload["started_at"]
     finally:
         if sys.platform == "win32":

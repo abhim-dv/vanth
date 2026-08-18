@@ -219,6 +219,31 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().deliveries(query.get("job_id", [None])[0], query.get("status", [None])[0], int(query.get("limit", ["20"])[0])))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/attempts"):
                 ok(self, get_manager().delivery_attempts(parsed.path.split("/")[2], int(query.get("limit", ["20"])[0])))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
+                ok(self, get_manager().metrics_query(
+                    parsed.path.split("/")[2],
+                    query.get("metric", [None])[0],
+                    int(query["from_ms"][0]) if "from_ms" in query else None,
+                    int(query["to_ms"][0]) if "to_ms" in query else None,
+                    int(query.get("limit", ["1000"])[0]),
+                ))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/summary"):
+                ok(self, get_manager().run_summary(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
+                ok(self, get_manager().artifacts(parsed.path.split("/")[2], int(query.get("limit", ["50"])[0])))
+            elif parsed.path == "/metrics/compare":
+                ok(self, get_manager().metric_compare(
+                    query.get("job_ids") or [],
+                    query.get("metric", [None])[0],
+                    query.get("aggregation", ["latest"])[0],
+                    int(query["from_ms"][0]) if "from_ms" in query else None,
+                    int(query["to_ms"][0]) if "to_ms" in query else None,
+                ))
+            elif parsed.path == "/dashboard":
+                ok(self, get_manager().dashboard(
+                    query.get("job_ids") or None,
+                    int(query.get("limit", ["5000"])[0]),
+                ))
             else:
                 error(self, "Not found", 404)
         except (ValueError, TypeError, OverflowError) as exc:
@@ -274,6 +299,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().retry_delivery(parsed.path.split("/")[2]))
             elif parsed.path == "/cleanup":
                 ok(self, get_manager().cleanup(**payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
+                ok(self, get_manager().artifact_add(parsed.path.split("/")[2], **payload))
             else:
                 error(self, "Not found", 404)
         except RequestTooLarge as exc:
