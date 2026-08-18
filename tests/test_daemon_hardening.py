@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -218,3 +219,106 @@ def test_shutdown_returns_controlled_result_to_active_wait(tmp_path):
     finally:
         if proc.poll() is None:
             stop_daemon(proc)
+
+
+def test_home_permissions_are_owner_only(tmp_path):
+    from vanth.paths import secure_home_permissions
+
+    home = tmp_path / "state"
+    home.mkdir(parents=True)
+    (home / "token").write_text("abc", encoding="utf-8")
+    secure_home_permissions(home)
+
+    if os.name == "nt":
+        def ace_identities(path):
+            result = subprocess.run(
+                ["icacls", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return result.stdout
+
+        acl = ace_identities(home / "token")
+        # The token must not be readable by BUILTIN\Users or the Everyone /
+        # sandbox-style group. Only the owner, SYSTEM, and Administrators are
+        # allowed (their SIDs appear in the explicit grant). The first ACE
+        # shares the filename header line, so scan every line.
+        lines = [line for line in acl.splitlines() if line.strip()]
+        assert not any("BUILTIN\\Users" in line for line in lines)
+        assert not any("Everyone" in line for line in lines)
+        # Inheritance must be disabled on the token (explicit ACEs, not (I)).
+        assert not any("(I)" in line for line in lines)
+        # Owner / SYSTEM / Administrators retain full control.
+        assert any("SYSTEM" in line and "(F)" in line for line in lines)
+        assert any("Administrators" in line and "(F)" in line for line in lines)
+    else:
+        mode = stat.S_IMODE(os.stat(home / "token").st_mode)
+        assert mode & 0o077 == 0  # no group/other access
+        home_mode = stat.S_IMODE(os.stat(home).st_mode)
+        assert home_mode & 0o077 == 0
+
+
+def test_secure_home_permissions_idempotent(tmp_path):
+    from vanth.paths import secure_home_permissions
+
+    home = tmp_path / "state"
+    home.mkdir(parents=True)
+    (home / "token").write_text("abc", encoding="utf-8")
+    secure_home_permissions(home)
+    secure_home_permissions(home)  # second run must not raise
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(home).st_mode) & 0o077 == 0
+
+
+def test_reuse_address_disabled_on_windows(tmp_path):
+    if os.name != "nt":
+        return  # only Windows has the phantom-listener problem
+    assert daemon.TrackingHTTPServer.allow_reuse_address is False
+
+
+def test_bind_failure_releases_lock_and_exits_cleanly(tmp_path):
+    import socket as _socket
+
+    home = tmp_path / "state"
+    with _socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.listen(1)
+        env = {**os.environ, "VANTH_HOME": str(home), "VANTH_DAEMON_PORT": str(port)}
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "vanth.daemon"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 1
+        assert b"cannot bind" in stderr
+        assert b"already owns" not in stderr
+    # The OS lock must not be left held: a fresh daemon on a free port must be
+    # able to start (proving the lock was released on the failed bind). The
+    # lock file itself may linger; only the OS-level lock matters.
+    second_port = free_port()
+    env2 = {**os.environ, "VANTH_HOME": str(home), "VANTH_DAEMON_PORT": str(second_port)}
+    proc2 = subprocess.Popen(
+        [sys.executable, "-m", "vanth.daemon"],
+        env=env2,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                status, _ = request(second_port, "GET", "/health")
+                if status == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise AssertionError("lock was still held after failed bind")
+    finally:
+        if proc2.poll() is None:
+            proc2.terminate()
+            proc2.wait(timeout=5)

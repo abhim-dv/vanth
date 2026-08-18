@@ -83,8 +83,18 @@ a job needs attention.
 
 - The daemon requires `Authorization: Bearer <token>` on every data route.
   The token is generated per home, stored owner-only, and never logged.
+- On daemon start the state directory's permissions are re-tightened to the
+  owner only (Unix `0700`/`0600`; Windows `icacls` disables ACL inheritance and
+  grants only owner, SYSTEM, and Administrators). This prevents a broad
+  profile-level grant (e.g. a sandbox group with read access to the user
+  profile) from exposing the bearer token or per-job env/spec data.
 - The daemon binds only to loopback addresses; a non-loopback
-  `VANTH_DAEMON_HOST` is rejected.
+  `VANTH_DAEMON_HOST` is rejected. On Windows, socket `SO_REUSEADDR` is
+  disabled so a second daemon cannot silently become a phantom listener on the
+  same port; a failed bind releases the home lock and exits cleanly.
+- An upstream `pydantic-settings` warning (an unresolved `lifespan` forward
+  reference in mcp's FastMCP) that printed on every console-script invocation
+  of a fresh install is suppressed.
 - One OS-backed daemon lock per `VANTH_HOME`; a second daemon exits quickly.
 
 ### Delivery

@@ -12,10 +12,23 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from logging.handlers import RotatingFileHandler
+
+# mcp's FastMCP has a Settings model with a `lifespan` field whose annotation
+# contains an unresolved forward reference; pydantic-settings >=2.15 warns about
+# it on import and on every console-script invocation (including the ops CLI,
+# which never touches MCP). The warning is upstream noise — suppress it so a
+# fresh install doesn't print a scary traceback-shaped message.
+try:
+    from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning as _IncompleteFieldWarning
+
+    warnings.filterwarnings("ignore", category=_IncompleteFieldWarning)
+except Exception:
+    pass
 
 from mcp.server.fastmcp import FastMCP
 

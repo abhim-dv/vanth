@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .paths import canonical_home
+from .paths import canonical_home, secure_home_permissions
 
 
 def _default_daemon_url() -> str:
@@ -32,15 +32,21 @@ def auth_token_path(home: str | os.PathLike[str] | None = None) -> str:
 def ensure_auth_token(home: str | os.PathLike[str] | None = None) -> str:
     path = auth_token_path(home)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    created = False
     try:
         with open(path, "x", encoding="utf-8") as handle:
             handle.write(secrets.token_urlsafe(32))
+        created = True
     except FileExistsError:
         pass
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    if created:
+        # Newly-created token: tighten the home ACL so a broad profile-level
+        # grant (e.g. a sandbox group) cannot read it.
+        secure_home_permissions(os.path.dirname(path))
     with open(path, encoding="utf-8") as handle:
         token = handle.read().strip()
     if not token:

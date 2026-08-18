@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .client import auth_token_path, ensure_auth_token
-from .paths import canonical_home
+from .paths import canonical_home, secure_home_permissions
 from .server import JobManager
 
 
@@ -36,6 +36,11 @@ class RequestTooLarge(ValueError):
 class TrackingHTTPServer(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = False
+    # Windows SO_REUSEADDR lets a second process bind the same loopback port
+    # silently, producing a phantom listener that never receives traffic and
+    # never exits cleanly. Disable it so a second daemon's bind fails loudly
+    # instead (the OS home lock is the real guard anyway).
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -397,11 +402,16 @@ def main() -> None:
         raise SystemExit("VANTH_DAEMON_PORT must be an integer") from exc
     home = canonical_home()
     ensure_auth_token(home)
+    secure_home_permissions(home)
     logger = _configure_logging(home)
     lock = DaemonLock(home / "daemon.lock")
     if not lock.acquire():
         raise SystemExit("another vanthd already owns this VANTH_HOME")
-    httpd = TrackingHTTPServer((host, port), Handler)
+    try:
+        httpd = TrackingHTTPServer((host, port), Handler)
+    except OSError as exc:
+        lock.release()
+        raise SystemExit(f"cannot bind {host}:{port}: {exc}") from exc
     _set_httpd(httpd)
     shutdown_event.clear()
     daemon_url = f"http://{host}:{port}"

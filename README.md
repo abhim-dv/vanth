@@ -647,6 +647,20 @@ exits immediately (OS-level lock). The daemon binds only to loopback
 (`127.0.0.1` / `::1` / `localhost`); a non-loopback `VANTH_DAEMON_HOST` is
 rejected.
 
+### Security
+
+- Every data route requires `Authorization: Bearer <token>`; the token is
+  generated per home and never logged. `GET /health` is the only
+  unauthenticated route (a cheap liveness probe for supervisors).
+- On daemon start the state directory is re-tightened to the owner: Unix
+  `chmod 0700`/`0600`; Windows disables ACL inheritance and grants only the
+  owner, SYSTEM, and Administrators via `icacls`. This blocks other accounts
+  (e.g. sandbox/CI users that inherit read from the user profile) from reading
+  the token or per-job env/spec data.
+- On Windows, socket `SO_REUSEADDR` is disabled so a second daemon cannot
+  become a phantom listener on the same port; a failed bind releases the home
+  lock and exits cleanly.
+
 ### The Go terminal monitor
 
 The native Go dashboard reads the same home **read-only** and renders live
@@ -846,7 +860,7 @@ Start it through `job_start` and watch it in `vanth monitor`.
 ## Development
 
 ```cmd
-uv run pytest -q                 # Python suite (72 passed, 1 Linux-only skip)
+uv run pytest -q                 # Python suite (112 passed, 1 Linux-only skip)
 uv run python -m compileall -q src tests examples
 uv build                         # sdist + wheel; wheel bundles the Go monitor
 go vet ./... && go test ./...    # Go: config, state, monitor
