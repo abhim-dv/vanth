@@ -4,6 +4,12 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.0.1 - 2026-08-18
+
+- Packaging: add Apache-2.0 `LICENSE`, production PyPI metadata (classifiers,
+  URLs, keywords), and point the quick-start install back at `uv tool install
+  vanth` now that the package is published. No runtime changes.
+
 ## 1.0.0 - 2026-08-18
 
 First supported v1 release. Vanth is a localhost background-job daemon and MCP
