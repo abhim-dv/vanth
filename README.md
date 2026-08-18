@@ -35,7 +35,7 @@ targets instead of you checking in.
 Install (requires `uv`; runs on Python 3.11+):
 
 ```cmd
-uv tool install vanth
+uv tool install git+https://github.com/abhim-dv/vanth.git
 ```
 
 This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
@@ -45,7 +45,7 @@ no Go toolchain is needed).
 From a source checkout (development):
 
 ```cmd
-git clone <repo> && cd vanth
+git clone https://github.com/abhim-dv/vanth.git && cd vanth
 uv sync
 ```
 
