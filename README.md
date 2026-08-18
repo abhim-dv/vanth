@@ -35,7 +35,7 @@ targets instead of you checking in.
 Install (requires `uv`; runs on Python 3.11+):
 
 ```cmd
-uv tool install git+https://github.com/abhim-dv/vanth.git
+uv tool install vanth
 ```
 
 This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
