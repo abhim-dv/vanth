@@ -441,7 +441,14 @@ The native Go dashboard reads the same home **read-only** and renders live
 plots, progress bars, the exact event table, and log tails:
 
 ```cmd
-set VANTH_HOME=%USERPROFILE%\.vanth
+uv run vanth-monitor
+```
+
+From a built wheel, `vanth-monitor` runs the bundled native binary (no Go
+toolchain needed). From a source checkout, it builds the monitor on first use
+and caches it under `~/.cache/vanth/` (requires `go` on PATH):
+
+```cmd
 go build -o bin\vanth.exe ./cmd\vanth
 bin\vanth.exe monitor
 ```
@@ -634,9 +641,16 @@ Start it through `job_start` and watch it in `vanth monitor`.
 ```cmd
 uv run pytest -q                 # Python suite (72 passed, 1 Linux-only skip)
 uv run python -m compileall -q src tests examples
-uv build
+uv build                         # sdist + wheel; wheel bundles the Go monitor
 go vet ./... && go test ./...    # Go: config, state, monitor
 ```
+
+The wheel build runs a hatchling build hook (`build-hooks/bundle_monitor.py`)
+that compiles the Go monitor for the host platform and bundles it under
+`vanth/monitor-bin/` so `vanth-monitor` needs no Go toolchain at runtime. `go`
+must be on PATH when building the wheel; it is not needed to install or run it.
+Wheels are platform-tagged (`py3-none-<platform>`) because they contain the
+native binary.
 
 Release-gate automation lives in `scripts/`:
 

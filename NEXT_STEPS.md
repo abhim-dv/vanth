@@ -133,6 +133,29 @@ Go `monitor` reads the same home read-only and renders the dashboard.
 3. Remote access, TLS, multi-user policy, quotas, interactive stdin, terminal UI,
    distributed workers, and custom service-manager code remain outside v1.
 
+## Go port decision: parked in backlog
+
+The full native Go port (`GO_PORT_IMPLEMENTATION_PLAN.md` Phases 2-6: native
+daemon/runner/MCP, delivery, packaging, cutover) is **parked** — not needed for
+v1. The Python runtime is production-candidate and ships first.
+
+What shipped instead (`39dc2c2`): the Go terminal monitor is bundled into the
+Python wheel as a native binary (`vanth/monitor-bin/`), reachable via the
+`vanth-monitor` console script. The Python package is the single runtime
+surface; Go stays a thin read-only viewer. This delivers the TUI without a
+second implementation of state/lifecycle/delivery logic.
+
+Revisit the full port only if one of these becomes a requirement:
+
+- the daemon/server must run with no Python interpreter or venv anywhere
+  (single static binary deploy, Docker scratch image, embedded runner);
+- a server-side web dashboard served from the same Go process as a cloud
+  aggregator (v2 "lightweight wandb" pairing scenario).
+
+The committed `internal/monitor` (Phase 1) remains the seed for any future
+port; the cross-language fixture conformance and wheel-bundling harness are
+already in place and exercised by CI.
+
 ## Important Files
 
 - `src/vanth/server.py`: main `JobManager`, MCP tools, event parsing, deliveries, recovery, view/doctor.

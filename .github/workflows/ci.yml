@@ -17,6 +17,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
       - run: uv sync --dev
       - run: uv run pytest -q
       - run: uv run python -m compileall -q src tests examples
