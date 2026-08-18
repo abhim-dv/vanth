@@ -4,6 +4,13 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.0.0 - 2026-08-18
+
+First supported v1 release. Vanth is a localhost background-job daemon and MCP
+interface for agents: start detached jobs, receive `AGENT_EVENT` structured
+events, wait on durable SQLite state, and wake Codex or OpenCode sessions when
+a job needs attention.
+
 ### Operations CLI and daemon lifecycle
 
 - New `vanth` subcommands for humans (not MCP): `vanth status`, `vanth doctor`,
@@ -16,6 +23,9 @@ All notable changes to Vanth are documented here.
 - `VanthClient` now honors `VANTH_DAEMON_HOST`/`VANTH_DAEMON_PORT` when no URL
   or discovery metadata is present, so clients and `vanth restart` work on
   non-default ports.
+- The terminal monitor ships as a bundled native Go binary via the
+  `vanth-monitor` console script (platform-tagged wheels, no Go toolchain
+  needed at runtime).
 
 ### Telemetry (schema v8)
 
@@ -53,19 +63,10 @@ All notable changes to Vanth are documented here.
 - `vanth.agent_logger` routes loguru records into structured `AGENT_EVENT`
   log events (timestamped, level-aware, with context) persisted in the event
   table.
-- SQLite schema bumped to v7 (adds `notes`, `run_json` columns); existing homes
-  migrate with a backup. Go fixture/conformance updated to v7.
-
-## 1.0.0 - unreleased
-
-First supported v1 release. Vanth is a localhost background-job daemon and MCP
-interface for agents: start detached jobs, receive `AGENT_EVENT` structured
-events, wait on durable SQLite state, and wake Codex or OpenCode sessions when
-a job needs attention.
 
 ### Migration and state
 
-- Ordered SQLite migrations driven by `PRAGMA user_version`; schema version 5.
+- Ordered SQLite migrations driven by `PRAGMA user_version`.
 - A timestamped backup of an existing database is created under
   `VANTH_HOME/backups/` before any migration runs.
 - SQLite uses WAL mode with a configurable `busy_timeout`
@@ -104,13 +105,16 @@ a job needs attention.
 - Bounded rotating daemon and per-job runner diagnostic logs; bounded per-stream
   log caps with `log_truncated` events; structured event cap per job.
 - `job_doctor` readiness and `job_cleanup` with dry-run and tombstones.
-- Windows Task Scheduler action (`deploy/vanthd.cmd`) and Unix systemd user
-  service (`deploy/vanthd.service`) templates.
+- Windows Startup/Task Scheduler action (`deploy/vanthd.cmd`) and Unix systemd
+  user service (`deploy/vanthd.service`) templates.
 
 ### Compatibility and packaging
 
 - `mcp` is pinned to `>=1.0,<2.0` because mcp 2.0 removed
   `mcp.server.fastmcp`.
+- The wheel bundles a native Go monitor binary (platform-tagged,
+  `py3-none-<platform>`), built by a hatchling build hook; no Go toolchain is
+  needed to install or run it.
 - CI workflow (`github/workflows/ci.yml`) runs the suite, compile check, wheel
   build, and an isolated wheel import smoke on Windows and Linux for Python
   3.11 and 3.12.

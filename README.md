@@ -32,6 +32,18 @@ targets instead of you checking in.
 
 ## Quick start
 
+Install (requires `uv`; runs on Python 3.11+):
+
+```cmd
+uv tool install vanth
+```
+
+This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
+the ops CLI as standalone tools (the wheel bundles the native Go monitor, so
+no Go toolchain is needed).
+
+From a source checkout (development):
+
 ```cmd
 git clone <repo> && cd vanth
 uv sync
