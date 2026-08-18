@@ -22,6 +22,12 @@ when a job needs attention. It is built for one trusted user on one machine.
 Out of scope for v1: remote network access, TLS, multi-user tenancy/RBAC,
 quotas, interactive stdin, and a web UI.
 
+**For agents:** start work with `job_start`, then `job_wait` for
+`progress`/`checkpoint`/`completed` events instead of polling; make jobs emit
+`AGENT_EVENT` lines (below) so progress, metrics, and checkpoints appear live
+in the `vanth-monitor` dashboard; and let long jobs resume you via wake
+targets instead of you checking in.
+
 ---
 
 ## Quick start
@@ -50,6 +56,40 @@ Verify everything is healthy:
 ```text
 job_doctor()
 ```
+
+### End-to-end: run a tracked job
+
+Once the MCP client is connected, this is the whole loop:
+
+```text
+job_start(
+  command="uv run python examples\\long_job.py",
+  name="demo run",
+  notify_on=["checkpoint", "failed", "completed"],
+)
+# -> job_<id>
+
+job_wait(job_id="job_<id>", filters=["checkpoint"], timeout_seconds=120)
+# -> returns the first checkpoint event + current status
+
+job_wait(job_id="job_<id>", filters=["completed", "failed"], timeout_seconds=300)
+# -> returns the terminal event + exit code
+```
+
+And in a third terminal, watch it live:
+
+```cmd
+uv run vanth-monitor
+```
+
+### Command-line entry points
+
+| Command | Purpose |
+|---|---|
+| `uv run vanth` | MCP stdio server (bridge to the daemon) |
+| `uv run vanthd` | The background HTTP daemon |
+| `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
+| `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin, dispatches it to Codex |
 
 ---
 
@@ -83,12 +123,36 @@ Ownership rules:
 A job is not considered terminal until both output streams have reached EOF and
 all structured events have been persisted.
 
+### Job lifecycle
+
+A job moves through a small set of states. Terminal states are permanent.
+
+| State | Meaning |
+|---|---|
+| `running` | Workload launched; runner is streaming output and heartbeating |
+| `completed` | Command exited 0, streams drained, events persisted |
+| `failed` | Command exited non-zero |
+| `timeout` | Command exceeded `timeout_seconds`; runner terminated it |
+| `cancelled` | `job_stop` was issued and the process tree actually terminated |
+| `orphaned` | Runner died unexpectedly (crash); never silently dropped |
+
+The runner enforces `timeout_seconds` even across daemon restarts. On recovery,
+a `running` job whose runner is gone is marked `cancelled` (if a stop was
+requested) or `orphaned` (if not) — never left as a zombie `running` row.
+
 ---
 
 ## Installing the MCP server
 
 `vanth` is the MCP stdio server. It talks to the daemon, starting it
 automatically on first use if it is not already running.
+
+Two ways to install it:
+
+- **From the published wheel** (recommended for agents/users):
+  `uv tool install vanth`, then configure `vanth` as the command.
+- **From a source checkout** (development): point `uv --directory <repo>` at
+  the checkout, as in the examples below.
 
 ### opencode
 
@@ -100,7 +164,22 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "vanth": {
       "type": "local",
-      "command": ["uv", "run", "--directory", "F:\\git\\vanth", "vanth"],
+      "command": ["vanth"],
+      "enabled": true,
+      "timeout": 15000
+    }
+  }
+}
+```
+
+From a source checkout, use `uv` directly instead of a bare `vanth`:
+
+```json
+{
+  "mcp": {
+    "vanth": {
+      "type": "local",
+      "command": ["uv", "run", "--directory", "/path/to/vanth", "vanth"],
       "enabled": true,
       "timeout": 15000
     }
@@ -116,12 +195,24 @@ opencode mcp list
 
 ### Claude-style MCP clients (`mcpServers`)
 
+Published wheel:
+
+```json
+{
+  "mcpServers": {
+    "vanth": { "command": "vanth", "env": { "VANTH_HOME": "C:/Users/you/.vanth" } }
+  }
+}
+```
+
+From a source checkout:
+
 ```json
 {
   "mcpServers": {
     "vanth": {
       "command": "uv",
-      "args": ["--directory", "F:/git/vanth", "run", "vanth"],
+      "args": ["--directory", "/path/to/vanth", "run", "vanth"],
       "env": { "VANTH_HOME": "C:/Users/you/.vanth" }
     }
   }
@@ -328,6 +419,39 @@ first, then jobs with pending/failed deliveries, then everything else. Each
 entry includes status, progress, the latest event, thread linkage, tags, and
 delivery counts.
 
+### job_stop — stop a running job
+
+```text
+job_stop(job_id="job_...", signal="terminate", kill_after_seconds=10)
+```
+
+Terminates the job's process tree. A graceful `signal` (default `terminate`) is
+sent first; if the job has not exited within `kill_after_seconds`, it is killed.
+The job becomes `cancelled` only after the workload tree actually terminated;
+otherwise it stays `running` and the stop is retryable.
+
+### job_mark_delivery / job_retry_delivery — manual delivery control
+
+```text
+job_mark_delivery(delivery_id="del_...", status="delivered", error="optional reason")
+job_retry_delivery(delivery_id="del_...")   # requeue a failed delivery
+```
+
+`job_mark_delivery` sets a delivery's status by hand (e.g. after resolving an
+adapter problem); `job_retry_delivery` requeues a failed one for the next
+dispatch pass. `job_delivery_attempts` shows the claim/lease history.
+
+### job_cleanup — remove old terminal jobs
+
+```text
+job_cleanup(older_than_seconds=86400, dry_run=true)   # preview
+job_cleanup(older_than_seconds=86400, dry_run=false)  # delete
+```
+
+Removes terminal jobs older than the cutoff: logs, event mirrors, specs,
+deliveries, attempts, wake targets, events, then the job row. Running jobs are
+never selected. Dry-run is fully read-only. Cleanup is safe to repeat.
+
 ---
 
 ## Wake targets (wake an agent when a job needs attention)
@@ -519,17 +643,6 @@ The HTTP daemon also exposes:
 
 - `GET /health` — cheap, unauthenticated liveness probe for supervisors;
 - `GET /ready` — authenticated readiness (doctor report; 503 when not ok).
-
-### Cleanup
-
-```text
-job_cleanup(older_than_seconds=86400, dry_run=true)   # preview
-job_cleanup(older_than_seconds=86400, dry_run=false)  # delete
-```
-
-Removes terminal jobs older than the cutoff: logs, event mirrors, specs,
-deliveries, attempts, wake targets, events, then the job row. Running jobs are
-never selected. Dry-run is fully read-only. Cleanup is safe to repeat.
 
 ### Upgrades and backups
 
