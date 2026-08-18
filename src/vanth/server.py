@@ -1972,5 +1972,13 @@ def job_dashboard(job_ids: list[str] | None = None, limit: int = 5000) -> dict[s
     return get_client().get("/dashboard", {"job_ids": job_ids, "limit": limit})
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    from .cli import main as cli_main
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    # Human-facing subcommands (status/doctor/restart) are dispatched to the
+    # CLI; anything else (including no args) runs the MCP stdio server, which
+    # is what MCP clients expect from `uv run vanth`.
+    if args and args[0] in {"status", "doctor", "restart"}:
+        raise SystemExit(cli_main(args))
     mcp.run()

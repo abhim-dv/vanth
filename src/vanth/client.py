@@ -16,7 +16,13 @@ from typing import Any
 from .paths import canonical_home
 
 
-DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
+def _default_daemon_url() -> str:
+    host = os.environ.get("VANTH_DAEMON_HOST", "127.0.0.1")
+    try:
+        port = int(os.environ.get("VANTH_DAEMON_PORT", "8765"))
+    except ValueError:
+        port = 8765
+    return f"http://{host}:{port}"
 
 
 def auth_token_path(home: str | os.PathLike[str] | None = None) -> str:
@@ -45,8 +51,24 @@ def ensure_auth_token(home: str | os.PathLike[str] | None = None) -> str:
 class VanthClient:
     def __init__(self, url: str | None = None, home: str | os.PathLike[str] | None = None) -> None:
         self.home = canonical_home(home)
-        self.url = (url or os.environ.get("VANTH_DAEMON_URL") or self._discover_url() or DEFAULT_DAEMON_URL).rstrip("/")
+        self.url = self._resolve_url(url).rstrip("/")
         self.token = ensure_auth_token(self.home)
+
+    def _resolve_url(self, url: str | None) -> str:
+        if url:
+            return url
+        env_url = os.environ.get("VANTH_DAEMON_URL")
+        if env_url:
+            return env_url
+        discovered = self._discover_url()
+        if discovered:
+            return discovered
+        host = os.environ.get("VANTH_DAEMON_HOST", "127.0.0.1")
+        try:
+            port = int(os.environ.get("VANTH_DAEMON_PORT", "8765"))
+        except ValueError:
+            port = 8765
+        return f"http://{host}:{port}"
 
     def _discover_url(self) -> str | None:
         try:

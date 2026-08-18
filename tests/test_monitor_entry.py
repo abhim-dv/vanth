@@ -48,7 +48,10 @@ def test_find_monitor_prefers_bundled(tmp_path, monkeypatch):
 def test_no_binary_and_no_go_raises(tmp_path, monkeypatch):
     pkg = _fake_bundled(tmp_path, monkeypatch)
     shutil.rmtree(pkg / "monitor-bin")
-    monkeypatch.delenv("VANTH_CACHE_DIR", raising=False)
+    # Point the dev cache at a fresh empty dir so no cached binary masks the
+    # missing-go path.
+    cache_dir = tmp_path / "fresh-cache"
+    monkeypatch.setenv("VANTH_CACHE_DIR", str(cache_dir))
     # Ensure `go` is not resolvable.
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     (tmp_path / "empty").mkdir(exist_ok=True)
@@ -72,4 +75,5 @@ def test_main_returns_binary_exit_code(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["vanth-monitor", "--flag"])
     assert main() == 17
     assert calls["cmd"][0] == str(bin)
-    assert calls["cmd"][1:] == ["--flag"]
+    # Unknown first args default to the `monitor` subcommand.
+    assert calls["cmd"][1:] == ["monitor", "--flag"]

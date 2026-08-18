@@ -86,10 +86,24 @@ uv run vanth-monitor
 
 | Command | Purpose |
 |---|---|
-| `uv run vanth` | MCP stdio server (bridge to the daemon) |
+| `uv run vanth` | MCP stdio server (bridge to the daemon); also `status` / `doctor` / `restart` subcommands |
 | `uv run vanthd` | The background HTTP daemon |
 | `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
 | `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin, dispatches it to Codex |
+
+### Operations CLI
+
+```cmd
+uv run vanth status              # is the daemon up? pid, schema, running jobs, deliveries
+uv run vanth status --json       # machine-readable version
+uv run vanth doctor              # full health report (same as job_doctor, human-readable)
+uv run vanth restart             # gracefully stop + start the daemon (jobs survive)
+```
+
+`vanth restart` is the reliable way to pick up a code/version update: it sends
+the daemon a graceful shutdown over loopback, waits for the old process to
+fully release the home lock, then starts a fresh daemon. In-flight jobs are
+owned by detached runners, so they continue across the restart.
 
 ---
 
@@ -609,10 +623,12 @@ Foreground (for development or diagnosis):
 uv run vanthd
 ```
 
-Start-at-login templates are in `deploy/`:
+Start-at-login options:
 
-- `deploy/vanthd.cmd` — Windows Task Scheduler action;
-- `deploy/vanthd.service` — Unix systemd user service.
+- **Windows**: the daemon is started from the user Startup folder
+  (`startup_commands.bat`) alongside other startup commands; a Task Scheduler
+  action template is also in `deploy/vanthd.cmd`.
+- **Unix**: `deploy/vanthd.service` is a systemd user service.
 
 Enable only one daemon per `VANTH_HOME`. A second daemon for the same home
 exits immediately (OS-level lock). The daemon binds only to loopback

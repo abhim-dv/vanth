@@ -24,6 +24,7 @@ from .server import JobManager
 manager: JobManager | None = None
 manager_lock = threading.Lock()
 shutdown_event = threading.Event()
+_httpd: "TrackingHTTPServer | None" = None
 DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -128,6 +129,28 @@ def get_manager() -> JobManager:
             if manager is None:
                 manager = JobManager()
     return manager
+
+
+def _set_httpd(server: "TrackingHTTPServer") -> None:
+    global _httpd
+    _httpd = server
+
+
+def _stop_httpd() -> None:
+    """Gracefully stop the HTTP server from a background thread.
+
+    Used by the signal handler and the authenticated ``/shutdown`` route. The
+    server thread unwinds through ``main``'s finally block, which closes the
+    manager, releases the daemon lock, and removes discovery metadata.
+    """
+    if shutdown_event.is_set():
+        return
+    shutdown_event.set()
+    if manager is not None:
+        manager.begin_shutdown()
+    server = _httpd
+    if server is not None:
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
 
 def _max_response_bytes() -> int:
@@ -301,6 +324,9 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().cleanup(**payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
                 ok(self, get_manager().artifact_add(parsed.path.split("/")[2], **payload))
+            elif parsed.path == "/shutdown":
+                _stop_httpd()
+                ok(self, {"result": "shutting_down"})
             else:
                 error(self, "Not found", 404)
         except RequestTooLarge as exc:
@@ -376,17 +402,10 @@ def main() -> None:
     if not lock.acquire():
         raise SystemExit("another vanthd already owns this VANTH_HOME")
     httpd = TrackingHTTPServer((host, port), Handler)
+    _set_httpd(httpd)
     shutdown_event.clear()
     daemon_url = f"http://{host}:{port}"
     write_daemon_metadata(home, daemon_url)
-
-    def stop(*_: Any) -> None:
-        if shutdown_event.is_set():
-            return
-        shutdown_event.set()
-        if manager is not None:
-            manager.begin_shutdown()
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     previous = {}
     signal_names = [signal.SIGINT, signal.SIGTERM]
@@ -394,7 +413,7 @@ def main() -> None:
         signal_names.append(signal.SIGBREAK)
     for name in signal_names:
         try:
-            previous[name] = signal.signal(name, stop)
+            previous[name] = signal.signal(name, _stop_httpd)
         except ValueError:
             pass
     try:

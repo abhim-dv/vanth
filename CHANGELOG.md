@@ -4,6 +4,19 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+### Operations CLI and daemon lifecycle
+
+- New `vanth` subcommands for humans (not MCP): `vanth status`, `vanth doctor`,
+  `vanth restart`. `status` reports daemon up/down, pid, schema, running jobs,
+  delivery counts (supports `--json`); `doctor` prints a human-readable health
+  report; `restart` gracefully stops the daemon and starts a fresh one (jobs
+  survive — runners are detached).
+- The daemon gains an authenticated `POST /shutdown` route so a client can
+  request graceful shutdown over loopback HTTP (used by `vanth restart`).
+- `VanthClient` now honors `VANTH_DAEMON_HOST`/`VANTH_DAEMON_PORT` when no URL
+  or discovery metadata is present, so clients and `vanth restart` work on
+  non-default ports.
+
 ### Telemetry (schema v8)
 
 - `metric_series` table: scalar fields of `metric`/`progress` AGENT_EVENTs are
