@@ -6,7 +6,7 @@ Run deliberately, not in ordinary CI:
     uv run python scripts/chaos_matrix.py --only burst  # one scenario
     uv run python scripts/chaos_matrix.py --iterations 3 --jobs 50 --events 500
 
-Scenarios map to V1_IMPLEMENTATION_PLAN.md Phase 5:
+Scenarios (v1 release-gate matrix):
 
   burst   - N concurrent jobs each emitting M events across stdout/stderr;
             assert exact durable event counts and unique per-job sequence numbers.
