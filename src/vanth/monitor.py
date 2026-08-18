@@ -86,8 +86,13 @@ def find_monitor_binary() -> Path:
 
 def main() -> int:
     binary = find_monitor_binary()
+    args = sys.argv[1:]
+    # The native binary uses subcommands; default to the monitor when invoked
+    # via the dedicated console script (vanth-monitor).
+    if not args or args[0] not in {"monitor", "daemon", "mcp", "doctor", "cleanup", "--version"}:
+        args = ["monitor", *args]
     try:
-        return subprocess.call([str(binary), *sys.argv[1:]])
+        return subprocess.call([str(binary), *args])
     except KeyboardInterrupt:
         return 130
 
