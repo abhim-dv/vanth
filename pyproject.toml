@@ -18,10 +18,14 @@ dev = [
 vanth = "vanth.server:main"
 vanthd = "vanth.daemon:main"
 vanth-codex-notify = "vanth.codex_bridge:main"
+vanth-monitor = "vanth.monitor:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+path = "build-hooks/bundle_monitor.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
