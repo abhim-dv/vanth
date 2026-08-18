@@ -166,3 +166,26 @@ def test_cli_help_and_no_args_list_commands(capsys):
         assert "usage: vanth" in out
         assert "status" in out
         assert "setup" in out
+
+
+def test_server_entry_routes_help_to_cli(capsys):
+    from vanth import server
+
+    for argv in (["--help"], ["-h"], ["help"]):
+        try:
+            server.main(argv)
+        except SystemExit as exc:
+            assert exc.code == 0
+        out = capsys.readouterr().out
+        assert "usage: vanth" in out
+        assert "setup" in out
+
+
+def test_server_entry_keeps_bare_mcp(capsys, monkeypatch):
+    """Bare `vanth` (no args) must keep running the MCP stdio server, not the CLI."""
+    from vanth import server
+
+    called: list = []
+    monkeypatch.setattr(server.mcp, "run", lambda: called.append("mcp"))
+    server.main([])
+    assert called == ["mcp"]

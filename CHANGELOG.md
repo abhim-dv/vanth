@@ -4,6 +4,13 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.1.3 - 2026-08-18
+
+- Fixed `vanth --help` through the real entry point (`vanth = vanth.server:main`
+  previously only routed status/doctor/restart/setup to the CLI, so `--help`
+  fell through into the MCP stdio server and printed nothing). Bare `vanth`
+  still runs the MCP server as expected.
+
 ## 1.1.2 - 2026-08-18
 
 - `vanth --help` / `vanth -h` / `vanth help` / bare `vanth` now print a proper
