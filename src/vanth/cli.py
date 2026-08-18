@@ -2,9 +2,10 @@
 
 Unlike the MCP tools (which are JSON request/response over stdio), these
 commands are meant for a person at a terminal: ``vanth status``, ``vanth
-doctor``, ``vanth restart``. They read the same daemon discovery metadata and
-speak the same authenticated loopback HTTP, but print readable output and exit
-with a meaningful status code (0 = healthy, 1 = problem, 2 = usage).
+doctor``, ``vanth restart``, ``vanth setup``. They read the same daemon
+discovery metadata and speak the same authenticated loopback HTTP, but print
+readable output and exit with a meaningful status code (0 = healthy, 1 =
+problem, 2 = usage).
 """
 
 from __future__ import annotations
@@ -303,14 +304,35 @@ def cmd_setup(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     return run_setup(clients or None, home=home, remove=remove, assume_yes=assume_yes, json_out=json_out)
 
 
+def _usage() -> str:
+    return (
+        "usage: vanth <command> [options]\n"
+        "\n"
+        "Vanth is a local background-job daemon for AI agents (and humans).\n"
+        "\n"
+        "commands:\n"
+        "  status         show daemon health, running jobs, and MCP client state\n"
+        "  doctor         full health report (schema, deliveries, tools)\n"
+        "  restart        gracefully restart the daemon (jobs survive)\n"
+        "  setup          register the MCP server in your clients' configs (one-shot)\n"
+        "\n"
+        "options:\n"
+        "  --help, -h     show this help\n"
+        "  --json         machine-readable output (where supported)\n"
+        "\n"
+        "run `vanth setup` after installing to connect your MCP clients; run\n"
+        "`vanth <command> --help` for command-specific options.\n"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     home = canonical_home()
     json_out = "--json" in argv
     argv = [arg for arg in argv if arg != "--json"]
-    if not argv:
-        print(__doc__, file=sys.stderr)
-        return 2
+    if not argv or argv[0] in {"--help", "-h", "help"}:
+        print(_usage(), end="")
+        return 0
     command = argv[0]
     if command == "status":
         return cmd_status(home, json_out=json_out)

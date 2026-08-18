@@ -4,6 +4,13 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.1.2 - 2026-08-18
+
+- `vanth --help` / `vanth -h` / `vanth help` / bare `vanth` now print a proper
+  usage summary listing status / doctor / restart / setup (previously bare
+  `vanth` dumped the module docstring to stderr and `--help` was an unknown
+  command).
+
 ## 1.1.1 - 2026-08-18
 
 - `vanth status` and `vanth doctor` now show MCP client registration state

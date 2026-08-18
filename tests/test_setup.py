@@ -155,3 +155,14 @@ def test_status_line_prints_client_states(tmp_path, capsys):
     _print_setup_status()
     captured = capsys.readouterr()
     assert "opencode=configured" in captured.out
+
+
+def test_cli_help_and_no_args_list_commands(capsys):
+    from vanth import cli
+
+    for argv in ([], ["--help"], ["-h"], ["help"]):
+        assert cli.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "usage: vanth" in out
+        assert "status" in out
+        assert "setup" in out
