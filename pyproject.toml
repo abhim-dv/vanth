@@ -4,10 +4,46 @@ version = "1.0.0"
 description = "Event-driven background jobs for agents"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "abhim-dv", email = "abhishek.manilal@darkvisiontech.com" },
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "background-jobs",
+    "agent",
+    "ai",
+    "task-runner",
+    "daemon",
+    "jobs",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Go",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
 dependencies = [
     "mcp>=1.0,<2.0",
     "loguru>=0.7,<1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/abhim-dv/vanth"
+Repository = "https://github.com/abhim-dv/vanth"
+Documentation = "https://github.com/abhim-dv/vanth#readme"
+Changelog = "https://github.com/abhim-dv/vanth/blob/master/CHANGELOG.md"
+Issues = "https://github.com/abhim-dv/vanth/issues"
 
 [dependency-groups]
 dev = [
