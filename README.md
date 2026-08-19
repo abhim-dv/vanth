@@ -638,12 +638,25 @@ The default OpenCode turn timeout is 30 seconds; raise it for long turns.
 With `auto_dispatch: false`, deliveries stay `pending` until an agent either
 dispatches them manually or changes the target.
 
+A target that omits `events` (or `notify_on`) inherits the job's top-level
+`notify_on` list. An explicit target `events` always wins:
+
+```json
+job_start(command="...", notify_on=["checkpoint","failed"],
+          wake_targets=[{"type": "local_command", "command": ["deliver.py"]}])
+```
+
+Concurrent adapter dispatches are capped (default 4) so a burst of events
+doesn't spawn unlimited adapter processes; excess deliveries stay queued and
+are picked up on the next dispatch pass. Set `VANTH_DELIVERY_MAX_CONCURRENT`
+to tune.
+
 ### Delivery operations
 
 ```text
 job_deliveries(job_id="job_...")
 job_delivery_attempts(delivery_id="del_...")
-job_retry_delivery(delivery_id="del_...")     # requeue a failed delivery
+job_retry_delivery(delivery_id="del_...")     # requeue a failed OR retrying delivery
 job_mark_delivery(delivery_id="del_...", status="delivered")
 ```
 
@@ -652,6 +665,13 @@ the attempt was reclaimed after an expired lease. If the daemon crashes after an
 adapter accepts a wake but before Vanth records success, the delivery is
 reclaimed and retried — surfaced as a `reclaimed` attempt rather than claimed as
 exactly-once delivery.
+
+`job_retry_delivery` requeues a delivery immediately for dispatch — including
+one that is currently `retrying` on backoff (resets `next_attempt_at`). If a
+delivery has exhausted `max_attempts`, it is dead-lettered: `vanth doctor`
+reports `dead_letter_count` and the most recent `dead_lettered` deliveries
+(each with `delivery_id`, `job_id`, `attempts`, `last_error`) so you can see
+which wakes were never delivered and why.
 
 ---
 

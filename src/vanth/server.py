@@ -198,6 +198,7 @@ class JobManager:
         self._log_truncated: set[tuple[str, str]] = set()
         self._delivery_threads: set[threading.Thread] = set()
         self._delivery_threads_lock = threading.Lock()
+        self.max_delivery_concurrency = max(1, int(os.environ.get("VANTH_DELIVERY_MAX_CONCURRENT", "4")))
         self.shutdown_requested = threading.Event()
         self.max_events_per_job = max(1, int(os.environ.get("VANTH_MAX_EVENTS_PER_JOB", "100000")))
         self._events_truncated: set[str] = set()
@@ -345,8 +346,10 @@ class JobManager:
                 payload = {}
             if payload.get("target", {}).get("auto_dispatch") is False:
                 continue
-            thread = threading.Thread(target=self._dispatch_delivery, args=(self._delivery_dict(row),), daemon=True)
             with self._delivery_threads_lock:
+                if len(self._delivery_threads) >= self.max_delivery_concurrency:
+                    continue
+                thread = threading.Thread(target=self._dispatch_delivery, args=(self._delivery_dict(row),), daemon=True)
                 self._delivery_threads.add(thread)
             thread.start()
 
@@ -802,6 +805,10 @@ class JobManager:
     ) -> dict[str, Any]:
         self._ensure_open()
         validate_wake_targets(wake_targets)
+        if notify_on:
+            for target in wake_targets or []:
+                if "events" not in target and "notify_on" not in target:
+                    target["events"] = notify_on
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
@@ -875,14 +882,39 @@ class JobManager:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         runner_log = (self.logs / f"{job_id}.runner.log").open("ab")
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "vanth.runner", str(self.home), job_id],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=runner_log,
-                creationflags=creationflags,
-                start_new_session=sys.platform != "win32",
-            )
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "vanth.runner", str(self.home), job_id],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=runner_log,
+                    creationflags=creationflags,
+                    start_new_session=sys.platform != "win32",
+                )
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except Exception as exc:
+                self.processes.pop(job_id, None)
+                self._transition_terminal(job_id, "failed", 1)
+                self._emit(
+                    job_id,
+                    "failed",
+                    message=f"Job runner failed to start: {exc}",
+                    data={"error": str(exc)},
+                    level="error",
+                    source="server",
+                )
+                Path(spec_path).unlink(missing_ok=True)
+                return {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "exit_code": 1,
+                    "message": f"Job runner failed to start: {exc}",
+                    "worker_pid": None,
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "events_path": str(events_path),
+                }
         finally:
             runner_log.close()
         self.processes[job_id] = proc
@@ -1577,7 +1609,7 @@ class JobManager:
             changed = self.db.execute(
                 """
                 UPDATE deliveries SET status='retrying', next_attempt_at=NULL, last_error=NULL
-                WHERE delivery_id=? AND status='failed'
+                WHERE delivery_id=? AND status IN ('failed','retrying')
                 """,
                 (delivery_id,),
             ).rowcount
@@ -1679,6 +1711,22 @@ class JobManager:
             "SELECT COUNT(*) FROM deliveries WHERE status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
             (now_iso(),),
         ).fetchone()[0]
+        dead_lettered = []
+        for row in self.db.execute(
+            "SELECT delivery_id, job_id, attempts, last_error, payload_json FROM deliveries WHERE status='failed' ORDER BY created_at DESC LIMIT 20"
+        ).fetchall():
+            target = json.loads(row["payload_json"] or "{}").get("target", {})
+            max_attempts = int(target.get("max_attempts", 1))
+            if int(row["attempts"]) < max_attempts:
+                continue
+            dead_lettered.append(
+                {
+                    "delivery_id": row["delivery_id"],
+                    "job_id": row["job_id"],
+                    "attempts": int(row["attempts"]),
+                    "last_error": row["last_error"],
+                }
+            )
         disk = shutil.disk_usage(self.home)
         return {
             "ok": not warnings and quick_check == "ok",
@@ -1694,6 +1742,8 @@ class JobManager:
             "quick_check": quick_check,
             "maintenance_alive": bool(self.dispatcher_thread and self.dispatcher_thread.is_alive()),
             "stale_delivery_leases": stale_leases,
+            "dead_letter_count": len(dead_lettered),
+            "dead_lettered": dead_lettered,
             "disk_free_bytes": disk.free,
             "token_path": str(self.home / "token"),
             "warnings": warnings,
@@ -1834,7 +1884,7 @@ def tool_error(message: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def job_start(
+def job_start(
     command: str,
     cwd: str | None = None,
     name: str | None = None,

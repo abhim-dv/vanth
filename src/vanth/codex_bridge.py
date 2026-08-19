@@ -15,6 +15,9 @@ class CodexBridgeError(RuntimeError):
     pass
 
 
+_INITIALIZE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+
 def _default_codex_command() -> list[str]:
     configured = os.environ.get("VANTH_CODEX_BIN")
     if configured:
@@ -50,14 +53,22 @@ class _CodexAppServer:
         self.stdout: queue.Queue[str] = queue.Queue()
         self.stderr: queue.Queue[str] = queue.Queue()
         self.stderr_tail: list[str] = []
-        self.proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        # Match runner.py/server.py: detach the codex child from the daemon's console group on Windows.
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        try:
+            self.proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise CodexBridgeError(f"failed to launch codex app-server: {exc}") from exc
         assert self.proc.stdout is not None
         assert self.proc.stderr is not None
         threading.Thread(target=_reader, args=(self.proc.stdout, self.stdout), daemon=True).start()
@@ -66,18 +77,29 @@ class _CodexAppServer:
     def close(self) -> None:
         if self.proc.poll() is not None:
             return
-        self.proc.terminate()
         try:
-            self.proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=2)
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+        except Exception:
+            pass
 
     def send(self, request_id: int, method: str, params: dict[str, Any]) -> None:
+        if self.proc.poll() is not None:
+            raise CodexBridgeError(self._error(f"codex app-server exited with {self.proc.returncode}"))
         if self.proc.stdin is None:
             raise CodexBridgeError("codex app-server stdin closed")
-        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            exit_code = self.proc.poll()
+            if exit_code is None:
+                raise CodexBridgeError(self._error("codex app-server exited (broken pipe)")) from exc
+            raise CodexBridgeError(self._error(f"codex app-server exited with {exit_code}")) from exc
 
     def response(self, request_id: int) -> dict[str, Any]:
         while True:
@@ -118,12 +140,27 @@ def send_message_to_thread(
 ) -> dict[str, Any]:
     server = _CodexAppServer(codex_command, timeout_seconds)
     try:
-        server.send(
-            1,
-            "initialize",
-            {"clientInfo": {"name": "vanth", "version": "0"}, "capabilities": {"experimentalApi": True}},
-        )
-        server.response(1)
+        last_error: CodexBridgeError | None = None
+        for attempt in range(len(_INITIALIZE_RETRY_DELAYS) + 1):
+            try:
+                server.send(
+                    1,
+                    "initialize",
+                    {"clientInfo": {"name": "vanth", "version": "0"}, "capabilities": {"experimentalApi": True}},
+                )
+                server.response(1)
+                last_error = None
+                break
+            except CodexBridgeError as exc:
+                last_error = exc
+                if attempt >= len(_INITIALIZE_RETRY_DELAYS):
+                    break
+                delay = _INITIALIZE_RETRY_DELAYS[attempt]
+                if server.deadline - time.monotonic() <= delay:
+                    break
+                time.sleep(delay)
+        if last_error is not None:
+            raise last_error
         server.send(2, "thread/resume", {"threadId": thread_id, "excludeTurns": True})
         server.response(2)
         server.send(3, "turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]})

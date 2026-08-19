@@ -1,10 +1,12 @@
 import asyncio
+import json
+import os
 import subprocess
 import sys
 import threading
 import time
 
-from vanth.server import JobManager
+from vanth.server import JobManager, now_iso
 
 
 def cmd(code: str) -> str:
@@ -159,3 +161,182 @@ def test_retry_due_after_manager_restart_is_dispatched(tmp_path):
         assert calls.read_text() == "xx"
     finally:
         restarted.close()
+
+
+def test_notify_on_defaults_events_for_targets_without_events(tmp_path, request):
+    manager = JobManager(tmp_path / "state")
+    request.addfinalizer(manager.close)
+    calls = tmp_path / "notify_calls.txt"
+    delivery_command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import sys; "
+            "p=Path(sys.argv[1]); p.write_text(p.read_text()+'x') if p.exists() else p.write_text('x')"
+        ),
+        str(calls),
+    ]
+    started = asyncio.run(
+        manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
+            notify_on=["checkpoint"],
+            wake_targets=[{"type": "local_command", "command": delivery_command}],
+        )
+    )
+    delivery = wait_for_delivery(manager, started["job_id"], "delivered")
+    assert delivery is not None and delivery["status"] == "delivered"
+    assert calls.read_text() == "x"
+
+
+def test_explicit_target_events_override_notify_on(tmp_path, request):
+    manager = JobManager(tmp_path / "state")
+    request.addfinalizer(manager.close)
+    calls = tmp_path / "override_calls.txt"
+    delivery_command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import sys; "
+            "p=Path(sys.argv[1]); p.write_text(p.read_text()+'x') if p.exists() else p.write_text('x')"
+        ),
+        str(calls),
+    ]
+    started = asyncio.run(
+        manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
+            notify_on=["completed"],
+            wake_targets=[
+                {
+                    "type": "local_command",
+                    "command": delivery_command,
+                    "events": ["checkpoint"],
+                }
+            ],
+        )
+    )
+    delivery = wait_for_delivery(manager, started["job_id"], "delivered")
+    assert delivery is not None and delivery["status"] == "delivered"
+    assert calls.read_text() == "x"
+
+
+def test_notify_on_alone_without_targets_still_stores_value(tmp_path, request):
+    manager = JobManager(tmp_path / "state")
+    request.addfinalizer(manager.close)
+    started = asyncio.run(
+        manager.start(cmd("import time; time.sleep(1)"), notify_on=["completed"])
+    )
+    assert json.loads(
+        manager._row("SELECT notify_on FROM jobs WHERE job_id=?", (started["job_id"],))["notify_on"]
+    ) == ["completed"]
+
+
+def test_retry_delivery_force_advances_retrying_delivery(tmp_path, request):
+    manager = JobManager(tmp_path / "state")
+    request.addfinalizer(manager.close)
+    calls = tmp_path / "retry_calls.txt"
+    delivery_command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import sys; "
+            "p=Path(sys.argv[1]); calls=p.read_text() if p.exists() else ''; "
+            "p.write_text(calls+'x'); sys.exit(7 if not calls else 0)"
+        ),
+        str(calls),
+    ]
+    started = asyncio.run(
+        manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
+            wake_targets=[
+                {
+                    "type": "local_command",
+                    "events": ["checkpoint"],
+                    "command": delivery_command,
+                    "max_attempts": 2,
+                    "retry_delay_seconds": 60,
+                }
+            ],
+        )
+    )
+    retrying = wait_for_delivery(manager, started["job_id"], "retrying")
+    assert retrying is not None
+    assert retrying["next_attempt_at"] is not None
+    manager.retry_delivery(retrying["delivery_id"])
+    delivered = wait_for_delivery(manager, started["job_id"], "delivered")
+    assert delivered is not None and delivered["status"] == "delivered"
+    assert delivered["attempts"] == 2
+    assert calls.read_text() == "xx"
+
+
+def test_delivery_dispatch_respects_concurrency_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANTH_DELIVERY_MAX_CONCURRENT", "2")
+
+    def active_threads() -> int:
+        with manager._delivery_threads_lock:
+            return len(manager._delivery_threads)
+
+    def drain() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and active_threads() > 0:
+            time.sleep(0.05)
+
+    manager = JobManager(tmp_path / "state", recover=False)
+    started = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+    try:
+        for _ in range(8):
+            manager._insert_wake_targets(
+                started["job_id"],
+                [{"type": "local_command", "events": ["checkpoint"],
+                  "command": [sys.executable, "-c", "import time; time.sleep(0.5)"], "timeout_seconds": 30}],
+                now_iso(),
+            )
+        with manager.db_lock:
+            manager.db.commit()
+        manager._emit(started["job_id"], "checkpoint", message="burst")
+        pending = manager.deliveries(started["job_id"], status="pending")["deliveries"]
+        assert len(pending) == 8
+
+        manager._dispatch_due_deliveries()
+        assert active_threads() == 2
+        drain()
+        manager._dispatch_due_deliveries()
+        assert active_threads() == 2
+        drain()
+        manager._dispatch_due_deliveries()
+        assert active_threads() == 2
+        drain()
+        manager._dispatch_due_deliveries()
+        assert active_threads() == 2
+        drain()
+
+        all_deliveries = manager.deliveries(started["job_id"])["deliveries"]
+        assert len(all_deliveries) == 8
+        assert all(delivery["status"] == "delivered" for delivery in all_deliveries)
+    finally:
+        manager.close()
+
+
+def test_doctor_reports_dead_lettered_deliveries(tmp_path, request):
+    manager = JobManager(tmp_path / "state")
+    request.addfinalizer(manager.close)
+    started = asyncio.run(
+        manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
+            wake_targets=[
+                {
+                    "type": "local_command",
+                    "events": ["checkpoint"],
+                    "command": [sys.executable, "-c", "import sys; sys.exit(7)"],
+                    "max_attempts": 2,
+                    "retry_delay_seconds": 1,
+                }
+            ],
+        )
+    )
+    failed = wait_for_delivery(manager, started["job_id"], "failed")
+    assert failed is not None
+    assert failed["attempts"] == 2
+    doctor = manager.doctor()
+    assert doctor["dead_letter_count"] >= 1
+    entry = next(item for item in doctor["dead_lettered"] if item["delivery_id"] == failed["delivery_id"])
+    assert entry["attempts"] == 2

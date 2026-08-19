@@ -106,3 +106,12 @@ def test_timeout_is_clear(monkeypatch: pytest.MonkeyPatch) -> None:
         send_delivery_to_opencode(
             {"prompt": "wake", "target": {"session_id": "ses_1", "timeout_seconds": 4}}
         )
+
+
+def test_launch_failure_is_clear(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_file_not_found(argv, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr(subprocess, "run", raise_file_not_found)
+    with pytest.raises(OpenCodeBridgeError, match="failed to start opencode"):
+        send_delivery_to_opencode({"prompt": "wake", "target": {"session_id": "ses_1"}})

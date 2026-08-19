@@ -4,7 +4,45 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
-## 1.1.3 - 2026-08-18
+## 1.2.0 - 2026-08-18
+
+Reliability hardening of the delivery/job core and the wake adapters. Goal: a
+job is never lost because of Vanth itself.
+
+### Job/delivery core
+
+- **Runner spawn is now crash-safe** (`JobManager.start`): if the detached
+  runner process fails to launch (missing venv python, OSError), the job is
+  transitioned to `failed` with an error event instead of being left as a
+  phantom `running` row with no worker.
+- **`notify_on` now actually works**: it becomes the default `events` list for
+  any wake target that doesn't specify its own `events`. Previously it was
+  stored but never consumed (an agent setting `notify_on` would never get
+  woken).
+- **`retry_delivery` can force-advance a `retrying` delivery** (reset its
+  backoff immediately), not just a `failed` one.
+- **Delivery dispatch backpressure**: concurrent adapter dispatches are capped
+  at `VANTH_DELIVERY_MAX_CONCURRENT` (default 4); excess stays queued in
+  SQLite and is picked up on the next poll.
+- **`job_start` MCP tool is now sync** so FastMCP runs it in a threadpool
+  instead of blocking the event loop on HTTP.
+- **Dead-letter visibility in `doctor`**: `dead_letter_count` and a
+  `dead_lettered` list (deliveries that exhausted `max_attempts`).
+
+### Wake adapters (codex_thread / opencode_thread)
+
+- Codex `initialize` handshake retries up to 3 times with backoff (bounded by
+  the delivery timeout); `thread/resume` and `turn/start` are never retried
+  (side-effect safety).
+- Dead/broken-pipe codex processes fail with a clear error including the exit
+  code and last stderr tail, instead of a raw `BrokenPipeError`.
+- Child cleanup can't mask the original delivery error.
+- Codex binary launch failures and opencode binary launch failures raise
+  clear `CodexBridgeError`/`OpenCodeBridgeError` messages.
+- Codex child processes are detached from the daemon's console group on
+  Windows.
+
+
 
 - Fixed `vanth --help` through the real entry point (`vanth = vanth.server:main`
   previously only routed status/doctor/restart/setup to the CLI, so `--help`

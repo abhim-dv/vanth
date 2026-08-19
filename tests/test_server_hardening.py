@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import subprocess
 import sys
@@ -127,3 +128,40 @@ def test_live_manager_detects_runner_disappearance(tmp_path):
         manager.close()
 
     asyncio.run(main())
+
+
+def test_runner_popen_failure_marks_job_failed(tmp_path, monkeypatch):
+    real_popen = subprocess.Popen
+
+    def failing_popen(argv, *args, **kwargs):
+        if "-m" in argv and "vanth.runner" in argv:
+            raise OSError("venv python missing")
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", failing_popen)
+    manager = JobManager(tmp_path)
+
+    async def main():
+        started = await manager.start(cmd("import time; time.sleep(30)"))
+        status = manager.status(started["job_id"])
+        events = manager.events(started["job_id"], types=["failed"])["events"]
+        assert status["status"] == "failed"
+        assert status["exit_code"] == 1
+        assert started["status"] == "failed"
+        assert started["exit_code"] == 1
+        assert started["worker_pid"] is None
+        assert started["message"].startswith("Job runner failed to start:")
+        assert events and events[0]["source"] == "server"
+        assert events[0]["message"].startswith("Job runner failed to start:")
+        assert not (manager.home / "specs" / f"{started['job_id']}.json").exists()
+        assert started["job_id"] not in manager.processes
+
+    asyncio.run(main())
+    manager.close()
+
+
+def test_job_start_mcp_tool_is_not_a_coroutine_function():
+    from vanth.server import mcp
+
+    tool = mcp._tool_manager._tools["job_start"]
+    assert inspect.iscoroutinefunction(tool.fn) is False
