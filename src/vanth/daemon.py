@@ -419,7 +419,15 @@ def main() -> None:
     if not lock.acquire():
         raise SystemExit("another vanthd already owns this VANTH_HOME")
     try:
-        httpd = TrackingHTTPServer((host, port), Handler)
+        httpd = None
+        for attempt in range(6):
+            try:
+                httpd = TrackingHTTPServer((host, port), Handler)
+                break
+            except OSError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
     except OSError as exc:
         lock.release()
         raise SystemExit(f"cannot bind {host}:{port}: {exc}") from exc
