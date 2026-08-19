@@ -4,6 +4,26 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.2.1 - 2026-08-18
+
+### Stale opencode session recovery
+
+- **Probe-before-dispatch**: `opencode_thread` deliveries now cheaply check
+  (`opencode session list --format json`) that the target session still exists
+  before burning a model turn. A confirmed-missing session raises a
+  classifiable `OpenCodeSessionNotFound` instead of failing with a raw
+  "Session not found" after wasting a turn.
+- **Skip retries on a dead session**: the delivery layer treats
+  `OpenCodeSessionNotFound` as permanently non-retryable — it dead-letters
+  immediately (attempts=1) instead of exhausting `max_attempts` on backoff for
+  a session that can never succeed.
+- The probe never blocks a valid dispatch: on any ambiguity (timeout, probe
+  failure, non-zero exit, bad JSON) it proceeds normally. Opt out per-target
+  with `skip_probe: true` or globally with `VANTH_OPENCODE_SKIP_PROBE=1`;
+  `attach` targets skip the probe automatically.
+- Previously-silent dead-lettered wakes from 1.2.0 (`opencode ... Session not
+  found`, e.g. "Session not found") now fail fast with actionable errors.
+
 ## 1.2.0 - 2026-08-18
 
 Reliability hardening of the delivery/job core and the wake adapters. Goal: a

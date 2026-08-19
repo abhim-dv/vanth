@@ -6,6 +6,9 @@ import sys
 import threading
 import time
 
+import pytest
+
+from vanth.opencode_bridge import OpenCodeSessionNotFound
 from vanth.server import JobManager, now_iso
 
 
@@ -340,3 +343,33 @@ def test_doctor_reports_dead_lettered_deliveries(tmp_path, request):
     assert doctor["dead_letter_count"] >= 1
     entry = next(item for item in doctor["dead_lettered"] if item["delivery_id"] == failed["delivery_id"])
     assert entry["attempts"] == 2
+
+
+def test_stale_opencode_session_skips_retries(tmp_path, request, monkeypatch):
+    import vanth.server as server_module
+
+    def raise_not_found(payload):
+        raise OpenCodeSessionNotFound("opencode session not found: ses_x")
+
+    monkeypatch.setattr(server_module, "send_delivery_to_opencode", raise_not_found)
+    manager = JobManager(tmp_path / "state")
+    request.addfinalizer(manager.close)
+    started = asyncio.run(
+        manager.start(
+            cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
+            wake_targets=[
+                {
+                    "type": "opencode_thread",
+                    "session_id": "ses_x",
+                    "events": ["checkpoint"],
+                    "max_attempts": 3,
+                    "retry_delay_seconds": 1,
+                }
+            ],
+        )
+    )
+    failed = wait_for_delivery(manager, started["job_id"], "failed")
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["attempts"] == 1
+    assert "session not found" in failed["last_error"]

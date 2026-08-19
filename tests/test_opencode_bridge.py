@@ -5,7 +5,12 @@ import subprocess
 
 import pytest
 
-from vanth.opencode_bridge import OpenCodeBridgeError, send_delivery_to_opencode, _command_argv
+from vanth.opencode_bridge import (
+    OpenCodeBridgeError,
+    OpenCodeSessionNotFound,
+    send_delivery_to_opencode,
+    _command_argv,
+)
 
 
 def test_default_command_resolves_through_which(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,3 +120,92 @@ def test_launch_failure_is_clear(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", raise_file_not_found)
     with pytest.raises(OpenCodeBridgeError, match="failed to start opencode"):
         send_delivery_to_opencode({"prompt": "wake", "target": {"session_id": "ses_1"}})
+
+
+def test_missing_session_raises_classifiable_error_without_model_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '[{"id": "ses_other"}]\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(OpenCodeSessionNotFound, match="session not found"):
+        send_delivery_to_opencode({"prompt": "x", "target": {"session_id": "ses_missing"}})
+    assert len(calls) == 1
+    assert "session" in calls[0] and "list" in calls[0] and "run" not in calls[0]
+
+
+def test_existing_session_proceeds_to_model_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "list" in argv:
+            return subprocess.CompletedProcess(argv, 0, '[{"id": "ses_live"}]\n', "")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = send_delivery_to_opencode({"prompt": "wake", "target": {"session_id": "ses_live"}})
+    assert len(calls) == 2
+    assert "run" in calls[1] and "--session" in calls[1]
+    assert result["session_id"] == "ses_live"
+
+
+@pytest.mark.parametrize("probe_exit", [7])
+def test_probe_ambiguity_does_not_block(monkeypatch: pytest.MonkeyPatch, probe_exit: int) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "list" in argv:
+            return subprocess.CompletedProcess(argv, probe_exit, "", "probe failed")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = send_delivery_to_opencode({"prompt": "wake", "target": {"session_id": "ses_ambig"}})
+    assert len(calls) == 2
+    assert "run" in calls[1] and "--session" in calls[1]
+    assert result["session_id"] == "ses_ambig"
+
+
+def test_probe_skipped_with_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setenv("VANTH_OPENCODE_SKIP_PROBE", "1")
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    send_delivery_to_opencode({"prompt": "wake", "target": {"session_id": "ses_1"}})
+    assert len(calls) == 1
+    assert "run" in calls[0] and "list" not in calls[0]
+
+
+def test_probe_skipped_with_target_optout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    send_delivery_to_opencode({"prompt": "wake", "target": {"session_id": "ses_1", "skip_probe": True}})
+    assert len(calls) == 1
+    assert "run" in calls[0] and "list" not in calls[0]
+
+
+def test_probe_skipped_when_attach_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    send_delivery_to_opencode(
+        {"prompt": "wake", "target": {"session_id": "ses_1", "attach": "http://127.0.0.1:4096"}}
+    )
+    assert len(calls) == 1
+    assert "list" not in calls[0]

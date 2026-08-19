@@ -35,7 +35,7 @@ from mcp.server.fastmcp import FastMCP
 from .client import VanthClient
 from .codex_bridge import send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
-from .opencode_bridge import send_delivery_to_opencode
+from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .paths import canonical_home
 from .runtime_info import capture_run_metadata, serialize_run_metadata
 
@@ -709,6 +709,18 @@ class JobManager:
                 try:
                     send_delivery_to_opencode(payload)
                     self._complete_delivery(delivery, "delivered")
+                except OpenCodeSessionNotFound as exc:
+                    effective_delivery = {
+                        **delivery,
+                        "payload": {
+                            **delivery["payload"],
+                            "target": {
+                                **delivery["payload"].get("target", {}),
+                                "max_attempts": 1,
+                            },
+                        },
+                    }
+                    self._complete_delivery(effective_delivery, "failed", str(exc))
                 except Exception as exc:
                     self._complete_delivery(delivery, "failed", str(exc))
                 return

@@ -621,6 +621,13 @@ Resumes an OpenCode session:
 
 The default OpenCode turn timeout is 30 seconds; raise it for long turns.
 
+Before dispatching to a plain (non-`attach`) session, Vanth runs a cheap
+`opencode session list` probe to confirm the session still exists — a
+confirmed-missing session fails fast (dead-lettered immediately, no retry
+burn) with `opencode session not found: <id>`. The probe never blocks a valid
+dispatch; on any ambiguity it proceeds. Opt out per-target with
+`"skip_probe": true` or globally with `VANTH_OPENCODE_SKIP_PROBE=1`.
+
 ### Shared delivery options
 
 ```json
@@ -900,6 +907,13 @@ Start it through `job_start` and watch it in `vanth monitor`.
   `progress` lines — add them (optional).
 - **OpenCode wake timing out**: increase `timeout_seconds` on the wake target
   beyond the expected turn length.
+- **OpenCode wake failed with `Session not found`**: the wake target's
+  `session_id` is stale or was removed. Vanth now probes the session before
+  dispatching (`opencode session list`) and fails fast with
+  `opencode session not found: <id>` instead of retrying a dead session.
+  Refresh the wake target's `session_id` (or start a new session) and
+  `job_retry_delivery` to re-dispatch. Per-target opt-out: `skip_probe: true`;
+  global opt-out: `VANTH_OPENCODE_SKIP_PROBE=1`.
 - **Monitor shows nothing / empty state**: confirm `VANTH_HOME` points at the
   daemon's home, and that `jobs.sqlite` exists there.
 
