@@ -404,14 +404,15 @@ events.
 | Tool | Purpose |
 |---|---|
 | `job_start` | Launch a command as a detached job |
-| `job_rerun` | Re-launch a job with its original command/env/cwd/targets |
+| `job_rerun` | Re-launch a job, optionally overriding `command`/`env`/`cwd`/`timeout_seconds`/`name`/`tags`/`notes`/`interactive` |
 | `job_send` | Feed stdin to an interactive job (`interactive=True` first) |
-| `job_wait` | Block until a matching event (or timeout) — the preferred way to await jobs |
+| `job_wait` | Block until a matching event (or timeout) — the preferred way to await jobs (`return_progress` optional) |
 | `job_status` | One job's status, command, env, progress, last event, linkage, tags |
+| `job_status_batch` | Many jobs' status in one call (`job_ids`, `limit`) |
 | `job_list` | Recent jobs, filterable by `status` / `thread_id` / `name` / `tags` |
 | `job_view` | Agent-facing summaries sorted by attention priority |
 | `job_events` | Structured events for a job (forward via `since_event_id`, or latest-first via `reverse`) |
-| `job_tail` | Bounded stdout/stderr log tail with byte offsets |
+| `job_tail` | Bounded stdout/stderr log tail with byte offsets (`follow`/`timeout_seconds` optional) |
 | `job_metrics_query` | Read stored scalar metric series (loss, acc, progress.percent, ...) |
 | `job_metric_compare` | Compare one metric across jobs (latest/mean/min/max/sum/count) |
 | `job_run_summary` | One-call "did it work?" — status, runtime, progress, metrics, artifacts |
@@ -425,6 +426,7 @@ events.
 | `job_stop` | Stop a running job (terminate process tree) |
 | `job_doctor` | Daemon health, schema, tables, binary availability |
 | `job_cleanup` | Dry-run or real removal of old terminal jobs |
+| `daemon_wake` | Schedule a self-resume wake target — full target dict or `events`/`type`/`...config` shorthand |
 
 For the full parameter contract and response shapes of every tool, see
 [docs/agent-tools.md](docs/agent-tools.md).

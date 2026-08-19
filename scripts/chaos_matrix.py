@@ -21,6 +21,9 @@ Scenarios (v1 release-gate matrix):
             and broken connections; assert structured errors and daemon health.
   state   - fill log caps and run cleanup twice; assert bounded state and
             idempotence.
+  qol     - v1.4 agent-QoL through the live daemon: rerun with overrides,
+            status_batch, wait return_progress streaming, tail follow mode, and
+            the daemon_wake shorthand.
 
 Every scenario prints PASS or FAIL and the process exits nonzero on any failure.
 """
@@ -542,9 +545,113 @@ class AgentFeatureScenario(Scenario):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class AgentQoLScenario(Scenario):
+    """Stress the v1.4 agent-QoL features under load: job_rerun with overrides,
+    job_status_batch, job_wait return_progress streaming, job_tail follow mode,
+    and the daemon_wake shorthand (all verified through the HTTP layer via a
+    live daemon so routes and payload coercion are exercised)."""
+
+    name = "qol"
+
+    def run(self) -> None:
+        import socket as _socket
+        home = Path(tempfile.mkdtemp(prefix="vanth-qol-"))
+        with _socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        daemon = subprocess.Popen(
+            [sys.executable, "-m", "vanth.daemon"],
+            env={**os.environ, "VANTH_HOME": str(home / "state"), "VANTH_DAEMON_PORT": str(port)},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        try:
+            wait_for(lambda: request(port, "GET", "/health") == (200, {"ok": True}), 30, "qol daemon start")
+            token = (home / "state" / "token").read_text(encoding="utf-8").strip()
+
+            def api(method: str, path: str, body=None, qparams=None) -> dict:
+                status, payload = request(port, method, path, body, {"Content-Type": "application/json"}, token)
+                assert status in {200, 201}, (method, path, status, payload)
+                return payload
+
+            # A short job that streams progress then completes.
+            progress_code = (
+                "import json,sys;"
+                "f=lambda i: print('AGENT_EVENT '+json.dumps({'type':'progress','data':{'current':i,'total':5}}), flush=True) or "
+                "__import__('time').sleep(0.25);"
+                "[f(i) for i in range(1,6)]"
+            )
+            body = json.dumps({"command": cmd(progress_code), "name": "qol-progress", "tags": ["qol", "chaos"]}).encode()
+            started = api("POST", "/jobs", body)
+            job_id = started["job_id"]
+
+            # job_wait return_progress streams progress events before completion.
+            seen_progress = 0
+            since = None
+            for _ in range(20):
+                payload = {"filters": ["completed"], "return_progress": True, "timeout_seconds": 10}
+                if since:
+                    payload["since_event_id"] = since
+                result = api("POST", f"/jobs/{job_id}/wait", json.dumps(payload).encode())
+                if result.get("event", {}).get("type") == "completed":
+                    break
+                assert result["result"] == "progress" and result["event"]["type"] == "progress", result
+                seen_progress += 1
+                since = result["event"]["event_id"]
+            assert seen_progress >= 3, seen_progress
+            assert api("POST", f"/jobs/{job_id}/wait", json.dumps({"filters": ["completed"], "timeout_seconds": 10}).encode())["event"]["type"] == "completed"
+
+            # job_tail follow streams output as it appears.
+            tail_code = "import sys,time; print('t1', flush=True); time.sleep(0.2); print('t2', flush=True)"
+            tail_job = api("POST", "/jobs", json.dumps({"command": cmd(tail_code)}).encode())["job_id"]
+            tail = api("GET", f"/jobs/{tail_job}/tail?follow=true&timeout_seconds=3&offset=0")
+            assert tail.get("followed") is True and "t2" in tail.get("content", ""), tail
+
+            # job_status_batch returns known + unknown ids in one call.
+            batch = api("GET", f"/status/batch?job_ids={job_id},{tail_job},job_bogus")
+            assert batch["count"] == 3 and batch["unknown"] == ["job_bogus"], batch
+            statuses = {j["job_id"]: j["status"] for j in batch["jobs"]}
+            assert statuses[job_id] == "completed" and statuses[tail_job] == "completed", statuses
+
+            # job_rerun with an override spawns a new job with the tweak applied.
+            rerun = api("POST", f"/jobs/{job_id}/rerun", json.dumps({"name": "qol-rerun"}).encode())
+            rerun_id = rerun["job_id"]
+            wait_for(lambda: api("GET", f"/jobs/{rerun_id}/status")["status"] in {"completed", "failed"}, 30,
+                     f"rerun {rerun_id} terminal")
+            rerun_status = api("GET", f"/jobs/{rerun_id}/status")
+            assert rerun_status["name"] == "qol-rerun", rerun_status
+            assert "progress" in rerun_status["command"], rerun_status
+
+            # daemon_wake shorthand registers a target that fires on completion.
+            wake_code = "import time; time.sleep(0.5)"
+            wake_job = api("POST", "/jobs", json.dumps({"command": cmd(wake_code)}).encode())["job_id"]
+            wake = api("POST", f"/jobs/{wake_job}/wake", json.dumps(
+                {"target": {"type": "local_command", "events": ["completed"],
+                            "command": [sys.executable, "-c", "import sys; sys.exit(0)"]}}).encode())
+            assert wake["result"] == "ok" and wake["target_type"] == "local_command", wake
+            wait_for(lambda: api("GET", f"/jobs/{wake_job}/status")["status"] in {"completed", "failed"}, 30,
+                     f"wake job {wake_job} terminal")
+            wait_for(lambda: any(d["target_type"] == "local_command" and d["status"] == "delivered"
+                                 for d in api("GET", f"/deliveries?job_id={wake_job}")["deliveries"]),
+                     30, "wake delivery dispatched to local_command")
+
+            print("  rerun overrides, status_batch, wait progress stream, tail follow, wake shorthand verified")
+        finally:
+            if sys.platform == "win32":
+                daemon.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                daemon.terminate()
+            try:
+                daemon.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=10)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 SCENARIOS = {
     scenario.name: scenario
-    for scenario in (BurstScenario, AdapterScenario, DaemonKillScenario, RunnerKillScenario, InputScenario, StateScenario, AgentFeatureScenario)
+    for scenario in (BurstScenario, AdapterScenario, DaemonKillScenario, RunnerKillScenario, InputScenario, StateScenario, AgentFeatureScenario, AgentQoLScenario)
 }
 
 

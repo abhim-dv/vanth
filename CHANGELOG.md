@@ -2,6 +2,25 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased / next (1.4.x)
+
+### Agent + user QoL
+
+- **MCP tool `job_rerun` now accepts override params**: `command`, `env`,
+  `timeout_seconds`, `name`, `tags`, `notes`, `cwd`, and `interactive` — omitted
+  parameters reuse the original job's values.
+- **NEW - MCP tool `job_status_batch`**: fetch many jobs' status in one call
+  (`job_ids`, `limit`) instead of N `job_status` round trips.
+- **MCP tool `job_wait` gains `return_progress`**: optionally include the job's
+  latest progress block in the wait response.
+- **MCP tool `job_tail` gains `follow` / `timeout_seconds`**: block for new
+  output until the job ends or the timeout elapses.
+- **MCP tool `daemon_wake` gains a shorthand**: pass a full target dict as
+  `target`, or use `type` (required, one of `local_command` / `codex_thread` /
+  `opencode_thread`) plus `events` / extra config kwargs (events default to
+  `["completed", "failed"]`). `add_wake_target` now validates wake targets
+  against `validate_wake_targets`, rejecting unsupported types.
+
 ## 1.4.0 - 2026-08-19
 
 ### Agent + user QoL

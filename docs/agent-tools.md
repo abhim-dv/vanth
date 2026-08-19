@@ -15,16 +15,18 @@ Conventions:
 - `limit` is validated to 1–1000 (up to 10000 for metrics, 50000 for
   dashboard, 1000 for artifacts).
 
-The current tool set is `job_start`, `job_rerun`, `job_status`, `job_send`,
-`job_list`, `job_view`, `job_events`, `job_deliveries`, `job_mark_delivery`,
-`job_retry_delivery`, `job_delivery_attempts`, `job_tail`, `job_wait`,
-`job_stop`, `job_doctor`, `job_cleanup`, `job_metrics_query`,
-`job_metric_compare`, `job_run_summary`, `job_artifact_add`, `job_artifacts`,
-`job_dashboard`.
+The current tool set is `job_start`, `job_rerun`, `job_status`,
+`job_status_batch`, `job_send`, `job_list`, `job_view`, `job_events`,
+`job_deliveries`, `job_mark_delivery`, `job_retry_delivery`,
+`job_delivery_attempts`, `job_tail`, `job_wait`, `job_stop`, `job_doctor`,
+`job_cleanup`, `job_metrics_query`, `job_metric_compare`, `job_run_summary`,
+`job_artifact_add`, `job_artifacts`, `job_dashboard`.
 
 The following are part of the planned v1.4 surface (in progress, not yet
 released): `job_metric_ingest`, `job_artifact_read`, `daemon_wake`,
-`job_cleanup_preview`.
+`job_cleanup_preview`. The parallel additions `job_rerun` override params,
+`job_status_batch`, `job_wait` `return_progress`, and `job_tail` `follow` /
+`timeout_seconds` are documented below as part of the planned surface.
 
 ---
 
@@ -72,17 +74,47 @@ the cause. On quota exhaustion (`VANTH_MAX_RUNNING_JOBS`):
 ## `job_rerun`
 
 Re-launch a job with its **original** command, cwd, env, timeout, name, tags,
-notes, origin thread, wake targets, and interactive flag.
+notes, origin thread, wake targets, and interactive flag. Any parameter may be
+overridden on the re-run; omitted parameters reuse the original job's values.
 
 **Parameters**
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `job_id` | `string` | required | Job to re-launch |
+| `command` | `string?` | `None` | Override the command |
+| `env` | `map<string,string>?` | `None` | Override the environment |
+| `timeout_seconds` | `int?` | `None` | Override the timeout |
+| `name` | `string?` | `None` | Override the label |
+| `tags` | `string[]?` | `None` | Override the tags |
+| `notes` | `string?` | `None` | Override the notes |
+| `cwd` | `string?` | `None` | Override the working directory |
+| `interactive` | `bool?` | `None` | Override the interactive flag |
 
 **Response**
 
 Same shape as `job_start` (new `job_id`). Errors if `job_id` is unknown.
+
+---
+
+## `job_status_batch`
+
+Multiple jobs' status at once — fewer round trips than N `job_status` calls.
+
+**Parameters**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `job_ids` | `string[]` | required | Jobs to inspect (comma-joined on the wire) |
+| `limit` | `int` | `500` | 1–1000 |
+
+**Response**
+
+```json
+{ "jobs": [ { "job_id": "job_abc123", "status": "running", "...status fields..." } ] }
+```
+
+Each entry is a `job_status` object.
 
 ---
 
@@ -328,6 +360,8 @@ Bounded stdout/stderr log tail with byte offsets.
 | `stream` | `string` | `stdout` | `stdout` or `stderr` |
 | `max_bytes` | `int` | `8192` | Max bytes to read |
 | `offset` | `int?` | `None` | Byte offset to start from; `None` = last `max_bytes` bytes |
+| `follow` | `bool` | `false` | Block for new output until the job ends or `timeout_seconds` elapses |
+| `timeout_seconds` | `int?` | `None` | Follow mode cap; `None` = until the job is terminal |
 
 **Response**
 
@@ -337,7 +371,9 @@ Bounded stdout/stderr log tail with byte offsets.
 ```
 
 `truncated` is true when the requested window was clipped to the log size or
-the byte cap. Use `next_offset` to page forward.
+the byte cap. Use `next_offset` to page forward. With `follow: true`, repeated
+blocks append as output lands; the call returns when the job is terminal or
+`timeout_seconds` is hit.
 
 ---
 
@@ -350,19 +386,24 @@ immediately — do not poll.
 **Parameters**
 
 | Param | Type | Default | Notes |
-|---|---|---|---|
+|---|---|---|---|---|
 | `job_id` | `string` | required | Job to wait on |
 | `filters` | `string[]` | required | Event types to wait for (e.g. `["checkpoint","failed","completed"]`) |
 | `since_event_id` | `string?` | `None` | Only events newer than this one |
 | `timeout_seconds` | `int` | `3600` | 0–86400 |
+| `return_progress` | `bool` | `false` | Include the job's latest progress block in the response |
 
 **Response**
 
 ```json
 { "result": "event", "job_id": "job_abc123", "status": "running",
-  "event": { "event_id": "evt_...", "type": "checkpoint", "..." } }
+  "event": { "event_id": "evt_...", "type": "checkpoint", "..." },
+  "progress": {"current": 10, "total": 100, "percent": 10.0, "stage": "train",
+               "updated_at": "..."} }
 ```
 
+With `return_progress: true`, `progress` is the job's latest `progress` event's
+data plus `updated_at` (or `null`).
 Timeout: `{"result": "timeout", "job_id": ..., "status": ..., "message": "No matching event before timeout"}`.
 Daemon shutdown: `{"result": "shutdown", "job_id": ..., "message": "Vanth is shutting down"}`.
 
@@ -656,19 +697,30 @@ out of a job — the read side of `job_artifact_add`.
 Request the daemon's attention from inside a job context — surfaces an
 agent-facing wake without requiring a matching wake-target event.
 
+Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
+the shorthand: `type` (required, one of `local_command` / `codex_thread` /
+`opencode_thread`) plus optional `events` and extra config kwargs. Events
+default to `["completed", "failed"]`.
+
 **Parameters**
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `job_id` | `string?` | `None` | Job to wake on |
-| `message` | `string` | required | Human/agent-readable reason |
-| `data` | `object?` | `{}` | Free-form context |
+| `job_id` | `string` | required | Job to wake on |
+| `target` | `object?` | `None` | Full wake-target dict (`{type, events, ...config}`); given, used as-is |
+| `events` | `string[]?` | `["completed","failed"]` | Shorthand; non-empty list of event types (e.g. `["checkpoint"]`) |
+| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_thread` / `opencode_thread` |
+| `...` | `object?` | `{}` | Extra config kwargs merged into the shorthand target |
 
 **Response**
 
 ```json
-{ "result": "queued", "wake_id": "wake_...", "job_id": "job_abc123" }
+{ "result": "ok", "job_id": "job_abc123", "target_id": "target_...",
+  "target_type": "local_command", "events": ["completed", "failed"] }
 ```
+
+Errors: `ValueError` when `events` is empty or not a list of strings, or
+`type` is empty.
 
 ### `job_cleanup_preview`
 

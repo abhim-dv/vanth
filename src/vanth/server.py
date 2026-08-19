@@ -977,10 +977,24 @@ class JobManager:
             "message": "Job started",
         }
 
-    async def rerun(self, job_id: str) -> dict[str, Any]:
-        return await asyncio.get_running_loop().run_in_executor(None, self.rerun_sync, job_id)
+    async def rerun(self, job_id: str, **overrides: Any) -> dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self.rerun_sync(job_id, **overrides)
+        )
 
-    def rerun_sync(self, job_id: str) -> dict[str, Any]:
+    def rerun_sync(
+        self,
+        job_id: str,
+        *,
+        command: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
+        name: str | None = None,
+        tags: list[str] | None = None,
+        notes: str | None = None,
+        cwd: str | None = None,
+        interactive: bool | None = None,
+    ) -> dict[str, Any]:
         self._ensure_open()
         row = self._row(
             "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
@@ -997,21 +1011,27 @@ class JobManager:
                 "events": json.loads(target["events_json"] or "[]"),
                 **config,
             })
-        tags = json.loads(row["tags_json"] or "[]")
-        notify_on = json.loads(row["notify_on"] or "[]")
-        interactive = json.loads(row["run_json"] or "{}").get("interactive") is True
+        stored_tags = json.loads(row["tags_json"] or "[]")
+        stored_notify_on = json.loads(row["notify_on"] or "[]")
+        stored_interactive = json.loads(row["run_json"] or "{}").get("interactive") is True
+        stored_env = json.loads(row["env_json"] or "{}")
+        merged_env = stored_env
+        if env is not None:
+            if not isinstance(env, dict):
+                raise ValueError("env must be an object of string values")
+            merged_env = {**stored_env, **env}
         return asyncio.run(self.start(
-            command=row["command"],
-            cwd=row["cwd"],
-            name=row["name"],
-            env=json.loads(row["env_json"] or "{}"),
-            timeout_seconds=row["timeout_seconds"],
-            notify_on=notify_on or None,
+            command=command if command is not None else row["command"],
+            cwd=cwd if cwd is not None else row["cwd"],
+            name=name if name is not None else row["name"],
+            env=merged_env,
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else row["timeout_seconds"],
+            notify_on=stored_notify_on or None,
             wake_targets=targets or None,
             origin_thread_id=row["origin_thread_id"],
-            tags=tags or None,
-            notes=row["notes"],
-            interactive=interactive,
+            tags=stored_tags if tags is None else tags,
+            notes=notes if notes is not None else row["notes"],
+            interactive=stored_interactive if not isinstance(interactive, bool) else interactive,
         ))
 
     def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
@@ -1223,6 +1243,7 @@ class JobManager:
         filters: list[str],
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
+        return_progress: bool = False,
     ) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(
             None,
@@ -1231,6 +1252,7 @@ class JobManager:
             filters,
             since_event_id,
             timeout_seconds,
+            return_progress,
         )
 
     def wait_sync(
@@ -1239,8 +1261,9 @@ class JobManager:
         filters: list[str],
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
+        return_progress: bool = False,
     ) -> dict[str, Any]:
-        return self._wait(job_id, filters, since_event_id, timeout_seconds)
+        return self._wait(job_id, filters, since_event_id, timeout_seconds, return_progress)
 
     def _wait(
         self,
@@ -1248,6 +1271,7 @@ class JobManager:
         filters: list[str],
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
+        return_progress: bool = False,
     ) -> dict[str, Any]:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 0 or timeout_seconds > 86400:
             raise ValueError("timeout_seconds must be between 0 and 86400")
@@ -1263,6 +1287,20 @@ class JobManager:
                 return {"result": "shutdown", "job_id": job_id, "message": "Vanth is shutting down"}
             if events:
                 return {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]}
+            if return_progress and "progress" not in filters:
+                try:
+                    progress = self._event_query(job_id, ["progress"], since_event_id, 1)
+                except RuntimeError:
+                    progress = []
+                if progress:
+                    event = progress[0]
+                    return {
+                        "result": "progress",
+                        "job_id": job_id,
+                        "event": event,
+                        "status": self.status(job_id)["status"],
+                        "progress": event.get("data"),
+                    }
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"result": "timeout", "job_id": job_id, "status": self.status(job_id)["status"], "message": "No matching event before timeout"}
@@ -1307,6 +1345,25 @@ class JobManager:
         }
         result["progress"] = ({**json.loads(progress["data_json"] or "{}"), "updated_at": progress["created_at"]} if progress else None)
         return result
+
+    def status_batch(self, job_ids: list[str], limit: int = 500) -> dict[str, Any]:
+        self._ensure_open()
+        validate_limit(limit, "limit", 1000)
+        if not isinstance(job_ids, list) or not job_ids:
+            raise ValueError("job_ids must be a non-empty list of job ids")
+        if any(isinstance(job_id, bool) or not isinstance(job_id, str) for job_id in job_ids):
+            raise ValueError("job_ids must be a list of strings")
+        if len(job_ids) > limit:
+            raise ValueError(f"job_ids must contain at most {limit} ids")
+        jobs = []
+        unknown = []
+        for job_id in job_ids:
+            try:
+                jobs.append(self.status(job_id))
+            except ValueError:
+                unknown.append(job_id)
+                jobs.append({"job_id": job_id, "status": "unknown", "error": "Unknown job_id"})
+        return {"jobs": jobs, "count": len(jobs), "unknown": unknown}
 
     def list(self, status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
              name: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
@@ -1781,19 +1838,22 @@ class JobManager:
         delivery = self._delivery_dict(row)
         return delivery
 
-    def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None) -> dict[str, Any]:
+    def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
+             follow: bool = False, timeout_seconds: float = 5.0) -> dict[str, Any]:
         validate_limit(max_bytes, "max_bytes", max(self.max_log_bytes, 8192))
         if offset is not None and (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0):
             raise ValueError("offset must be a non-negative integer")
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be stdout or stderr")
+        if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds < 0 or timeout_seconds > 86400:
+            raise ValueError("timeout_seconds must be between 0 and 86400")
         row = self._row(f"SELECT {stream}_path AS path FROM jobs WHERE job_id=?", (job_id,))
         if not row:
             raise ValueError(f"Unknown job_id: {job_id}")
         path = Path(row["path"])
         size = path.stat().st_size if path.exists() else 0
         if not path.exists():
-            return {
+            result = {
                 "job_id": job_id,
                 "stream": stream,
                 "offset": 0,
@@ -1802,6 +1862,7 @@ class JobManager:
                 "truncated": False,
                 "content": "",
             }
+            return self._tail_follow_result(job_id, stream, result, follow, max_bytes, timeout_seconds, path)
         start = max(0, offset or 0)
         truncated = False
         with path.open("rb") as f:
@@ -1816,7 +1877,7 @@ class JobManager:
                 f.seek(min(start, size))
             content = f.read(max_bytes).decode(errors="replace")
             cursor = f.tell()
-        return {
+        result = {
             "job_id": job_id,
             "stream": stream,
             "offset": start,
@@ -1824,6 +1885,52 @@ class JobManager:
             "size": size,
             "truncated": truncated,
             "content": content,
+        }
+        if not follow:
+            return result
+        return self._tail_follow_result(job_id, stream, result, follow, max_bytes, timeout_seconds, path)
+
+    def _tail_follow_result(self, job_id: str, stream: str, result: dict[str, Any], follow: bool,
+                            max_bytes: int, timeout_seconds: float, path: Path) -> dict[str, Any]:
+        if not follow:
+            return result
+        deadline = time.monotonic() + timeout_seconds
+        cursor = int(result["next_offset"])
+        new_chunks: list[str] = []
+        limit = 4 * max_bytes
+        seen_bytes = 0
+        while True:
+            if self.shutdown_requested.is_set():
+                break
+            got = False
+            if path.exists():
+                size = path.stat().st_size
+                if size > cursor:
+                    with path.open("rb") as f:
+                        f.seek(cursor)
+                        raw = f.read(max(0, min(limit - seen_bytes, size - cursor)))
+                    if raw:
+                        got = True
+                        chunk = raw.decode(errors="replace")
+                        new_chunks.append(chunk)
+                        seen_bytes += len(chunk)
+                        cursor += len(raw)
+                        if seen_bytes >= limit:
+                            break
+            current_status = self.status(job_id)["status"]
+            if not got and current_status in TERMINAL_STATUSES:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+        return {
+            **result,
+            "followed": True,
+            "new_bytes": seen_bytes,
+            "next_offset": cursor,
+            "content": result["content"] + "".join(new_chunks),
+            "size": path.stat().st_size if path.exists() else result["size"],
         }
 
     def agent_view(self, thread_id: str | None = None, limit: int = 50) -> dict[str, Any]:
@@ -2071,14 +2178,11 @@ class JobManager:
         self._ensure_open()
         if not isinstance(target, dict):
             raise ValueError("target must be an object")
+        validate_wake_targets([target])
         target_type = target.get("type")
-        if not isinstance(target_type, str) or not target_type:
-            raise ValueError("target type must be a non-empty string")
         events = target.get("events")
         if events is None:
             events = target.get("notify_on") or ["completed", "failed"]
-        if not isinstance(events, list) or not all(isinstance(event, str) for event in events):
-            raise ValueError("target events must be a list of strings")
         if not events:
             raise ValueError("target events must not be empty")
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
@@ -2170,8 +2274,25 @@ def job_start(
 
 
 @mcp.tool()
-def job_rerun(job_id: str) -> dict[str, Any]:
-    return get_client().post(f"/jobs/{job_id}/rerun")
+def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | None = None,
+              timeout_seconds: int | None = None, name: str | None = None, tags: list[str] | None = None,
+              notes: str | None = None, cwd: str | None = None, interactive: bool | None = None) -> dict[str, Any]:
+    payload = {key: value for key, value in {
+        "command": command,
+        "env": env,
+        "timeout_seconds": timeout_seconds,
+        "name": name,
+        "tags": tags,
+        "notes": notes,
+        "cwd": cwd,
+        "interactive": interactive,
+    }.items() if value is not None}
+    return get_client().post(f"/jobs/{job_id}/rerun", payload)
+
+
+@mcp.tool()
+def job_status_batch(job_ids: list[str], limit: int = 500) -> dict[str, Any]:
+    return get_client().get("/status/batch", {"job_ids": ",".join(job_ids), "limit": limit})
 
 
 @mcp.tool()
@@ -2222,8 +2343,10 @@ def job_delivery_attempts(delivery_id: str, limit: int = 20) -> dict[str, Any]:
 
 
 @mcp.tool()
-def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None) -> dict[str, Any]:
-    return get_client().get(f"/jobs/{job_id}/tail", {"stream": stream, "max_bytes": max_bytes, "offset": offset})
+def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
+             follow: bool = False, timeout_seconds: float = 5.0) -> dict[str, Any]:
+    return get_client().get(f"/jobs/{job_id}/tail", {"stream": stream, "max_bytes": max_bytes, "offset": offset,
+                                                     "follow": follow, "timeout_seconds": timeout_seconds})
 
 
 @mcp.tool()
@@ -2232,10 +2355,12 @@ def job_wait(
     filters: list[str],
     since_event_id: str | None = None,
     timeout_seconds: int = 3600,
+    return_progress: bool = False,
 ) -> dict[str, Any]:
     return get_client().post(
         f"/jobs/{job_id}/wait",
-        {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds},
+        {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds,
+         "return_progress": return_progress},
     )
 
 
@@ -2308,10 +2433,51 @@ def job_artifact_read(artifact_id: str, max_bytes: int = 262144) -> dict[str, An
     return get_client().get(f"/artifacts/{artifact_id}/content", {"max_bytes": max_bytes})
 
 
+def _build_wake_target(
+    target: dict[str, Any] | None,
+    events: list[str] | None,
+    target_type: str | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the daemon_wake shorthand into a full wake-target dict.
+
+    When ``target`` is given it is returned unchanged (backward compatible).
+    Otherwise a target is built from ``type`` / ``events`` / ``config``.
+    ``type`` is required and must be a supported wake target type
+    (local_command, codex_thread, opencode_thread); events default to
+    ["completed", "failed"].
+    """
+    if target is not None:
+        if not isinstance(target, dict):
+            raise ValueError("target must be a dict")
+        return target
+    if target_type is None or not isinstance(target_type, str) or not target_type:
+        raise ValueError("type is required when target is not provided")
+    if target_type not in WAKE_TARGET_TYPES:
+        raise ValueError(f"unsupported wake target type: {target_type!r}")
+    if events is not None:
+        if not isinstance(events, list) or not events or not all(isinstance(event, str) for event in events):
+            raise ValueError("events must be a non-empty list of strings")
+    return {"type": target_type, "events": events or ["completed", "failed"], **config}
+
+
 @mcp.tool()
-def daemon_wake(job_id: str, target: dict[str, Any]) -> dict[str, Any]:
-    """Schedule a self-resume wake target against a running/known job."""
-    return get_client().post(f"/jobs/{job_id}/wake", {"target": target})
+def daemon_wake(
+    job_id: str,
+    target: dict[str, Any] | None = None,
+    events: list[str] | None = None,
+    type: str | None = None,
+    **config: Any,
+) -> dict[str, Any]:
+    """Schedule a self-resume wake target against a running/known job.
+
+    Pass a full target dict ({"type", "events", ...config}) as ``target``, or
+    use the shorthand: ``type`` (required, one of local_command / codex_thread
+    / opencode_thread) plus optional ``events`` and extra config kwargs.
+    Events default to ["completed", "failed"].
+    """
+    resolved = _build_wake_target(target, events, type, config)
+    return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
 @mcp.tool()

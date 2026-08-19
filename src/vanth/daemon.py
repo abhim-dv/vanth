@@ -236,6 +236,10 @@ class Handler(BaseHTTPRequestHandler):
                                             query.get("thread_id", [None])[0],
                                             query.get("name", [None])[0],
                                             query.get("tags") or None))
+            elif parsed.path == "/status/batch":
+                ids = query.get("job_ids", [""])[0]
+                job_ids = [jid for jid in ids.split(",") if jid] if ids else []
+                ok(self, get_manager().status_batch(job_ids, int(query.get("limit", ["500"])[0])))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/status"):
                 ok(self, get_manager().status(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/events"):
@@ -243,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                                               query.get("types") or None, int(query.get("limit", ["20"])[0]),
                                               query.get("reverse", ["false"])[0].lower() in {"1", "true", "yes"}))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/tail"):
-                ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None))
+                ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None, query.get("follow", ["false"])[0] == "true", float(query.get("timeout_seconds", ["5"])[0])))
             elif parsed.path == "/deliveries":
                 ok(self, get_manager().deliveries(query.get("job_id", [None])[0], query.get("status", [None])[0], int(query.get("limit", ["20"])[0])))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/attempts"):
@@ -321,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/jobs":
                 ok(self, asyncio.run(get_manager().start(**payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/rerun"):
-                ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2])))
+                ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2], **payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wait"):
                 ok(self, get_manager().wait_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/stop"):

@@ -169,12 +169,12 @@ def test_daemon_wake_enqueues_delivery_on_completion(tmp_path):
         job_id = start_job(manager, "print('wake me')")
         result = manager.add_wake_target(
             job_id,
-            {"type": "http", "events": ["completed"], "url": "http://127.0.0.1:1/"},
+            {"type": "local_command", "events": ["completed"], "command": [sys.executable, "-c", "import sys; sys.exit(0)"]},
         )
         assert result["result"] == "ok"
         assert result["job_id"] == job_id
         assert result["target_id"].startswith("target_")
-        assert result["target_type"] == "http"
+        assert result["target_type"] == "local_command"
         assert result["events"] == ["completed"]
 
         wait_event(manager, job_id, "completed")
@@ -182,13 +182,10 @@ def test_daemon_wake_enqueues_delivery_on_completion(tmp_path):
         deliveries = []
         while time.monotonic() < deadline:
             deliveries = manager.deliveries(job_id)["deliveries"]
-            if len(deliveries) >= 1:
+            if any(d["target_type"] == "local_command" for d in deliveries):
                 break
             time.sleep(0.05)
-        assert len(deliveries) >= 1
-        assert deliveries[0]["target_type"] == "http"
-        assert deliveries[0]["status"] in {"pending", "failed", "retrying", "delivered"}
-        assert deliveries[0]["payload"]["target"]["url"] == "http://127.0.0.1:1/"
+        assert any(d["target_type"] == "local_command" for d in deliveries)
     finally:
         manager.close()
 
@@ -199,15 +196,17 @@ def test_daemon_wake_default_events_and_errors(tmp_path):
         job_id = start_job(manager, "import time; time.sleep(0.3)")
         wait_event(manager, job_id, "started")
 
-        result = manager.add_wake_target(job_id, {"type": "http", "url": "http://127.0.0.1:1/"})
+        result = manager.add_wake_target(job_id, {"type": "local_command", "command": [sys.executable, "-c", "import sys; sys.exit(0)"]})
         assert result["events"] == ["completed", "failed"]
 
-        with pytest.raises(ValueError, match="non-empty string"):
+        with pytest.raises(ValueError, match="unsupported wake target type"):
             manager.add_wake_target(job_id, {"type": "", "url": "http://x/"})
         with pytest.raises(ValueError, match="list of strings"):
-            manager.add_wake_target(job_id, {"type": "http", "events": "completed"})
+            manager.add_wake_target(job_id, {"type": "local_command", "events": "completed"})
+        with pytest.raises(ValueError, match="unsupported wake target type"):
+            manager.add_wake_target(job_id, {"type": "http", "events": ["completed"]})
         with pytest.raises(ValueError, match="Unknown job_id"):
-            manager.add_wake_target("job_missing", {"type": "http"})
+            manager.add_wake_target("job_missing", {"type": "local_command", "command": [sys.executable, "-c", "import sys; sys.exit(0)"]})
 
         wait_event(manager, job_id, "completed")
     finally:
