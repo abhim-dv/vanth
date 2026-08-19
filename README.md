@@ -33,10 +33,10 @@ targets instead of you checking in.
 
 ## Quick start
 
-Install (requires `uv`; runs on Python 3.11+):
+Install via `pip` or `uv` (Python 3.11+):
 
 ```cmd
-uv tool install vanth
+pip install vanth              # or: uv tool install vanth
 ```
 
 This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
@@ -51,25 +51,31 @@ git clone https://github.com/abhim-dv/vanth.git && cd vanth
 uv sync
 ```
 
-Start the daemon (keep this terminal open):
+The daemon **autostarts on demand**: the first MCP tool call or CLI command
+starts it if it isn't already running, so there is no separate "start the
+daemon" step.
 
-```cmd
-uv run vanthd
-```
+1. **Register the MCP server** in opencode, Codex, and Claude-style clients:
 
-In a second terminal, start a tracked job through the MCP server:
+   ```cmd
+   vanth setup                 # detect + configure everything found (prompts)
+   vanth setup --yes           # apply without prompting (scripts/CI)
+   vanth setup opencode codex  # only specific clients
+   ```
 
-```cmd
-uv run vanth
-```
+2. **Check health**:
 
-or use the tools directly from an MCP client (see [MCP integration](#mcp-integration)).
+   ```cmd
+   vanth status                # is the daemon up? pid, schema, running jobs, deliveries
+   vanth doctor                # full health report (same as job_doctor, human-readable)
+   ```
 
-Verify everything is healthy:
+3. **Pick up updates** — after upgrading, restart the daemon so it runs the new
+   code. In-flight jobs survive (runners are detached):
 
-```text
-job_doctor()
-```
+   ```cmd
+   vanth restart
+   ```
 
 ### End-to-end: run a tracked job
 
@@ -100,26 +106,51 @@ uv run vanth-monitor
 
 | Command | Purpose |
 |---|---|
-| `uv run vanth` | MCP stdio server (bridge to the daemon); also `status` / `doctor` / `restart` subcommands |
+| `uv run vanth` | MCP stdio server (bridge to the daemon); also the human CLI below |
 | `uv run vanthd` | The background HTTP daemon |
 | `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
 | `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin, dispatches it to Codex |
 
-### Operations CLI
+### Human CLI
+
+`vanth` doubles as a human-facing operations CLI. The daemon autostarts on
+demand for any of these. Every flag-based command supports `--json` where noted
+for scripts.
+
+| Command | Purpose |
+|---|---|
+| `vanth --version` | Print the installed version |
+| `vanth status` | Daemon up/down, pid, schema, running jobs, deliveries (`--json`) |
+| `vanth doctor` | Full health report (same as `job_doctor`, human-readable; `--json`) |
+| `vanth restart` | Gracefully stop + start the daemon (jobs survive) |
+| `vanth setup [opencode] [codex] [claude] [--remove] [--yes]` | Register/unregister the MCP server in your clients' configs |
+| `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`) |
+| `vanth logs <job_id>` (`tail` alias) | Show a job's output (`--stream stdout\|stderr\|all`, `--offset`, `--max-bytes`, `--json`) |
+| `vanth stop <job_id>` | Stop a running job (`--signal`, `--kill-after`) |
+| `vanth artifacts <job_id>` | List a job's artifacts (`--limit`, `--json`) |
+| `vanth prune` | Manual retention cleanup; dry-run by default (`--older-than N`, `--yes`) |
+| `vanth autostart enable\|disable\|status` | Daemon survives reboots (Windows Task Scheduler / macOS launchd / Linux systemd user unit) |
+
+Examples:
 
 ```cmd
-uv run vanth status              # is the daemon up? pid, schema, running jobs, deliveries
-uv run vanth status --json       # machine-readable version
-uv run vanth doctor              # full health report (same as job_doctor, human-readable)
-uv run vanth restart             # gracefully stop + start the daemon (jobs survive)
-uv run vanth setup               # register the MCP server in your clients' configs
-uv run vanth setup --remove      # unregister it
+vanth status --json
+vanth list --status running --limit 20 --json
+vanth logs job_abc123 --stream stderr --max-bytes 65536
+vanth stop job_abc123 --signal terminate --kill-after 10
+vanth artifacts job_abc123 --json
+vanth prune --older-than 604800 --yes     # actually delete (dry-run is the default)
+vanth autostart enable                     # daemon survives reboots
 ```
 
 `vanth restart` is the reliable way to pick up a code/version update: it sends
 the daemon a graceful shutdown over loopback, waits for the old process to
 fully release the home lock, then starts a fresh daemon. In-flight jobs are
 owned by detached runners, so they continue across the restart.
+
+`vanth autostart` installs a start-at-login mechanism per platform — a Windows
+Task Scheduler task, a macOS launchd agent, or a Linux systemd user unit —
+then `vanth status` reports whether it is active.
 
 ---
 
@@ -368,12 +399,13 @@ events.
 
 ---
 
-## Tool reference (all 20 MCP tools)
+## Tool reference (MCP tools)
 
 | Tool | Purpose |
 |---|---|
 | `job_start` | Launch a command as a detached job |
 | `job_rerun` | Re-launch a job with its original command/env/cwd/targets |
+| `job_send` | Feed stdin to an interactive job (`interactive=True` first) |
 | `job_wait` | Block until a matching event (or timeout) — the preferred way to await jobs |
 | `job_status` | One job's status, command, env, progress, last event, linkage, tags |
 | `job_list` | Recent jobs, filterable by `status` / `thread_id` / `name` / `tags` |
@@ -393,6 +425,17 @@ events.
 | `job_stop` | Stop a running job (terminate process tree) |
 | `job_doctor` | Daemon health, schema, tables, binary availability |
 | `job_cleanup` | Dry-run or real removal of old terminal jobs |
+
+For the full parameter contract and response shapes of every tool, see
+[docs/agent-tools.md](docs/agent-tools.md).
+
+### AGENT_EVENT protocol
+
+Jobs can emit `AGENT_EVENT <json>` lines on stdout (or stderr) to create typed
+events — `progress`, `metric`, `checkpoint`, `completed`, and more — that the
+daemon persists durably, the dashboard charts, and wake deliveries carry to
+agents. See `vanth/agent_events.py` for the Python helpers and
+`vanth/agent_logger.py` for the loguru integration.
 
 ### job_start
 
@@ -792,6 +835,19 @@ Environment variables (defaults live in `src/vanth/server.py`,
 | `VANTH_LOG_MAX_BYTES` | `5 MiB` | Rotating daemon log size |
 | `VANTH_LOG_BACKUP_COUNT` | `3` | Daemon log rotation count |
 | `VANTH_BUSY_TIMEOUT_MS` | `30000` | SQLite write-lock wait |
+
+Key knobs in one glance:
+
+| Variable | Purpose |
+|---|---|
+| `VANTH_HOME` | State root (alias: `AGENT_BG_HOME`) |
+| `VANTH_DAEMON_HOST` / `VANTH_DAEMON_PORT` | Where the daemon binds (loopback only; default `127.0.0.1:8765`) |
+| `VANTH_MAX_RUNNING_JOBS` | Concurrency quota; `0` = unlimited |
+| `VANTH_RETENTION_SECONDS` / `VANTH_RETENTION_INTERVAL` / `VANTH_RETENTION_DRY_RUN` | Automatic background retention of old terminal jobs (dry-run by default) |
+| `VANTH_NO_SETUP_HINT` | Suppress the stderr "MCP server not configured" hint |
+| `VANTH_OPENCODE_SKIP_PROBE` | Skip the `opencode session list` probe before dispatch |
+| `VANTH_DELIVERY_MAX_CONCURRENT` | Cap on concurrent adapter dispatches (default 4) |
+| `VANTH_MAX_REQUEST_BYTES` | HTTP request body cap (default 1 MiB) |
 
 ---
 

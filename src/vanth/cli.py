@@ -17,9 +17,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import autostart
 from .client import VanthClient
 from .paths import canonical_home
 
@@ -208,6 +210,43 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} TiB"
 
 
+def _humanize(seconds: float) -> str:
+    """Humanize a seconds count: "42s", "2m 3s", "1h", "3d 4h"."""
+    if seconds is None:
+        return ""
+    seconds = int(max(0.0, float(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            count, seconds = divmod(seconds, size)
+            parts.append(f"{count}{unit}")
+        if len(parts) >= 2:
+            break
+    if parts and seconds:
+        parts.append(f"{seconds}s")
+    return " ".join(parts) if parts else f"{seconds}s"
+
+
+def _parse_iso_ts(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_from(value: str | None) -> str:
+    """Humanized age since an ISO timestamp (blank when unparsable)."""
+    if not value:
+        return ""
+    parsed = _parse_iso_ts(value)
+    if parsed is None:
+        return ""
+    delta = (datetime.now(timezone.utc) - parsed).total_seconds()
+    return _humanize(max(0.0, delta))
+
+
 def cmd_restart(home: Path, *, json_out: bool = False) -> int:
     """Gracefully stop the daemon (if running) and start it again fresh.
 
@@ -304,6 +343,428 @@ def cmd_setup(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     return run_setup(clients or None, home=home, remove=remove, assume_yes=assume_yes, json_out=json_out)
 
 
+def cmd_autostart(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    """`vanth autostart enable|disable|status [--dry-run] [--yes] [--json]`."""
+    if not argv or argv[0] in {"--help", "-h"}:
+        print(
+            "usage: vanth autostart enable|disable|status [--dry-run] [--yes] [--json]\n"
+            "\n"
+            "Register the Vanth daemon as a background service so it survives\n"
+            "reboots (Windows Task Scheduler / macOS launchd / Linux systemd).\n"
+            "\n"
+            "actions:\n"
+            "  status         show whether autostart is registered\n"
+            "  enable         register the daemon to start automatically\n"
+            "  disable        remove the autostart registration\n"
+            "\n"
+            "options:\n"
+            "  --dry-run      show what would happen without changing anything\n"
+            "  --yes, -y      do not prompt; apply immediately\n"
+            "  --json         machine-readable output\n"
+        )
+        return 0
+    action = argv[0]
+    rest = argv[1:]
+    dry_run = "--dry-run" in rest
+    assume_yes = "--yes" in rest or "-y" in rest
+    if action == "status":
+        state = autostart.detect(home)
+        if json_out:
+            print(json.dumps(state, indent=2, default=str))
+        else:
+            enabled = state.get("enabled", False)
+            print(f"vanth autostart: {'enabled' if enabled else 'disabled'}")
+            print(f"  platform: {state.get('platform')}")
+            print(f"  target:   {state.get('target')}")
+            if state.get("error"):
+                print(f"  error:    {state['error']}")
+        return 0 if state.get("enabled") else 1
+    if action == "enable":
+        if not assume_yes and not dry_run:
+            answer = input("Install Vanth autostart? [y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("vanth autostart: declined")
+                return 0
+        try:
+            result = autostart.enable(home, dry_run=dry_run)
+        except Exception as exc:
+            print(f"vanth autostart: enable failed: {exc}", file=sys.stderr)
+            return 1
+        if json_out:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            if result.get("dry_run"):
+                print(f"vanth autostart: would install: {result.get('would_install')}")
+            else:
+                print(f"vanth autostart: enabled ({result.get('target')})")
+        return 0
+    if action == "disable":
+        if not assume_yes and not dry_run:
+            answer = input("Remove Vanth autostart? [y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("vanth autostart: declined")
+                return 0
+        try:
+            result = autostart.disable(home, dry_run=dry_run)
+        except Exception as exc:
+            print(f"vanth autostart: disable failed: {exc}", file=sys.stderr)
+            return 1
+        if json_out:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            if result.get("dry_run"):
+                print(f"vanth autostart: would uninstall: {result.get('would_uninstall')}")
+            else:
+                print(f"vanth autostart: disabled ({result.get('target')})")
+        return 0
+    print(f"vanth: unknown autostart action {action!r}", file=sys.stderr)
+    return 2
+
+
+def cmd_version() -> int:
+    print(_daemon_version())
+    return 0
+
+
+def _job_error(message: str) -> dict[str, Any]:
+    return {"result": "error", "error": message}
+
+
+def _expect_ok(payload: dict[str, Any]) -> bool:
+    return bool(payload and payload.get("result") != "error")
+
+
+def cmd_list(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    statuses: list[str] = []
+    limit = 50
+    include_all = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--status":
+            i += 1
+            if i >= len(argv):
+                print("vanth list: --status requires a value", file=sys.stderr)
+                return 2
+            statuses.extend(item.strip() for item in argv[i].split(",") if item.strip())
+        elif arg == "--limit":
+            i += 1
+            if i >= len(argv):
+                print("vanth list: --limit requires a value", file=sys.stderr)
+                return 2
+            try:
+                limit = int(argv[i])
+            except ValueError:
+                print(f"vanth list: invalid --limit value {argv[i]!r}", file=sys.stderr)
+                return 2
+        elif arg == "--all":
+            include_all = True
+        else:
+            print(f"vanth list: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+        params: dict[str, Any] = {"limit": limit}
+        if statuses:
+            params["status"] = statuses
+        payload = client.get("/jobs", params)
+    except Exception as exc:
+        print(f"vanth list: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(payload):
+        print(f"vanth list: daemon error: {payload.get('error') or payload}", file=sys.stderr)
+        return 1
+    jobs = payload.get("jobs") or []
+    if not include_all:
+        jobs = [job for job in jobs if job.get("status") == "running"]
+    else:
+        active = {"running", "queued", "pending", "retrying", "dispatching", "orphaned"}
+        jobs = [job for job in jobs if job.get("status") not in active]
+    if json_out:
+        print(json.dumps(jobs, indent=2, default=str))
+        return 0
+    if not jobs:
+        print("vanth list: no jobs")
+        return 0
+    jobs = sorted(
+        jobs,
+        key=lambda job: (job.get("status") != "running", job.get("created_at") or ""),
+        reverse=True,
+    )
+    print(f"{'STATUS':<10} {'JOB ID':<24} {'NAME':<28} {'DURATION':<10} {'EXIT':<6} AGE")
+    for job in jobs:
+        runtime = job.get("runtime_seconds")
+        if runtime is None:
+            started_at = job.get("started_at")
+            duration = _age_from(started_at) if started_at else ""
+        else:
+            duration = _humanize(runtime)
+        exit_code = job.get("exit_code")
+        exit_text = "" if exit_code is None else str(exit_code)
+        age = _age_from(job.get("created_at") or job.get("updated_at"))
+        print(
+            f"{(job.get('status') or ''):<10} {(job.get('job_id') or ''):<24} "
+            f"{(job.get('name') or ''):<28} {duration:<10} {exit_text:<6} {age}"
+        )
+    return 0
+
+
+def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    if not argv:
+        print("vanth logs: missing job id", file=sys.stderr)
+        return 2
+    job_id = argv[0]
+    stream = "stdout"
+    max_bytes = 8192
+    offset: int | None = None
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--stream":
+            i += 1
+            if i >= len(argv):
+                print("vanth logs: --stream requires a value", file=sys.stderr)
+                return 2
+            value = argv[i]
+            if value not in {"stdout", "stderr", "all"}:
+                print("vanth logs: --stream must be stdout, stderr, or all", file=sys.stderr)
+                return 2
+            stream = value
+        elif arg == "--max-bytes":
+            i += 1
+            if i >= len(argv):
+                print("vanth logs: --max-bytes requires a value", file=sys.stderr)
+                return 2
+            try:
+                max_bytes = int(argv[i])
+            except ValueError:
+                print(f"vanth logs: invalid --max-bytes value {argv[i]!r}", file=sys.stderr)
+                return 2
+        elif arg == "--offset":
+            i += 1
+            if i >= len(argv):
+                print("vanth logs: --offset requires a value", file=sys.stderr)
+                return 2
+            try:
+                offset = int(argv[i])
+            except ValueError:
+                print(f"vanth logs: invalid --offset value {argv[i]!r}", file=sys.stderr)
+                return 2
+        else:
+            print(f"vanth logs: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+    except Exception as exc:
+        print(f"vanth logs: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    streams = ["stdout", "stderr"] if stream == "all" else [stream]
+    results: list[dict[str, Any]] = []
+    for name in streams:
+        params: dict[str, Any] = {"stream": name, "max_bytes": max_bytes}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            result = client.get(f"/jobs/{job_id}/tail", params)
+        except Exception as exc:
+            print(f"vanth logs: failed to reach daemon: {exc}", file=sys.stderr)
+            return 1
+        if not _expect_ok(result):
+            error = result.get("error") or ""
+            if "unknown" in error.lower() or "job_id" in error.lower() or "not found" in error.lower():
+                print(f"vanth logs: unknown job {job_id}", file=sys.stderr)
+                return 1
+            print(f"vanth logs: daemon error: {error}", file=sys.stderr)
+            return 1
+        results.append(result)
+    if json_out:
+        print(json.dumps(results[0] if len(results) == 1 else results, indent=2, default=str))
+        return 0
+    for result in results:
+        print(result.get("content") or "", end="")
+    return 0
+
+
+def cmd_stop(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    if not argv:
+        print("vanth stop: missing job id", file=sys.stderr)
+        return 2
+    job_id = argv[0]
+    signal = "terminate"
+    kill_after = 10
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--signal":
+            i += 1
+            if i >= len(argv):
+                print("vanth stop: --signal requires a value", file=sys.stderr)
+                return 2
+            value = argv[i]
+            if value not in {"terminate", "kill"}:
+                print("vanth stop: --signal must be terminate or kill", file=sys.stderr)
+                return 2
+            signal = value
+        elif arg == "--kill-after":
+            i += 1
+            if i >= len(argv):
+                print("vanth stop: --kill-after requires a value", file=sys.stderr)
+                return 2
+            try:
+                kill_after = int(argv[i])
+            except ValueError:
+                print(f"vanth stop: invalid --kill-after value {argv[i]!r}", file=sys.stderr)
+                return 2
+        else:
+            print(f"vanth stop: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+        result = client.post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after})
+    except Exception as exc:
+        print(f"vanth stop: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        error = result.get("error") or ""
+        if "not running" in error or "is not running" in error or "unknown" in error.lower():
+            print(f"vanth stop: unknown or not running job {job_id}", file=sys.stderr)
+            return 1
+        print(f"vanth stop: daemon error: {error}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(f"vanth stop: requested stop for {job_id}")
+    return 0
+
+
+def cmd_artifacts(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    if not argv:
+        print("vanth artifacts: missing job id", file=sys.stderr)
+        return 2
+    job_id = argv[0]
+    limit = 50
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--limit":
+            i += 1
+            if i >= len(argv):
+                print("vanth artifacts: --limit requires a value", file=sys.stderr)
+                return 2
+            try:
+                limit = int(argv[i])
+            except ValueError:
+                print(f"vanth artifacts: invalid --limit value {argv[i]!r}", file=sys.stderr)
+                return 2
+        else:
+            print(f"vanth artifacts: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+        result = client.get(f"/jobs/{job_id}/artifacts", {"limit": limit})
+    except Exception as exc:
+        print(f"vanth artifacts: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        error = result.get("error") or ""
+        if "unknown" in error.lower() or "job_id" in error.lower():
+            print(f"vanth artifacts: unknown job {job_id}", file=sys.stderr)
+            return 1
+        print(f"vanth artifacts: daemon error: {error}", file=sys.stderr)
+        return 1
+    artifacts = result.get("artifacts") or []
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if not artifacts:
+        print(f"vanth artifacts: no artifacts for {job_id}")
+        return 0
+    for artifact in artifacts:
+        size = artifact.get("size_bytes")
+        size_text = _fmt_bytes(size) if size is not None else ""
+        print(
+            f"{(artifact.get('name') or ''):<24} {(artifact.get('kind') or ''):<12} "
+            f"{size_text:<10} {(artifact.get('uri') or ''):<40} {artifact.get('created_at') or ''}"
+        )
+    return 0
+
+
+def cmd_prune(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    older_than = 0
+    dry_run: bool | None = None
+    assume_yes = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--older-than":
+            i += 1
+            if i >= len(argv):
+                print("vanth prune: --older-than requires a value", file=sys.stderr)
+                return 2
+            try:
+                older_than = int(argv[i])
+            except ValueError:
+                print(f"vanth prune: invalid --older-than value {argv[i]!r}", file=sys.stderr)
+                return 2
+        elif arg == "--dry-run":
+            dry_run = True
+        elif arg == "--yes":
+            assume_yes = True
+            dry_run = False
+        else:
+            print(f"vanth prune: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    if dry_run is None:
+        dry_run = not assume_yes
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+        result = client.post("/cleanup", {"older_than_seconds": older_than, "dry_run": dry_run})
+    except Exception as exc:
+        print(f"vanth prune: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        print(f"vanth prune: daemon error: {result.get('error') or result}", file=sys.stderr)
+        return 1
+    count = int(result.get("count") or 0)
+    job_ids = result.get("jobs") or []
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if dry_run:
+        if count:
+            print(f"vanth prune: would remove {count} job(s): {', '.join(job_ids)}")
+        else:
+            print("vanth prune: no jobs to remove")
+        return 0
+    if not assume_yes:
+        if count == 0:
+            print("vanth prune: no jobs to remove")
+            return 0
+        try:
+            answer = input(f"Remove {count} job(s)? [y/N] ")
+        except EOFError:
+            answer = "n"
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("vanth prune: aborted")
+            return 0
+    if count:
+        print(f"vanth prune: removed {count} job(s)")
+    else:
+        print("vanth prune: no jobs to remove")
+    return 0
+
+
 def _usage() -> str:
     return (
         "usage: vanth <command> [options]\n"
@@ -313,8 +774,15 @@ def _usage() -> str:
         "commands:\n"
         "  status         show daemon health, running jobs, and MCP client state\n"
         "  doctor         full health report (schema, deliveries, tools)\n"
+        "  list, ps       list jobs (running by default; --all for terminal)\n"
+        "  logs, tail     show a job's stdout/stderr output\n"
+        "  stop           stop a running job\n"
+        "  artifacts      list a job's artifacts\n"
+        "  prune          manually clean up terminal jobs (default dry-run)\n"
         "  restart        gracefully restart the daemon (jobs survive)\n"
         "  setup          register the MCP server in your clients' configs (one-shot)\n"
+        "  autostart      enable/disable/status (daemon survives reboots)\n"
+        "  version        print the installed package version\n"
         "\n"
         "options:\n"
         "  --help, -h     show this help\n"
@@ -334,6 +802,8 @@ def main(argv: list[str] | None = None) -> int:
         print(_usage(), end="")
         return 0
     command = argv[0]
+    if command in {"--version", "version"}:
+        return cmd_version()
     if command == "status":
         return cmd_status(home, json_out=json_out)
     if command == "doctor":
@@ -342,6 +812,18 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_restart(home, json_out=json_out)
     if command == "setup":
         return cmd_setup(argv[1:], home, json_out=json_out)
+    if command == "autostart":
+        return cmd_autostart(argv[1:], home, json_out=json_out)
+    if command in {"list", "ps"}:
+        return cmd_list(argv[1:], home, json_out=json_out)
+    if command in {"logs", "tail"}:
+        return cmd_logs(argv[1:], home, json_out=json_out)
+    if command == "stop":
+        return cmd_stop(argv[1:], home, json_out=json_out)
+    if command == "artifacts":
+        return cmd_artifacts(argv[1:], home, json_out=json_out)
+    if command == "prune":
+        return cmd_prune(argv[1:], home, json_out=json_out)
     print(f"vanth: unknown command {command!r}", file=sys.stderr)
     return 2
 

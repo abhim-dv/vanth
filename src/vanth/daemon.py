@@ -260,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().run_summary(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
                 ok(self, get_manager().artifacts(parsed.path.split("/")[2], int(query.get("limit", ["50"])[0])))
+            elif parsed.path.startswith("/artifacts/") and parsed.path.endswith("/content"):
+                ok(self, get_manager().artifact_read(parsed.path.split("/")[2], int(query.get("max_bytes", ["262144"])[0])))
+            elif parsed.path == "/cleanup/preview":
+                ok(self, get_manager().cleanup_preview(int(query.get("older_than_seconds", ["0"])[0])))
             elif parsed.path == "/metrics/compare":
                 ok(self, get_manager().metric_compare(
                     query.get("job_ids") or [],
@@ -330,6 +334,10 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().retry_delivery(parsed.path.split("/")[2]))
             elif parsed.path == "/cleanup":
                 ok(self, get_manager().cleanup(**payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
+                ok(self, get_manager().metric_ingest(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wake"):
+                ok(self, get_manager().add_wake_target(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
                 ok(self, get_manager().artifact_add(parsed.path.split("/")[2], **payload))
             elif parsed.path == "/shutdown":

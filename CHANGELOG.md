@@ -2,7 +2,32 @@
 
 All notable changes to Vanth are documented here.
 
-## Unreleased
+## 1.4.0 - 2026-08-19
+
+### Agent + user QoL
+
+- **NEW - richer human CLI**: `vanth list` (alias `ps`), `vanth logs`
+  (alias `tail`), `vanth stop`, `vanth artifacts`, `vanth prune`, and
+  `vanth --version` join `status` / `doctor` / `restart` / `setup` as
+  first-class operations. `list` filters by `--status`/`--limit`/`--all` and
+  prints JSON; `logs` selects `--stream stdout|stderr|all` with `--offset` /
+  `--max-bytes`; `prune` is a manual retention pass that is dry-run by default
+  (`--older-than N`, `--yes` to apply).
+- **NEW - `vanth autostart enable|disable|status`**: installs a
+  start-at-login mechanism per platform (Windows Task Scheduler / macOS
+  launchd / Linux systemd user unit) so the daemon survives reboots, and
+  reports activation state via `vanth status`.
+- **NEW - MCP tool `job_metric_ingest`**: write scalar metric points
+  into a job's series with idempotency-key support, complementing the existing
+  read-only `job_metrics_query`.
+- **NEW - MCP tool `job_artifact_read`**: read a stored artifact's
+  contents/metadata back out of a job (the read side of `job_artifact_add`).
+- **NEW - MCP tool `daemon_wake`**: request the daemon's attention from
+  inside a job context (e.g. to surface an agent-facing wake without a wake
+  target event).
+- **NEW - MCP tool `job_cleanup_preview`**: a dedicated dry-run
+  retention preview that reports exactly what would be removed, separate from
+  the destructive `job_cleanup`.
 
 ## 1.3.1 - 2026-08-18
 

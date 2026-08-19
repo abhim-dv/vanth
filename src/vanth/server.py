@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -12,6 +13,9 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -197,6 +201,7 @@ class JobManager:
         self.reader_threads: dict[str, list[threading.Thread]] = {}
         self.conditions: dict[str, threading.Condition] = {}
         self._log_truncated: set[tuple[str, str]] = set()
+        self._metric_ingest_keys: set[str] = set()
         self._delivery_threads: set[threading.Thread] = set()
         self._delivery_threads_lock = threading.Lock()
         self.max_delivery_concurrency = max(1, int(os.environ.get("VANTH_DELIVERY_MAX_CONCURRENT", "4")))
@@ -1024,20 +1029,22 @@ class JobManager:
         except (sqlite3.Error, RuntimeError):
             return
 
-    def _insert_wake_targets(self, job_id: str, targets: list[dict[str, Any]], created_at: str) -> None:
+    def _insert_wake_targets(self, job_id: str, targets: list[dict[str, Any]], created_at: str) -> list[str]:
+        inserted = []
         for target in targets:
             target_type = target.get("type")
             events = target.get("events") or target.get("notify_on") or []
             if not isinstance(target_type, str):
                 continue
             config = {key: value for key, value in target.items() if key not in {"type", "events", "notify_on"}}
+            target_id = "target_" + uuid.uuid4().hex[:12]
             self.db.execute(
                 """
                 INSERT INTO wake_targets(target_id, job_id, type, events_json, config_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    "target_" + uuid.uuid4().hex[:12],
+                    target_id,
                     job_id,
                     target_type,
                     json.dumps(events, separators=(",", ":")),
@@ -1045,6 +1052,8 @@ class JobManager:
                     created_at,
                 ),
             )
+            inserted.append(target_id)
+        return inserted
 
     def _read_stream(
         self,
@@ -1452,6 +1461,69 @@ class JobManager:
             }
         return result
 
+    def metric_ingest(self, job_id: str, metrics: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
+        """Record scalar metric points for a job programmatically.
+
+        Each point is ``{"name": str, "value": float, "ts_ms": int|None,
+        "labels": dict|None}``. Points are mirrored into the same
+        ``metric_series`` pipeline used by ``metric`` AGENT_EVENT payloads, so
+        ``metrics_query``/``metric_compare`` see them immediately. A repeated
+        ``idempotency_key`` is ignored.
+        """
+        self._ensure_open()
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown job_id: {job_id}")
+        if not isinstance(metrics, list) or not metrics:
+            raise ValueError("metrics must be a non-empty list")
+        if len(metrics) > 1000:
+            raise ValueError("metrics must contain at most 1000 points")
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise ValueError("idempotency_key must be a string")
+        points: list[tuple[str, float, int | None, dict[str, Any]]] = []
+        for point in metrics:
+            if not isinstance(point, dict):
+                raise ValueError("each metric point must be an object")
+            name = point.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("each metric point must have a non-empty string name")
+            value = point.get("value")
+            if not self._is_finite_number(value):
+                raise ValueError(f"metric {name!r} value must be a finite number")
+            ts_ms = point.get("ts_ms")
+            if ts_ms is not None and (isinstance(ts_ms, bool) or not isinstance(ts_ms, int)):
+                raise ValueError("ts_ms must be an integer epoch milliseconds")
+            labels = point.get("labels")
+            if labels is not None:
+                if not isinstance(labels, dict) or not all(
+                    isinstance(key, str) and isinstance(label_value, (str, int, float))
+                    for key, label_value in labels.items()
+                ):
+                    raise ValueError(f"metric {name!r} labels must be a dict of scalar values")
+            points.append((name, float(value), ts_ms, labels or {}))
+        if idempotency_key is not None:
+            if idempotency_key in self._metric_ingest_keys:
+                return {
+                    "result": "ok",
+                    "job_id": job_id,
+                    "ingested": 0,
+                    "event_id": None,
+                    "deduplicated": True,
+                }
+            self._metric_ingest_keys.add(idempotency_key)
+        event_id: str | None = None
+        for name, value, ts_ms, labels in points:
+            data: dict[str, Any] = {name: value}
+            if ts_ms is not None:
+                data["_step"] = ts_ms
+            data.update(labels)
+            event = self._emit(job_id, "metric", data=data, message=f"metric ingest {name}", source="server")
+            event_id = event.get("event_id")
+            if not event_id:
+                if idempotency_key is not None:
+                    self._metric_ingest_keys.discard(idempotency_key)
+                raise RuntimeError("metric ingest event was not persisted")
+        return {"result": "ok", "job_id": job_id, "ingested": len(points), "event_id": event_id}
+
     def run_summary(self, job_id: str) -> dict[str, Any]:
         """One-call summary of a job: status, runtime, progress, top metrics.
 
@@ -1543,6 +1615,55 @@ class JobManager:
         return {"artifact_id": artifact_id, "job_id": job_id, "name": name, "uri": uri,
                 "kind": kind, "size_bytes": size_bytes, "sha256": sha256,
                 "meta": meta or {}, "created_at": created_at}
+
+    def artifact_read(self, artifact_id: str, max_bytes: int = 262144) -> dict[str, Any]:
+        """Read the content of an artifact (file://, local path, or http(s)://).
+
+        Returns base64-encoded content so binary and JSON artifacts round-trip
+        cleanly through the MCP JSON transport. ``truncated`` is set when the
+        artifact exceeds ``max_bytes``.
+        """
+        self._ensure_open()
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 256 or max_bytes > 1024 * 1024:
+            raise ValueError("max_bytes must be an integer between 256 and 1048576")
+        row = self._row(
+            "SELECT artifact_id, job_id, name, uri, kind, size_bytes, sha256 FROM artifacts WHERE artifact_id=?",
+            (artifact_id,),
+        )
+        if not row:
+            raise ValueError(f"artifact content unavailable: unknown artifact_id: {artifact_id}")
+        uri = row["uri"]
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme in {"http", "https"}:
+            try:
+                with urllib.request.urlopen(uri, timeout=5) as response:
+                    content = response.read(max_bytes + 1)
+            except Exception as exc:
+                raise ValueError(f"artifact content unavailable: {exc}") from None
+        elif parsed.scheme in {"", "file"} or (len(parsed.scheme) == 1 and parsed.scheme.isalpha()):
+            path = Path(uri)
+            if parsed.scheme == "file":
+                path = Path(urllib.request.url2pathname(parsed.path))
+            if not path.is_absolute():
+                path = Path(self.home) / path
+            if not path.exists() or not path.is_file():
+                raise ValueError(f"artifact content unavailable: {uri}")
+            with path.open("rb") as handle:
+                content = handle.read(max_bytes + 1)
+        else:
+            raise ValueError(f"artifact content unavailable: unsupported scheme {parsed.scheme!r}")
+        truncated = len(content) > max_bytes
+        content = content[:max_bytes]
+        return {
+            "artifact_id": row["artifact_id"],
+            "name": row["name"],
+            "kind": row["kind"],
+            "uri": uri,
+            "size_bytes": row["size_bytes"],
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "truncated": truncated,
+            "bytes_read": len(content),
+        }
 
     def dashboard(self, job_ids: list[str] | None = None, limit: int = 5000) -> dict[str, Any]:
         """Chart-data view for one or more jobs, mirroring the Go monitor.
@@ -1799,18 +1920,22 @@ class JobManager:
             "warnings": warnings,
         }
 
+    def _cleanup_rows(self, older_than_seconds: int) -> list[sqlite3.Row]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+        with self.db_lock:
+            return self.db.execute(
+                "SELECT * FROM jobs WHERE status IN ('completed','failed','timeout','cancelled','orphaned') AND updated_at<=?",
+                (cutoff,),
+            ).fetchall()
+
     def cleanup(self, older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
         self._ensure_open()
         if isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0:
             raise ValueError("older_than_seconds must be a non-negative integer")
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
-        with self.db_lock:
-            rows = self.db.execute(
-                "SELECT job_id, stdout_path, stderr_path, events_path FROM jobs WHERE status IN ('completed','failed','timeout','cancelled','orphaned') AND updated_at<=?",
-                (cutoff,),
-            ).fetchall()
-            job_ids = [row["job_id"] for row in rows]
-            if not dry_run and job_ids:
+        rows = self._cleanup_rows(older_than_seconds)
+        job_ids = [row["job_id"] for row in rows]
+        if not dry_run and job_ids:
+            with self.db_lock:
                 placeholders = ",".join("?" for _ in job_ids)
                 self.db.execute("BEGIN IMMEDIATE")
                 for row in rows:
@@ -1836,6 +1961,25 @@ class JobManager:
         if not dry_run:
             self._drain_cleanup_tombstones()
         return {"dry_run": dry_run, "older_than_seconds": older_than_seconds, "jobs": job_ids, "count": len(job_ids)}
+
+    def cleanup_preview(self, older_than_seconds: int) -> dict[str, Any]:
+        """Dry-run preview of the jobs a cleanup would remove, without deleting."""
+        self._ensure_open()
+        if isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0:
+            raise ValueError("older_than_seconds must be a non-negative integer")
+        jobs = [
+            {
+                "job_id": row["job_id"],
+                "name": row["name"],
+                "status": row["status"],
+                "updated_at": row["updated_at"],
+                "stdout_path": row["stdout_path"],
+                "stderr_path": row["stderr_path"],
+                "events_path": row["events_path"],
+            }
+            for row in self._cleanup_rows(older_than_seconds)
+        ]
+        return {"dry_run": True, "older_than_seconds": older_than_seconds, "jobs": jobs, "count": len(jobs)}
 
     def _drain_cleanup_tombstones(self) -> None:
         with self.db_lock:
@@ -1916,6 +2060,29 @@ class JobManager:
         if failures:
             raise RuntimeError(f"Failed to stop process tree(s): {failures}")
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
+
+    def add_wake_target(self, job_id: str, target: dict[str, Any]) -> dict[str, Any]:
+        """Schedule a self-resume wake target against a job after the fact."""
+        self._ensure_open()
+        if not isinstance(target, dict):
+            raise ValueError("target must be an object")
+        target_type = target.get("type")
+        if not isinstance(target_type, str) or not target_type:
+            raise ValueError("target type must be a non-empty string")
+        events = target.get("events")
+        if events is None:
+            events = target.get("notify_on") or ["completed", "failed"]
+        if not isinstance(events, list) or not all(isinstance(event, str) for event in events):
+            raise ValueError("target events must be a list of strings")
+        if not events:
+            raise ValueError("target events must not be empty")
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown job_id: {job_id}")
+        config = {key: value for key, value in target.items() if key not in {"type", "events", "notify_on"}}
+        with self.db_lock:
+            inserted = self._insert_wake_targets(job_id, [{"type": target_type, "events": events, **config}], now_iso())
+            self.db.commit()
+        return {"result": "ok", "job_id": job_id, "target_id": inserted[0], "target_type": target_type, "events": events}
 
     async def send(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(None, self.send_sync, job_id, input, eof)
@@ -2124,6 +2291,30 @@ def job_dashboard(job_ids: list[str] | None = None, limit: int = 5000) -> dict[s
     return get_client().get("/dashboard", {"job_ids": job_ids, "limit": limit})
 
 
+@mcp.tool()
+def job_metric_ingest(job_id: str, metrics: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
+    """Record scalar metric points for a job (loss, accuracy, ...) programmatically."""
+    return get_client().post(f"/jobs/{job_id}/metrics", {"metrics": metrics, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def job_artifact_read(artifact_id: str, max_bytes: int = 262144) -> dict[str, Any]:
+    """Fetch the content of an artifact (base64-encoded) for direct consumption."""
+    return get_client().get(f"/artifacts/{artifact_id}/content", {"max_bytes": max_bytes})
+
+
+@mcp.tool()
+def daemon_wake(job_id: str, target: dict[str, Any]) -> dict[str, Any]:
+    """Schedule a self-resume wake target against a running/known job."""
+    return get_client().post(f"/jobs/{job_id}/wake", {"target": target})
+
+
+@mcp.tool()
+def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
+    """Dry-run preview of what job_cleanup would remove, without deleting anything."""
+    return get_client().get("/cleanup/preview", {"older_than_seconds": older_than_seconds})
+
+
 def _hint_setup() -> None:
     """Print a stderr hint on MCP startup when a known client still lacks the
     Vanth MCP entry. stdout is the JSON-RPC protocol, so hints go to stderr
@@ -2152,10 +2343,14 @@ def main(argv: list[str] | None = None) -> None:
     from .cli import main as cli_main
 
     args = list(sys.argv[1:] if argv is None else argv)
-    # Human-facing subcommands (status/doctor/restart/setup/--help) are
-    # dispatched to the CLI; anything else (including no args) runs the MCP
-    # stdio server, which is what MCP clients expect from `vanth` (bare).
-    if args and args[0] in {"status", "doctor", "restart", "setup", "--help", "-h", "help"}:
+    # Human-facing subcommands are dispatched to the CLI; anything else
+    # (including no args) runs the MCP stdio server, which is what MCP
+    # clients expect from `vanth` (bare).
+    if args and args[0] in {
+        "status", "doctor", "restart", "setup", "--help", "-h", "help",
+        "list", "ps", "logs", "tail", "stop", "artifacts", "prune",
+        "autostart", "--version", "version",
+    }:
         raise SystemExit(cli_main(args))
     _hint_setup()
     mcp.run()
