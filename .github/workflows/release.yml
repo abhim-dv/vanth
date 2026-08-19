@@ -112,14 +112,14 @@ jobs:
       - name: Normalize binary name
         shell: bash
         run: |
-          # download-artifact extracts into dist/<artifact-name>/; move the
-          # binary up to dist/ and drop any .exe suffix so VANTH_MONITOR_BIN is
-          # the same shape for every target. The hook names the bundled file
-          # for the host platform.
-          mkdir -p dist
-          src="dist/monitor-${{ matrix.bin }}/vanth-monitor-${{ matrix.bin }}"
-          [ -f "$src.exe" ] && src="$src.exe"
-          mv "$src" "dist/vanth-monitor-${{ matrix.bin }}"
+          # upload-artifact@v4 preserves the source dir structure, so the binary
+          # may be under dist/dist/ (the artifact's own subpath) depending on
+          # the upload glob. Locate it robustly and move it to a known path
+          # with no .exe suffix so VANTH_MONITOR_BIN is the same for every
+          # target; the hook names the bundled file for the host platform.
+          found="$(find dist -name 'vanth-monitor-${{ matrix.bin }}*' -type f | head -n1)"
+          test -n "$found"
+          mv "$found" "dist/vanth-monitor-${{ matrix.bin }}"
       - name: Build wheel with injected monitor
         shell: bash
         env:
