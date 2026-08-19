@@ -3,8 +3,15 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+// Absolute-looking paths that are valid on every platform so the alias tests
+// exercise the same "given an absolute path, return it cleaned" behavior.
+var absHome = filepath.Join(string(filepath.Separator), "state", "vanth")
+var absAgent = filepath.Join(string(filepath.Separator), "state", "agent")
+var absOther = filepath.Join(string(filepath.Separator), "state", "other")
 
 func setHomeEnv(t *testing.T, vant, agent string) {
 	t.Helper()
@@ -20,41 +27,54 @@ func setHomeEnv(t *testing.T, vant, agent string) {
 }
 
 func TestCanonicalHomeVanthTakesPrecedence(t *testing.T) {
-	setHomeEnv(t, `C:\state\vanth`, "")
+	if runtime.GOOS == "windows" {
+		absHome = `C:\state\vanth`
+	}
+	setHomeEnv(t, absHome, "")
 	got, err := CanonicalHome()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Clean(`C:\state\vanth`) {
+	if got != filepath.Clean(absHome) {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestCanonicalHomeAgentAlias(t *testing.T) {
-	setHomeEnv(t, "", `C:\state\agent`)
+	if runtime.GOOS == "windows" {
+		absAgent = `C:\state\agent`
+	}
+	setHomeEnv(t, "", absAgent)
 	got, err := CanonicalHome()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Clean(`C:\state\agent`) {
+	if got != filepath.Clean(absAgent) {
 		t.Fatalf("got %q", got)
 	}
 }
 
 func TestCanonicalHomeConflictingAliasesRejected(t *testing.T) {
-	setHomeEnv(t, `C:\a`, `C:\b`)
+	if runtime.GOOS == "windows" {
+		absHome = `C:\a`
+		absAgent = `C:\b`
+	}
+	setHomeEnv(t, absHome, absAgent)
 	if _, err := CanonicalHome(); err == nil {
 		t.Fatal("expected conflict error")
 	}
 }
 
 func TestCanonicalHomeMatchingAliasesOK(t *testing.T) {
-	setHomeEnv(t, `C:\same`, `C:\same`)
+	if runtime.GOOS == "windows" {
+		absOther = `C:\same`
+	}
+	setHomeEnv(t, absOther, absOther)
 	got, err := CanonicalHome()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != filepath.Clean(`C:\same`) {
+	if got != filepath.Clean(absOther) {
 		t.Fatalf("got %q", got)
 	}
 }

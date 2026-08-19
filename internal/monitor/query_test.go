@@ -329,11 +329,16 @@ func TestReadLogTail(t *testing.T) {
 }
 
 func TestResolvePath(t *testing.T) {
-	cfg := DefaultConfig(`C:\home\vanth`)
-	if got := cfg.resolvePath("logs/job.log"); got != `C:\home\vanth\logs\job.log` {
+	home := filepath.Join(string(filepath.Separator), "home", "vanth")
+	abs, err := filepath.Abs("abs" + string(filepath.Separator) + "job.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig(home)
+	if got := cfg.resolvePath("logs/job.log"); got != filepath.Join(home, "logs", "job.log") {
 		t.Errorf("relative resolve = %q", got)
 	}
-	if got := cfg.resolvePath(`C:\abs\job.log`); got != `C:\abs\job.log` {
+	if got := cfg.resolvePath(abs); got != abs {
 		t.Errorf("absolute resolve = %q", got)
 	}
 	if got := cfg.resolvePath(""); got != "" {

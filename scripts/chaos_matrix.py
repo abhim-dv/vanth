@@ -71,7 +71,14 @@ def request(port: int, method: str, path: str, body=None, headers=None, token=No
 def wait_for(condition, timeout: float, message: str):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        result = condition()
+        try:
+            result = condition()
+        except ConnectionRefusedError:
+            # Daemon not listening yet (startup race on loaded runners); retry.
+            result = None
+        except (ConnectionResetError, BrokenPipeError):
+            # Mid-restart socket teardown; retry.
+            result = None
         if result:
             return result
         time.sleep(0.05)
