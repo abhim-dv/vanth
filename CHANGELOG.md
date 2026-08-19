@@ -4,6 +4,14 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.3.1 - 2026-08-18
+
+- Fixed a Linux-only daemon crash on shutdown: `_stop_httpd` is registered as a
+  Unix signal handler, which passes `(signum, frame)`; it previously took no
+  arguments and raised `TypeError`, leaking a traceback into daemon stderr and
+  failing signal-driven shutdown. It now accepts and ignores the handler args
+  (the authenticated `/shutdown` route still calls it with none).
+
 ## 1.3.0 - 2026-08-18
 
 ### Cross-platform wheels + release automation

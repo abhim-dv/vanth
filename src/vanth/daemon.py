@@ -141,12 +141,13 @@ def _set_httpd(server: "TrackingHTTPServer") -> None:
     _httpd = server
 
 
-def _stop_httpd() -> None:
+def _stop_httpd(*args: Any) -> None:
     """Gracefully stop the HTTP server from a background thread.
 
-    Used by the signal handler and the authenticated ``/shutdown`` route. The
-    server thread unwinds through ``main``'s finally block, which closes the
-    manager, releases the daemon lock, and removes discovery metadata.
+    Used by the signal handler (which passes ``(signum, frame)`` on Unix) and
+    the authenticated ``/shutdown`` route (no args). The server thread unwinds
+    through ``main``'s finally block, which closes the manager, releases the
+    daemon lock, and removes discovery metadata.
     """
     if shutdown_event.is_set():
         return

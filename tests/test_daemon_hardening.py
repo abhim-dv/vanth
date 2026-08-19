@@ -322,3 +322,15 @@ def test_bind_failure_releases_lock_and_exits_cleanly(tmp_path):
         if proc2.poll() is None:
             proc2.terminate()
             proc2.wait(timeout=5)
+
+
+def test_signal_handler_accepts_signum_frame():
+    """Unix signal handlers receive (signum, frame); _stop_httpd must accept both.
+
+    Regression: registering _stop_httpd with signal.signal then receiving a real
+    signal raised TypeError on Linux ("takes 0 positional arguments but 2 were
+    given"), which crashed daemon shutdown and leaked a traceback into stderr.
+    """
+    daemon._stop_httpd(15, None)
+    daemon.shutdown_event.clear()
+    daemon._stop_httpd()
