@@ -82,19 +82,19 @@ jobs:
             goarch: arm64
             tag: manylinux_2_17_aarch64
           - target: macos-x86_64
-            os: macos-13
+            os: ubuntu-latest
             bin: darwin-amd64
             goos: darwin
             goarch: amd64
             tag: macosx_10_9_x86_64
           - target: macos-arm64
-            os: macos-14
+            os: ubuntu-latest
             bin: darwin-arm64
             goos: darwin
             goarch: arm64
             tag: macosx_11_0_arm64
           - target: windows-amd64
-            os: windows-latest
+            os: ubuntu-latest
             bin: windows-amd64
             goos: windows
             goarch: amd64
@@ -170,6 +170,7 @@ jobs:
         shell: bash
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          UV_PUBLISH_CHECK_URL: https://pypi.org/simple/
         run: uv publish
       - name: Create GitHub Release
         shell: bash
