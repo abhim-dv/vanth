@@ -86,7 +86,7 @@ jobs:
             bin: darwin-amd64
             goos: darwin
             goarch: amd64
-            tag: macosx_10_9_x86_64
+            tag: macosx_10_15_x86_64
           - target: macos-arm64
             os: ubuntu-latest
             bin: darwin-arm64
