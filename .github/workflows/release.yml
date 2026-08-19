@@ -1,0 +1,176 @@
+# Vanth release automation: cross-platform wheels + GitHub Release + PyPI.
+#
+# We deliberately do NOT use cibuildwheel. The wheel bundles a pure-Go monitor
+# binary, so the "hard part" of a build is cross-compiling Go, not Python. The
+# workflow instead cross-compiles the monitor in the `binaries` job, injects
+# the prebuilt binary into the wheel via the custom hatchling hook
+# (build-hooks/bundle_monitor.py) using VANTH_MONITOR_BIN / VANTH_MONITOR_TAG,
+# and tags each wheel with an explicit PEP 425 platform tag
+# (VANTH_MONITOR_TAG). That avoids cibuildwheel image/Go headaches entirely.
+
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: Cross-compile monitor
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+          - target: windows-amd64
+            goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Cross-compile ${{ matrix.target }}
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          exe=""
+          [ "$GOOS" = "windows" ] && exe=".exe"
+          go build -trimpath -ldflags "-X vanth/internal/config.Version=${{ github.ref_name }}" -o "dist/vanth-monitor-${{ matrix.target }}${exe}" ./cmd/vanth
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitor-${{ matrix.target }}
+          path: dist/vanth-monitor-${{ matrix.target }}*
+
+  wheels:
+    name: Build wheel for ${{ matrix.target }}
+    needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+            bin: linux-amd64
+            goos: linux
+            goarch: amd64
+            tag: manylinux_2_17_x86_64
+          - target: linux-aarch64
+            os: ubuntu-latest
+            bin: linux-arm64
+            goos: linux
+            goarch: arm64
+            tag: manylinux_2_17_aarch64
+          - target: macos-x86_64
+            os: macos-13
+            bin: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            tag: macosx_10_9_x86_64
+          - target: macos-arm64
+            os: macos-14
+            bin: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            tag: macosx_11_0_arm64
+          - target: windows-amd64
+            os: windows-latest
+            bin: windows-amd64
+            goos: windows
+            goarch: amd64
+            tag: win_amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: monitor-${{ matrix.bin }}
+          path: dist
+      - name: Normalize binary name
+        shell: bash
+        run: |
+          # Drop the .exe suffix so VANTH_MONITOR_BIN is the same shape for
+          # every target; the hook names the bundled file for the host platform.
+          if [ -f "dist/vanth-monitor-${{ matrix.bin }}.exe" ]; then
+            mv "dist/vanth-monitor-${{ matrix.bin }}.exe" "dist/vanth-monitor-${{ matrix.bin }}"
+          fi
+      - name: Build wheel with injected monitor
+        shell: bash
+        env:
+          VANTH_MONITOR_BIN: dist/vanth-monitor-${{ matrix.bin }}
+          VANTH_MONITOR_TAG: ${{ matrix.tag }}
+        run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+
+  sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - name: Build sdist
+        shell: bash
+        run: uv build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish to PyPI and GitHub Release
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'wheels-*'
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        shell: bash
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: uv publish
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.whl dist/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "Vanth ${{ github.ref_name }}" \
+            --notes "Release ${{ github.ref_name }}"

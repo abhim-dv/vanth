@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import shutil
+import struct
 import subprocess
 import sqlite3
 import sys
@@ -199,6 +200,11 @@ class JobManager:
         self._delivery_threads: set[threading.Thread] = set()
         self._delivery_threads_lock = threading.Lock()
         self.max_delivery_concurrency = max(1, int(os.environ.get("VANTH_DELIVERY_MAX_CONCURRENT", "4")))
+        self.max_running_jobs = max(0, int(os.environ.get("VANTH_MAX_RUNNING_JOBS", "0")))
+        self.max_retention_seconds = max(0, int(os.environ.get("VANTH_RETENTION_SECONDS", "0")))
+        self.retention_interval_seconds = max(0, int(os.environ.get("VANTH_RETENTION_INTERVAL_SECONDS", "3600")))
+        self.retention_dry_run = os.environ.get("VANTH_RETENTION_DRY_RUN", "1") != "0"
+        self._last_retention_run: float | None = None
         self.shutdown_requested = threading.Event()
         self.max_events_per_job = max(1, int(os.environ.get("VANTH_MAX_EVENTS_PER_JOB", "100000")))
         self._events_truncated: set[str] = set()
@@ -325,8 +331,25 @@ class JobManager:
             try:
                 self._dispatch_due_deliveries()
                 self._reconcile_running_jobs()
+                self._maybe_auto_cleanup()
             except Exception:
                 self.logger.exception("maintenance iteration failed")
+
+    def _running_count(self) -> int:
+        with self.db_lock:
+            return self.db.execute("SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()[0]
+
+    def _maybe_auto_cleanup(self) -> dict[str, Any] | None:
+        if self.max_retention_seconds <= 0:
+            return
+        if self._last_retention_run is not None and time.monotonic() - self._last_retention_run < self.retention_interval_seconds:
+            return
+        self._last_retention_run = time.monotonic()
+        try:
+            return self.cleanup(older_than_seconds=self.max_retention_seconds, dry_run=self.retention_dry_run)
+        except Exception:
+            self.logger.exception("automatic retention cleanup failed")
+            return None
 
     def _dispatch_due_deliveries(self) -> None:
         self._ensure_open()
@@ -814,6 +837,7 @@ class JobManager:
         origin_thread_id: str | None = None,
         tags: list[str] | None = None,
         notes: str | None = None,
+        interactive: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
         validate_wake_targets(wake_targets)
@@ -825,6 +849,8 @@ class JobManager:
             raise ValueError("command must be a non-empty string")
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise ValueError("timeout_seconds must be an integer >= 1")
+        if self.max_running_jobs and self._running_count() >= self.max_running_jobs:
+            raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
         stderr_path = self.logs / f"{job_id}.stderr.log"
@@ -850,12 +876,14 @@ class JobManager:
                     "max_log_bytes": self.max_log_bytes,
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
+                    "interactive": interactive,
                 },
                 separators=(",", ":"),
             ),
             encoding="utf-8",
         )
         run_info = capture_run_metadata(cwd=cwd, notes=notes)
+        run_payload = {**run_info, "interactive": interactive}
         with self.db_lock:
             self.db.execute(
                 """
@@ -880,7 +908,7 @@ class JobManager:
                     json.dumps(tags or [], separators=(",", ":")),
                     json.dumps(env or {}, separators=(",", ":")),
                     notes,
-                    serialize_run_metadata(run_info),
+                    serialize_run_metadata(run_payload),
                     str(stdout_path),
                     str(stderr_path),
                     str(events_path),
@@ -951,7 +979,7 @@ class JobManager:
         self._ensure_open()
         row = self._row(
             "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
-            "tags_json, name, notes FROM jobs WHERE job_id=?",
+            "tags_json, name, notes, run_json FROM jobs WHERE job_id=?",
             (job_id,),
         )
         if not row:
@@ -966,6 +994,7 @@ class JobManager:
             })
         tags = json.loads(row["tags_json"] or "[]")
         notify_on = json.loads(row["notify_on"] or "[]")
+        interactive = json.loads(row["run_json"] or "{}").get("interactive") is True
         return asyncio.run(self.start(
             command=row["command"],
             cwd=row["cwd"],
@@ -977,6 +1006,7 @@ class JobManager:
             origin_thread_id=row["origin_thread_id"],
             tags=tags or None,
             notes=row["notes"],
+            interactive=interactive,
         ))
 
     def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
@@ -1740,6 +1770,7 @@ class JobManager:
                 }
             )
         disk = shutil.disk_usage(self.home)
+        running_jobs = self._running_count()
         return {
             "ok": not warnings and quick_check == "ok",
             "home": str(self.home),
@@ -1756,6 +1787,13 @@ class JobManager:
             "stale_delivery_leases": stale_leases,
             "dead_letter_count": len(dead_lettered),
             "dead_lettered": dead_lettered,
+            "running_jobs": running_jobs,
+            "max_running_jobs": self.max_running_jobs,
+            "retention": {
+                "seconds": self.max_retention_seconds,
+                "interval_seconds": self.retention_interval_seconds,
+                "dry_run": self.retention_dry_run,
+            },
             "disk_free_bytes": disk.free,
             "token_path": str(self.home / "token"),
             "warnings": warnings,
@@ -1783,6 +1821,7 @@ class JobManager:
                         row["events_path"],
                         str(self.logs / f"{job_id}.runner.log"),
                         str(self.home / "specs" / f"{job_id}.json"),
+                        str(self.home / "stdin" / f"{job_id}.in"),
                     ]
                     self.db.execute(
                         "INSERT OR IGNORE INTO cleanup_tombstones(tombstone_id, job_id, artifacts_json, created_at) VALUES (?, ?, ?, ?)",
@@ -1878,6 +1917,37 @@ class JobManager:
             raise RuntimeError(f"Failed to stop process tree(s): {failures}")
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
 
+    async def send(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(None, self.send_sync, job_id, input, eof)
+
+    def send_sync(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
+        """Append a stdin record to a running interactive job's channel."""
+        self._ensure_open()
+        if not isinstance(input, str):
+            raise ValueError("input must be a string")
+        if not eof and not input:
+            raise ValueError("input must be a non-empty string")
+        row = self._row(
+            "SELECT status, run_json FROM jobs WHERE job_id=?",
+            (job_id,),
+        )
+        if not row:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        run = json.loads(row["run_json"] or "{}")
+        if run.get("interactive") is not True:
+            raise ValueError("job is not interactive (started without interactive=True)")
+        if row["status"] != "running":
+            raise ValueError(f"job is not running: {row['status']}")
+        channel_dir = self.home / "stdin"
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        data = input.encode()
+        with (channel_dir / f"{job_id}.in").open("ab") as f:
+            if data:
+                f.write(struct.pack("<Q", len(data)) + data)
+            if eof:
+                f.write(struct.pack("<Q", 0))
+        return {"job_id": job_id, "sent": len(data), "eof": bool(eof)}
+
 
 client: VanthClient | None = None
 mcp = FastMCP("vanth")
@@ -1907,6 +1977,7 @@ def job_start(
     origin_thread_id: str | None = None,
     tags: list[str] | None = None,
     notes: str | None = None,
+    interactive: bool = False,
 ) -> dict[str, Any]:
     return get_client().post(
         "/jobs",
@@ -1921,6 +1992,7 @@ def job_start(
             "origin_thread_id": origin_thread_id,
             "tags": tags,
             "notes": notes,
+            "interactive": interactive,
         },
     )
 
@@ -1933,6 +2005,11 @@ def job_rerun(job_id: str) -> dict[str, Any]:
 @mcp.tool()
 def job_status(job_id: str) -> dict[str, Any]:
     return get_client().get(f"/jobs/{job_id}/status")
+
+
+@mcp.tool()
+def job_send(job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
+    return get_client().post(f"/jobs/{job_id}/send", {"input": input, "eof": eof})
 
 
 @mcp.tool()

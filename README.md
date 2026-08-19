@@ -20,7 +20,8 @@ when a job needs attention. It is built for one trusted user on one machine.
   W&B-LEET-style dashboard of jobs, metrics, and plots.
 
 Out of scope for v1: remote network access, TLS, multi-user tenancy/RBAC,
-quotas, interactive stdin, and a web UI.
+a web UI, and distributed workers. Interactive stdin (`job_send`), concurrent
+job quotas, and automatic retention are supported (see below).
 
 **For agents:** start work with `job_start`, then `job_wait` for
 `progress`/`checkpoint`/`completed` events instead of polling; make jobs emit
@@ -40,7 +41,8 @@ uv tool install vanth
 
 This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
 the ops CLI as standalone tools (the wheel bundles the native Go monitor, so
-no Go toolchain is needed).
+no Go toolchain is needed). Wheels are published for Windows x86_64, Linux
+x86_64/arm64, and macOS x86_64/arm64.
 
 From a source checkout (development):
 
@@ -401,6 +403,7 @@ job_start(
   cwd="F:\\git\\project",            # optional
   env={"CUDA_VISIBLE_DEVICES": "0"}, # optional
   timeout_seconds=3600,              # optional; None = no timeout
+  interactive=True,                  # optional; open stdin for job_send
   notify_on=["progress","checkpoint","failed","completed"],
   origin_thread_id="019f...",        # the agent thread that launched it
   tags=["training","gpu"],           # optional
@@ -409,6 +412,18 @@ job_start(
 ```
 
 Returns `job_id`, `status`, `worker_pid`, and the log/event paths.
+
+### job_send — feed stdin to an interactive job
+
+```text
+job_send(job_id="job_...", input="y", eof=False)
+```
+
+Appends `input` to a running job's stdin. Start the job with `interactive=True`
+first. `eof=True` closes the job's stdin (the child sees EOF). Non-blocking:
+returns immediately; the input is queued to the runner. Rejects jobs that are
+not interactive, not running, or unknown. `job_rerun` preserves the
+`interactive` flag.
 
 ### job_status — see what a job is running
 
@@ -509,8 +524,18 @@ job_cleanup(older_than_seconds=86400, dry_run=false)  # delete
 ```
 
 Removes terminal jobs older than the cutoff: logs, event mirrors, specs,
-deliveries, attempts, wake targets, events, then the job row. Running jobs are
-never selected. Dry-run is fully read-only. Cleanup is safe to repeat.
+deliveries, attempts, wake targets, events, stdin channels, then the job row.
+Running jobs are never selected. Dry-run is fully read-only. Cleanup is safe
+to repeat.
+
+**Automatic retention**: set `VANTH_RETENTION_SECONDS` on the daemon to purge
+old terminal jobs in the background (polled every
+`VANTH_RETENTION_INTERVAL_SECONDS`, default 3600; safe by default —
+`VANTH_RETENTION_DRY_RUN=0` to actually delete).
+
+**Concurrency quota**: set `VANTH_MAX_RUNNING_JOBS` (default `0` = unlimited)
+to cap how many jobs may run at once; `job_start` returns a clear error when
+the cap is reached.
 
 ### job_metrics_query — read stored scalar series
 

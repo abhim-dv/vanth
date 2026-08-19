@@ -6,14 +6,59 @@ can locate it without requiring a Go toolchain at runtime.
 
 The hook runs only for the ``wheel`` target (not ``sdist``). ``go`` must be on
 PATH during the build; it is not required at install or run time.
+
+Three modes
+-----------
+1. Host ``go build`` (default): compiles the monitor for the host platform and
+   tags the wheel with the host PEP 425 platform tag (:func:`wheel_platform_tag`).
+2. Cross ``go build``: when both ``VANTH_MONITOR_GOOS`` and
+   ``VANTH_MONITOR_GOARCH`` are set (and ``VANTH_MONITOR_BIN`` is not), they are
+   exported to the ``go build`` subprocess so a single machine can cross-compile
+   every target. The wheel platform tag is derived from the target via
+   :func:`platform_tag_for`.
+3. Prebuilt binary injection: when ``VANTH_MONITOR_BIN`` points at an existing
+   file, that file is copied into the build output and ``go`` is never invoked
+   (no Go toolchain needed in the build environment). The binary is named for
+   the host platform (where the wheel will be installed) and the wheel tag
+   honors ``VANTH_MONITOR_TAG`` if set, else falls back to the host tag.
+
+``VANTH_MONITOR_TAG`` overrides the wheel platform tag in every mode.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 
-from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+try:
+    from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+except ImportError:  # pragma: no cover - only required inside a real build
+    class BuildHookInterface:
+        """Minimal stand-in for hatchling's hook interface.
+
+        Kept so the module can be imported (and its pure helpers unit-tested)
+        in environments without a build backend installed. Mirrors the
+        attribute surface that ``initialize`` relies on.
+        """
+
+        PLUGIN_NAME = ""
+
+        @property
+        def app(self) -> object:
+            return self._BuildHookInterface__app
+
+        @property
+        def root(self) -> str:
+            return self._BuildHookInterface__root
+
+        @property
+        def target_name(self) -> str:
+            return self._BuildHookInterface__target_name
+
+        @property
+        def metadata(self) -> object:
+            return self._BuildHookInterface__metadata
 
 try:
     from packaging.tags import platform_tags
@@ -39,6 +84,37 @@ def wheel_platform_tag() -> str:
     return f"{sysname}_{machine.lower()}"
 
 
+_CROSS_TARGET_TAGS = {
+    ("windows", "amd64"): "win_amd64",
+    ("linux", "amd64"): "manylinux_2_17_x86_64",
+    ("linux", "arm64"): "manylinux_2_17_aarch64",
+    ("darwin", "amd64"): "macosx_10_9_x86_64",
+    ("darwin", "arm64"): "macosx_11_0_arm64",
+}
+
+
+def platform_tag_for(goos: str, goarch: str) -> str:
+    """Return a coarse PEP 425 platform tag for a GOOS/GOARCH cross target.
+
+    Unknown combinations fall back to a ``<goos>_<goarch>`` tag so the wheel
+    still builds with a deterministic name.
+    """
+    return _CROSS_TARGET_TAGS.get((goos, goarch), f"{goos}_{goarch}")
+
+
+def monitor_filename(goos: str | None = None) -> str:
+    """Return the bundled monitor filename for a target ``GOOS``.
+
+    ``None`` means "host platform"; the ``.exe`` suffix is applied for Windows
+    (both the native host build and any ``GOOS=windows`` cross build).
+    """
+    if goos is None:
+        exe = ".exe" if os.name == "nt" else ""
+    else:
+        exe = ".exe" if goos == "windows" else ""
+    return f"vanth-monitor{exe}"
+
+
 class BundleMonitorBuildHook(BuildHookInterface):
     PLUGIN_NAME = "bundle-monitor"
 
@@ -47,9 +123,34 @@ class BundleMonitorBuildHook(BuildHookInterface):
             return
 
         root = self.root
-        exe = ".exe" if os.name == "nt" else ""
-        binary = os.path.join(root, "dist", f"vanth-monitor{exe}")
+        prebuilt = os.environ.get("VANTH_MONITOR_BIN")
+        goos = os.environ.get("VANTH_MONITOR_GOOS")
+        goarch = os.environ.get("VANTH_MONITOR_GOARCH")
+        tag_override = os.environ.get("VANTH_MONITOR_TAG")
 
+        if prebuilt is not None:
+            binary = self._inject_prebuilt(root, prebuilt)
+            tag = tag_override or wheel_platform_tag()
+        elif goos and goarch:
+            binary = self._compile(root, goos, goarch)
+            tag = tag_override or platform_tag_for(goos, goarch)
+        else:
+            binary = self._compile(root, None, None)
+            tag = tag_override or wheel_platform_tag()
+
+        rel = os.path.join("vanth", "monitor-bin", os.path.basename(binary))
+        build_data["force_include"] = {binary: rel}
+        build_data["tag"] = f"py3-none-{tag}"
+        self.app.display_success(f"Bundled monitor binary -> {rel}")
+
+    def _compile(self, root: str, goos: str | None, goarch: str | None) -> str:
+        """Compile the monitor with the Go toolchain (host or cross target)."""
+        env = dict(os.environ)
+        if goos and goarch:
+            env["GOOS"] = goos
+            env["GOARCH"] = goarch
+
+        binary = os.path.join(root, "dist", monitor_filename(goos))
         os.makedirs(os.path.dirname(binary), exist_ok=True)
 
         ldflags = f"-X vanth/internal/config.Version={self.metadata.version}"
@@ -63,9 +164,18 @@ class BundleMonitorBuildHook(BuildHookInterface):
             binary,
             "./cmd/vanth",
         ]
-        subprocess.run(cmd, cwd=root, check=True)
+        subprocess.run(cmd, cwd=root, check=True, env=env)
+        return binary
 
-        rel = os.path.join("vanth", "monitor-bin", os.path.basename(binary))
-        build_data["force_include"] = {binary: rel}
-        build_data["tag"] = f"py3-none-{wheel_platform_tag()}"
-        self.app.display_success(f"Bundled monitor binary -> {rel}")
+    def _inject_prebuilt(self, root: str, source: str) -> str:
+        """Copy a prebuilt monitor binary into the build output without compiling."""
+        if not os.path.isfile(source):
+            raise FileNotFoundError(
+                f"VANTH_MONITOR_BIN is set but no file exists at: {source}"
+            )
+        # The wheel is built for the host platform (the prebuilt binary matches
+        # it), so name the bundled binary for the host where it will install.
+        binary = os.path.join(root, "dist", monitor_filename())
+        os.makedirs(os.path.dirname(binary), exist_ok=True)
+        shutil.copyfile(source, binary)
+        return binary

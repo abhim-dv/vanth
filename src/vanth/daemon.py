@@ -307,7 +307,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes"}
+                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive"}
                 if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)
@@ -321,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().wait_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/stop"):
                 ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/send"):
+                ok(self, get_manager().send_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/mark"):
                 ok(self, get_manager().mark_delivery(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/retry"):

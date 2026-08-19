@@ -4,6 +4,42 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased
 
+## 1.3.0 - 2026-08-18
+
+### Cross-platform wheels + release automation
+
+- The wheel build now supports injecting a prebuilt (possibly cross-compiled)
+  Go monitor via `VANTH_MONITOR_BIN` + `VANTH_MONITOR_TAG`, and cross-compiling
+  in place via `VANTH_MONITOR_GOOS` / `VANTH_MONITOR_GOARCH`. Local `uv build`
+  behavior is unchanged.
+- New `.github/workflows/release.yml` publishes Linux x86_64/arm64, macOS
+  x86_64/arm64, and Windows x86_64 wheels to PyPI and a GitHub Release on any
+  `v*` tag push (also runnable via `workflow_dispatch`). `uv tool install vanth`
+  now works on Linux and macOS, not just Windows.
+- CI gains a `resilience` job that runs the chaos matrix on Linux.
+
+### Interactive stdin + `job_send`
+
+- `job_start(..., interactive=True)` opens the job's stdin. The runner forwards
+  length-prefixed records from a per-job channel (`<home>/stdin/<job_id>.in`)
+  to the child's stdin; a zero-length record closes stdin (EOF).
+- New MCP tool `job_send(job_id, input, eof=False)` (and HTTP
+  `POST /jobs/{id}/send`) appends input to a running interactive job's channel.
+  Non-blocking; rejects unknown/not-running/non-interactive jobs.
+- `job_rerun` preserves the `interactive` flag; `job_cleanup` also removes the
+  stdin channel files.
+
+### Quotas + automatic retention
+
+- `VANTH_MAX_RUNNING_JOBS` caps concurrent running jobs (default `0` =
+  unlimited). `job_start` returns a clean 400 when the quota is reached.
+- `VANTH_RETENTION_SECONDS` (default `0` = off), `VANTH_RETENTION_INTERVAL_SECONDS`
+  (default 3600), and `VANTH_RETENTION_DRY_RUN` (default `1`) add automatic
+  background retention of old terminal jobs, wired into the existing dispatcher
+  loop. Safe-by-default: dry-run unless explicitly enabled.
+- `vanth doctor` now reports `running_jobs`, `max_running_jobs`, and a
+  `retention` config block.
+
 ## 1.2.1 - 2026-08-18
 
 ### Stale opencode session recovery

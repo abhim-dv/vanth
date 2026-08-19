@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from .server import JobManager, now_iso
@@ -44,6 +46,58 @@ def _abort_workload(manager: JobManager, job_id: str, proc: subprocess.Popen[byt
     return 1
 
 
+def _feed_stdin(job_id: str, channel: Path, stdin, feeder_stop: threading.Event) -> None:
+    """Forward length-prefixed records from the job's stdin channel to the child."""
+    if stdin is None:
+        return
+    offset = 0
+    buffer = bytearray()
+    eof_seen = False
+    while not eof_seen and not feeder_stop.is_set():
+        try:
+            if not channel.exists():
+                channel.parent.mkdir(parents=True, exist_ok=True)
+                time.sleep(0.02)
+                continue
+            try:
+                with channel.open("rb") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                    offset = f.tell()
+            except OSError:
+                time.sleep(0.02)
+                continue
+            if chunk:
+                buffer.extend(chunk)
+                while len(buffer) >= 8:
+                    (length,) = struct.unpack_from("<Q", buffer)
+                    if length == 0:
+                        eof_seen = True
+                        del buffer[:8]
+                        break
+                    if len(buffer) < 8 + length:
+                        break
+                    record = bytes(buffer[8:8 + length])
+                    del buffer[:8 + length]
+                    try:
+                        stdin.write(record)
+                        stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        return
+            time.sleep(0.02)
+        except Exception:
+            time.sleep(0.02)
+    if not feeder_stop.is_set():
+        try:
+            stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+    try:
+        stdin.close()
+    except OSError:
+        pass
+
+
 def run(home: str, job_id: str) -> int:
     manager = JobManager(home, recover=False)
     try:
@@ -57,7 +111,7 @@ def run(home: str, job_id: str) -> int:
             spec["command"],
             cwd=spec.get("cwd"),
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if spec.get("interactive") else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=True,
@@ -112,10 +166,23 @@ def run(home: str, job_id: str) -> int:
 
     heartbeat_thread = threading.Thread(target=heartbeat, name=f"vanth-heartbeat-{job_id}", daemon=True)
     heartbeat_thread.start()
+    feeder_stop = threading.Event()
+    feeder_thread: threading.Thread | None = None
+    if proc.stdin is not None:
+        feeder_thread = threading.Thread(
+            target=_feed_stdin,
+            args=(job_id, Path(home) / "stdin" / f"{job_id}.in", proc.stdin, feeder_stop),
+            name=f"vanth-stdin-{job_id}",
+            daemon=True,
+        )
+        feeder_thread.start()
     timeout_seconds = spec.get("timeout_seconds")
     try:
         exit_code = proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
+        feeder_stop.set()
+        if feeder_thread:
+            feeder_thread.join(timeout=1)
         manager._kill_process(proc, force=True)
         exit_code = proc.wait()
         manager._readers_done(job_id)
@@ -124,6 +191,14 @@ def run(home: str, job_id: str) -> int:
         heartbeat_thread.join(timeout=1)
         manager.close()
         return exit_code
+    if proc.stdin is not None:
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    feeder_stop.set()
+    if feeder_thread:
+        feeder_thread.join(timeout=1)
     status = manager._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))["status"]
     if status != "cancelled":
         manager._readers_done(job_id)
