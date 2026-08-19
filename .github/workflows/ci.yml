@@ -58,6 +58,7 @@ jobs:
           go test ./internal/state/ -count=1
       - run: go build ./...
       - name: Fixture matches schema and representative rows
+        shell: bash
         run: |
           uv run python - <<'PY'
           import sqlite3

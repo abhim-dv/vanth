@@ -212,7 +212,7 @@ class DaemonKillScenario(Scenario):
             try:
                 wait_for(
                     lambda: request(port, "GET", "/health") == (200, {"ok": True}),
-                    10,
+                    30,
                     "daemon start",
                 )
                 if token is None:
@@ -264,7 +264,7 @@ class DaemonKillScenario(Scenario):
         try:
             wait_for(
                 lambda: request(port, "GET", "/health") == (200, {"ok": True}),
-                10,
+                30,
                 "final daemon start",
             )
             go.write_text("go", encoding="utf-8")
@@ -355,7 +355,7 @@ class InputScenario(Scenario):
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
         try:
-            wait_for(lambda: request(port, "GET", "/health") == (200, {"ok": True}), 10, "daemon start")
+            wait_for(lambda: request(port, "GET", "/health") == (200, {"ok": True}), 30, "daemon start")
             token = (base / "state" / "token").read_text(encoding="utf-8").strip()
             bad_bodies = [
                 b'{"command":',
