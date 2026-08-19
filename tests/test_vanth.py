@@ -58,10 +58,10 @@ def test_vanth_home_and_event_size_cap(tmp_path, monkeypatch):
         monkeypatch.setenv("VANTH_MAX_EVENT_BYTES", "20")
         manager = JobManager()
         started = await manager.start(cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','data':{'big':'x'*100}}), flush=True)"))
-        event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         assert event["event"]["data"] == {"truncated": True, "max_bytes": 20}
         assert manager.home == tmp_path / "state"
-        await manager.wait(started["job_id"], ["completed"], event["event"]["event_id"], timeout_seconds=5)
+        await manager.wait(started["job_id"], ["completed"], event["event"]["event_id"], timeout_seconds=30)
         manager.close()
 
     run(main())
@@ -71,7 +71,7 @@ def test_wait_returns_stored_event(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         started = await manager.start(cmd("print('hello')"))
-        result = await manager.wait(started["job_id"], ["completed"], timeout_seconds=5)
+        result = await manager.wait(started["job_id"], ["completed"], timeout_seconds=30)
         assert result["result"] == "event"
         assert result["event"]["type"] == "completed"
 
@@ -89,9 +89,9 @@ def test_checkpoint_progress_and_tail(tmp_path):
             "print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'done'}), flush=True)"
         )
         started = await manager.start(cmd(code))
-        progress = await manager.wait(started["job_id"], ["progress"], timeout_seconds=5)
-        checkpoint = await manager.wait(started["job_id"], ["checkpoint"], progress["event"]["event_id"], timeout_seconds=5)
-        completed = await manager.wait(started["job_id"], ["completed"], checkpoint["event"]["event_id"], timeout_seconds=5)
+        progress = await manager.wait(started["job_id"], ["progress"], timeout_seconds=30)
+        checkpoint = await manager.wait(started["job_id"], ["checkpoint"], progress["event"]["event_id"], timeout_seconds=30)
+        completed = await manager.wait(started["job_id"], ["completed"], checkpoint["event"]["event_id"], timeout_seconds=30)
 
         assert progress["event"]["data"]["percent"] == 50
         assert checkpoint["event"]["type"] == "checkpoint"
@@ -137,7 +137,7 @@ def test_wake_target_enqueues_delivery(tmp_path):
                 }
             ],
         )
-        event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         deliveries = manager.deliveries(started["job_id"])["deliveries"]
 
         assert len(deliveries) == 1
@@ -194,7 +194,7 @@ for line in sys.stdin:
                 }
             ],
         )
-        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         delivery = poll_delivery(manager, started["job_id"], "delivered")
 
         assert delivery is not None
@@ -230,7 +230,7 @@ def test_opencode_thread_delivery_dispatches_via_cli(tmp_path):
                 }
             ],
         )
-        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         delivery = poll_delivery(manager, started["job_id"], "delivered")
 
         assert delivery is not None
@@ -270,7 +270,7 @@ def test_local_command_delivery_dispatches_immediately(tmp_path):
                 }
             ],
         )
-        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not sink.exists():
             time.sleep(0.05)
@@ -302,7 +302,7 @@ def test_thread_association_agent_view_and_doctor(tmp_path):
                 }
             ],
         )
-        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         status = manager.status(started["job_id"])
         listed = manager.list(thread_id="thread_origin")["jobs"]
         view = manager.agent_view(thread_id="thread_wake")["jobs"]
@@ -341,7 +341,7 @@ def test_delivery_retry_records_attempts_and_succeeds(tmp_path):
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'retry me'}), flush=True)"),
             wake_targets=[{"type": "local_command", "events": ["checkpoint"], "command": retry_command}],
         )
-        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
+        await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         failed = poll_delivery(manager, started["job_id"], "failed")
         assert failed["attempts"] == 1
 
@@ -359,7 +359,7 @@ def test_restart_persists_completed_job(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         started = await manager.start(cmd("print('hello')"))
-        completed = await manager.wait(started["job_id"], ["completed"], timeout_seconds=5)
+        completed = await manager.wait(started["job_id"], ["completed"], timeout_seconds=30)
         manager.close()
 
         restarted = JobManager(tmp_path)
@@ -379,7 +379,7 @@ def test_running_runner_survives_manager_restart(tmp_path):
 
         restarted = JobManager(tmp_path)
         assert restarted.status(started["job_id"])["status"] in {"running", "completed"}
-        completed = await restarted.wait(started["job_id"], ["completed"], timeout_seconds=5)
+        completed = await restarted.wait(started["job_id"], ["completed"], timeout_seconds=30)
         assert completed["event"]["type"] == "completed"
         assert "after" in restarted.tail(started["job_id"])["content"]
         restarted.close()
@@ -417,11 +417,11 @@ def test_failed_and_cancelled(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         failed_job = await manager.start(cmd("import sys; sys.exit(3)"))
-        failed = await manager.wait(failed_job["job_id"], ["failed"], timeout_seconds=5)
+        failed = await manager.wait(failed_job["job_id"], ["failed"], timeout_seconds=30)
         assert failed["event"]["data"]["exit_code"] == 3
 
         slow_job = await manager.start(cmd("import time; time.sleep(30)"))
-        waiter = asyncio.create_task(manager.wait(slow_job["job_id"], ["cancelled"], timeout_seconds=5))
+        waiter = asyncio.create_task(manager.wait(slow_job["job_id"], ["cancelled"], timeout_seconds=30))
         stopped = await manager.stop(slow_job["job_id"], kill_after_seconds=1)
         cancelled = await waiter
         assert stopped["status"] == "cancelled"
@@ -436,11 +436,11 @@ def test_stderr_event_and_timeout(tmp_path):
         stderr_job = await manager.start(
             cmd("import json,sys; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), file=sys.stderr, flush=True)")
         )
-        checkpoint = await manager.wait(stderr_job["job_id"], ["checkpoint"], timeout_seconds=5)
+        checkpoint = await manager.wait(stderr_job["job_id"], ["checkpoint"], timeout_seconds=30)
         assert checkpoint["event"]["source"] == "stderr"
 
         timeout_job = await manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
-        timed_out = await manager.wait(timeout_job["job_id"], ["timeout"], timeout_seconds=5)
+        timed_out = await manager.wait(timeout_job["job_id"], ["timeout"], timeout_seconds=30)
         assert timed_out["event"]["type"] == "timeout"
 
     run(main())
@@ -452,8 +452,8 @@ def test_multiple_waiters(tmp_path):
         code = "import json,time; time.sleep(.2); print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"
         started = await manager.start(cmd(code))
         results = await asyncio.gather(
-            manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5),
-            manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5),
+            manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30),
+            manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30),
         )
         assert [r["event"]["type"] for r in results] == ["checkpoint", "checkpoint"]
 

@@ -1892,8 +1892,13 @@ class JobManager:
             )
         disk = shutil.disk_usage(self.home)
         running_jobs = self._running_count()
+        # Optional agent adapters being absent is informational, not a health
+        # problem: the daemon (and its jobs) are fully functional without them.
+        soft_warning_types = {"codex_unavailable", "opencode_unavailable"}
+        hard_warnings = [w for w in warnings if w.get("type") not in soft_warning_types]
         return {
-            "ok": not warnings and quick_check == "ok",
+            "ok": not hard_warnings and quick_check == "ok",
+            "ok_warnings": [w.get("type") for w in warnings],
             "home": str(self.home),
             "db_path": str(self.home / "jobs.sqlite"),
             "logs_dir": str(self.logs),

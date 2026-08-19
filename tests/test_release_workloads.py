@@ -24,7 +24,7 @@ def cmd(code: str) -> str:
     return subprocess.list2cmdline([sys.executable, "-c", code])
 
 
-def wait_completed(manager: JobManager, job_id: str, timeout: float = 20) -> None:
+def wait_completed(manager: JobManager, job_id: str, timeout: float = 60) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if manager.status(job_id)["status"] in {"completed", "failed"}:

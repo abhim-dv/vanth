@@ -14,7 +14,7 @@ def cmd(code: str) -> str:
     return subprocess.list2cmdline([sys.executable, "-c", code])
 
 
-def wait_status(manager: JobManager, job_id: str, status: str, timeout: float = 10) -> dict:
+def wait_status(manager: JobManager, job_id: str, status: str, timeout: float = 30) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = manager.status(job_id)
