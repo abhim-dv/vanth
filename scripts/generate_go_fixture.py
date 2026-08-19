@@ -22,6 +22,11 @@ from vanth.migrations import LATEST_SCHEMA_VERSION
 
 def seed(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        # Idempotent regeneration: drop the previous fixture so re-running
+        # the generator (e.g. from CI on a checked-out fixture) produces a
+        # fresh, byte-stable database instead of failing on existing tables.
+        db_path.unlink()
     db = sqlite3.connect(db_path)
     try:
         db.executescript(
