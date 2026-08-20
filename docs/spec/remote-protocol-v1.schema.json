@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vanth.dev/spec/remote-protocol-v1.schema.json",
+  "title": "Vanth remote protocol v1",
+  "description": "Newline-delimited JSON frames over the SSH forced-command helper transport.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1",
+      "description": "Protocol version. Every frame carries \"1\"."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["hello", "request", "response", "error", "snapshot", "log_range"]
+    },
+    "sent_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "ISO-8601 UTC timestamp with Z suffix."
+    },
+    "protocol": {
+      "type": "string",
+      "const": "vanth.remote"
+    },
+    "agent": { "type": "string" },
+    "remote_id": { "type": "string", "pattern": "^rmt_[0-9a-f]{32}$" },
+    "state_epoch": { "type": "integer", "minimum": 1 },
+    "request_id": { "type": "string", "pattern": "^req_[0-9a-f]{32}$" },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{8,128}$"
+    },
+    "method": {
+      "type": "string",
+      "enum": ["job.start", "job.stop", "job.rerun"]
+    },
+    "payload": {
+      "type": "object",
+      "description": "Method payload; strict shape is enforced per-method by the payload_* $defs via the request conditional."
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256 of the canonical request triple."
+    },
+    "result": { "type": "object" },
+    "code": {
+      "type": "string",
+      "enum": [
+        "PROTOCOL_MALFORMED",
+        "PROTOCOL_OVERSIZED",
+        "PROTOCOL_UNKNOWN_KIND",
+        "PROTOCOL_DUPLICATE_KEY",
+        "PROTOCOL_UNKNOWN_FIELD",
+        "PROTOCOL_REPLAY_MISMATCH",
+        "UNSUPPORTED_FEATURE",
+        "AUTH_FAILED",
+        "INVALID_REQUEST"
+      ]
+    },
+    "message": { "type": "string" },
+    "cursor": {
+      "type": "object",
+      "description": "Feed/pagination cursor (Phase 3).",
+      "additionalProperties": true
+    },
+    "jobs": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "events": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "has_more": { "type": "boolean" },
+    "remote_job_id": { "type": "string" },
+    "stream": { "type": "string", "enum": ["stdout", "stderr"] },
+    "offset": { "type": "integer", "minimum": 0 },
+    "size": { "type": "integer", "minimum": 0 },
+    "content": { "type": "string", "description": "Base64-encoded bytes." },
+    "truncated": { "type": "boolean" }
+  },
+  "required": ["version", "kind"],
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "hello" } }, "required": ["kind"] },
+      "then": {
+        "required": ["protocol"],
+        "properties": {
+          "protocol": { "const": "vanth.remote" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "request" } }, "required": ["kind"] },
+      "then": {
+        "required": ["idempotency_key", "method", "payload", "digest"],
+        "allOf": [
+          {
+            "if": { "properties": { "method": { "const": "job.start" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.start" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "job.stop" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.stop" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "job.rerun" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.rerun" } } }
+          }
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "response" } }, "required": ["kind"] },
+      "then": { "required": ["method"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "error" } }, "required": ["kind"] },
+      "then": { "required": ["code", "message"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "snapshot" } }, "required": ["kind"] },
+      "then": { "required": ["state_epoch", "cursor", "jobs"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "log_range" } }, "required": ["kind"] },
+      "then": { "required": ["remote_job_id", "stream", "offset", "content"] }
+    }
+  ],
+  "$defs": {
+    "wake_target": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["local_command", "codex_thread", "opencode_thread"]
+        },
+        "events": { "type": "array", "items": { "type": "string" } },
+        "notify_on": { "type": "array", "items": { "type": "string" } },
+        "command": { "type": ["string", "array"], "items": { "type": "string" } },
+        "thread_id": { "type": "string" },
+        "threadId": { "type": "string" },
+        "session_id": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "retry_delay_seconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "status"],
+      "properties": {
+        "job_id": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "failed", "timeout", "cancelled", "orphaned"]
+        }
+      }
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{8,128}$"
+    },
+    "payload_job.start": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "cwd": { "type": "string" },
+        "name": { "type": "string" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "notify_on": { "type": "array", "items": { "type": "string" } },
+        "wake_targets": { "type": "array", "items": { "$ref": "#/$defs/wake_target" } },
+        "origin_thread_id": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" },
+        "interactive": { "type": "boolean" },
+        "trigger": { "$ref": "#/$defs/trigger" }
+      }
+    },
+    "payload_job.stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id"],
+      "properties": {
+        "job_id": { "type": "string" },
+        "signal": { "type": "string", "enum": ["terminate", "kill"] },
+        "kill_after_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "payload_job.rerun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id"],
+      "properties": {
+        "job_id": { "type": "string" },
+        "command": { "type": "string" },
+        "cwd": { "type": "string" },
+        "name": { "type": "string" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" },
+        "interactive": { "type": "boolean" }
+      }
+    }
+  }
+}

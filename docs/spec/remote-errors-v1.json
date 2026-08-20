@@ -1,0 +1,42 @@
+{
+  "version": "1",
+  "description": "Stable error registry for the Vanth remote protocol. code -> {status, message}.",
+  "errors": {
+    "PROTOCOL_MALFORMED": {
+      "status": 400,
+      "message": "frame is not valid JSON or violates the protocol shape"
+    },
+    "PROTOCOL_OVERSIZED": {
+      "status": 413,
+      "message": "frame exceeds the maximum allowed size"
+    },
+    "PROTOCOL_UNKNOWN_KIND": {
+      "status": 400,
+      "message": "frame has an unknown kind"
+    },
+    "PROTOCOL_DUPLICATE_KEY": {
+      "status": 400,
+      "message": "object contains a duplicate key"
+    },
+    "PROTOCOL_UNKNOWN_FIELD": {
+      "status": 400,
+      "message": "object contains an unknown field"
+    },
+    "PROTOCOL_REPLAY_MISMATCH": {
+      "status": 409,
+      "message": "idempotency key was reused with a different request"
+    },
+    "UNSUPPORTED_FEATURE": {
+      "status": 501,
+      "message": "requested feature is not supported"
+    },
+    "AUTH_FAILED": {
+      "status": 401,
+      "message": "authentication failed"
+    },
+    "INVALID_REQUEST": {
+      "status": 422,
+      "message": "request payload is invalid"
+    }
+  }
+}

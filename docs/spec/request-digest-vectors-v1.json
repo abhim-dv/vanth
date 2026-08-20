@@ -1,0 +1,77 @@
+{
+  "version": "1",
+  "description": "Golden conformance vectors for request canonicalization and digests. digest_sha256 = lowercase hex SHA-256 of the UTF-8 bytes of `canonical`. Produced by the reference implementation (src/vanth/remote/protocol.py) and cross-checked with an independent Node/V8 implementation.",
+  "canonicalization": {
+    "notes": [
+      "Keys sort by UTF-16 code-unit order.",
+      "Numbers use shortest round-trip ES6 formatting: 1.0 -> 1, 0.5 -> 0.5, 1e3 -> 1000, 1e16 -> 10000000000000000, 1e21 -> 1E+21, 1.5e-8 -> 1.5E-8.",
+      "Exponent marker is a single uppercase E with an explicit sign.",
+      "Strings escape only \" and \\ and controls < 0x20, always as lowercase \\uXXXX.",
+      "No whitespace. Duplicate keys are rejected."
+    ]
+  },
+  "vectors": [
+    {
+      "id": "empty",
+      "method": "job.start",
+      "payload": {},
+      "idempotency_key": "key-0000-0000",
+      "canonical": "{\"idempotency_key\":\"key-0000-0000\",\"method\":\"job.start\",\"payload\":{}}",
+      "digest_sha256": "84517454eb79f726aeb11a214f287a9aa1caccbfd080fe1e9ae3025a761a5d42"
+    },
+    {
+      "id": "nested-sort",
+      "method": "job.start",
+      "payload": {"z": 1, "a": {"y": 2, "b": 3}},
+      "idempotency_key": "key-0000-0001",
+      "canonical": "{\"idempotency_key\":\"key-0000-0001\",\"method\":\"job.start\",\"payload\":{\"a\":{\"b\":3,\"y\":2},\"z\":1}}",
+      "digest_sha256": "0ac41c0266cef40dbcb6eefaccf8aa8bf8ebab52efb076beee0e949490a60c75"
+    },
+    {
+      "id": "float-integers",
+      "method": "job.start",
+      "payload": {"x": 1.0, "y": 0.5},
+      "idempotency_key": "key-0000-0002",
+      "canonical": "{\"idempotency_key\":\"key-0000-0002\",\"method\":\"job.start\",\"payload\":{\"x\":1,\"y\":0.5}}",
+      "digest_sha256": "259ca102a08e17c826868318e4fc71f79f08e21428ff343c6984d803d39385c8"
+    },
+    {
+      "id": "exponent",
+      "method": "job.stop",
+      "payload": {"job_id": "job_demo", "signal": "kill"},
+      "idempotency_key": "key-0000-0003",
+      "canonical": "{\"idempotency_key\":\"key-0000-0003\",\"method\":\"job.stop\",\"payload\":{\"job_id\":\"job_demo\",\"signal\":\"kill\"}}",
+      "digest_sha256": "b2728e5497f1ed10450cd98489c06ef9890eb1b9b5dce05491c58901f034dba9"
+    },
+    {
+      "id": "string-escapes",
+      "method": "job.rerun",
+      "payload": {"job_id": "job_demo", "notes": "a\n\"b\\c\u0001d"},
+      "idempotency_key": "key-0000-0004",
+      "canonical": "{\"idempotency_key\":\"key-0000-0004\",\"method\":\"job.rerun\",\"payload\":{\"job_id\":\"job_demo\",\"notes\":\"a\\u000a\\\"b\\\\c\\u0001d\"}}",
+      "digest_sha256": "fd029d75ee98d22884504bf7379b10b0976a029b5192184072e05f85fe7535f6"
+    },
+    {
+      "id": "full-start",
+      "method": "job.start",
+      "payload": {
+        "command": "echo hi",
+        "cwd": "/tmp",
+        "env": {"A": "1"},
+        "timeout_seconds": 30,
+        "tags": ["t"],
+        "notes": "demo"
+      },
+      "idempotency_key": "key-0000-0005",
+      "canonical": "{\"idempotency_key\":\"key-0000-0005\",\"method\":\"job.start\",\"payload\":{\"command\":\"echo hi\",\"cwd\":\"/tmp\",\"env\":{\"A\":\"1\"},\"notes\":\"demo\",\"tags\":[\"t\"],\"timeout_seconds\":30}}",
+      "digest_sha256": "0bf1a392f6d9542766b5cedc6f5430291f64416152d204fa5a59c88b5d17c83c"
+    }
+  ],
+  "rejected_cases": [
+    {
+      "id": "duplicate-key",
+      "description": "canonical_json rejects duplicate keys with VanthRemoteProtocolError(PROTOCOL_DUPLICATE_KEY).",
+      "input": {"method": "job.start", "payload": {"a": 1, "a": 2}, "idempotency_key": "key-0000-0000"}
+    }
+  ]
+}
