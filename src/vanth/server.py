@@ -1910,6 +1910,10 @@ class JobManager:
         Returns base64-encoded content so binary and JSON artifacts round-trip
         cleanly through the MCP JSON transport. ``truncated`` is set when the
         artifact exceeds ``max_bytes``.
+
+        HTTP(S) retrieval is disabled by default and must be opted into via
+        ``VANTH_ALLOW_HTTP_ARTIFACT_READ=1``. This path is legacy and is never
+        used by managed artifacts (see ``artifacts/``).
         """
         self._ensure_open()
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 256 or max_bytes > 1024 * 1024:
@@ -1923,6 +1927,11 @@ class JobManager:
         uri = row["uri"]
         parsed = urllib.parse.urlparse(uri)
         if parsed.scheme in {"http", "https"}:
+            if os.environ.get("VANTH_ALLOW_HTTP_ARTIFACT_READ") != "1":
+                raise ValueError(
+                    "artifact content unavailable: http(s) retrieval is disabled; "
+                    "set VANTH_ALLOW_HTTP_ARTIFACT_READ=1 to enable legacy retrieval"
+                )
             try:
                 with urllib.request.urlopen(uri, timeout=5) as response:
                     content = response.read(max_bytes + 1)
@@ -2188,6 +2197,26 @@ class JobManager:
         jobs.sort(key=lambda item: (item["priority"], item["updated_at"]), reverse=True)
         return {"jobs": jobs}
 
+    def reap_orphans(self) -> dict[str, Any]:
+        """Terminate MCP stdio server processes whose launching client is gone."""
+        orphans = _orphaned_mcp_servers()
+        reaped = []
+        failed = []
+        import signal as _signal
+
+        for entry in orphans:
+            pid = entry["pid"]
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                else:
+                    os.kill(pid, _signal.SIGKILL)
+                reaped.append(pid)
+            except Exception as exc:
+                failed.append({"pid": pid, "error": str(exc)})
+        return {"reaped": reaped, "failed": failed, "orphan_count": len(orphans)}
+
     def doctor(self) -> dict[str, Any]:
         self._ensure_open()
         tables = {
@@ -2211,6 +2240,17 @@ class JobManager:
         opencode_available = bool(shutil.which(opencode_bin) or Path(opencode_bin).exists())
         if not opencode_available:
             warnings.append({"type": "opencode_unavailable", "command": opencode_bin})
+        orphaned_mcp = _orphaned_mcp_servers()
+        if orphaned_mcp:
+            warnings.append(
+                {
+                    "type": "orphaned_mcp_servers",
+                    "count": len(orphaned_mcp),
+                    "pids": [entry["pid"] for entry in orphaned_mcp],
+                    "detail": "MCP stdio servers whose launching client is gone; "
+                    "reap with `vanth doctor --reap-orphans`",
+                }
+            )
         quick_check = self.db.execute("PRAGMA quick_check").fetchone()[0]
         stale_leases = self.db.execute(
             "SELECT COUNT(*) FROM deliveries WHERE status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
@@ -2265,6 +2305,7 @@ class JobManager:
             "disk_free_bytes": disk.free,
             "token_path": str(self.home / "token"),
             "warnings": warnings,
+            "orphaned_mcp_servers": orphaned_mcp,
         }
 
     def _cleanup_rows(self, older_than_seconds: int) -> list[sqlite3.Row]:
@@ -2764,6 +2805,83 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
     return get_client().get("/cleanup/preview", {"older_than_seconds": older_than_seconds})
 
 
+def _orphaned_mcp_servers() -> list[dict[str, Any]]:
+    """Find MCP stdio server processes whose launching client is gone.
+
+    Scans for ``vanth``/python processes running the Vanth MCP entrypoint and
+    checks whether their parent process is still alive. A ``vanth`` process
+    launched by a dead client is an orphan that the new watchdog is designed to
+    prevent, but which older versions (and force-killed sessions) may still
+    have left behind. Returns a list of ``{pid, started, parent_pid}`` entries.
+    """
+    from .process_watch import process_alive
+
+    import subprocess as _sp
+
+    candidates = []
+    try:
+        if sys.platform == "win32":
+            result = _sp.run(
+                ["wmic", "process", "get", "name,processid,parentprocessid,creationdate", "/format:csv"],
+                stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True, timeout=10,
+            )
+            for line in result.stdout.splitlines()[1:]:
+                if not line.strip():
+                    continue
+                parts = line.split(",")
+                if len(parts) < 5:
+                    continue
+                _, name, pid, ppid, created = parts[:5]
+                name = (name or "").strip()
+                pid_s = (pid or "").strip()
+                if not name or not pid_s.isdigit():
+                    continue
+                if "vanth" not in name.lower() and "python" not in name.lower():
+                    continue
+                candidates.append(
+                    {
+                        "pid": int(pid_s),
+                        "name": name,
+                        "started": created.strip(),
+                        "ppid": int(ppid.strip()) if (ppid or "").strip().isdigit() else None,
+                    }
+                )
+        else:
+            result = _sp.run(["ps", "-eo", "pid=,ppid=,etime=,comm="],
+                             stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True, timeout=10)
+            for line in result.stdout.splitlines():
+                parts = line.split(None, 3)
+                if len(parts) < 4:
+                    continue
+                pid, ppid, etime, comm = parts
+                if "vanth" not in comm.lower() and "python" not in comm.lower():
+                    continue
+                candidates.append(
+                    {
+                        "pid": int(pid),
+                        "name": comm,
+                        "started": etime,
+                        "ppid": int(ppid) if ppid.isdigit() else None,
+                    }
+                )
+    except Exception:
+        return []
+    orphans = []
+    for entry in candidates:
+        if entry["ppid"] in (0, 1, None):
+            continue
+        if process_alive(entry["ppid"]):
+            continue
+        orphans.append(
+            {
+                "pid": entry["pid"],
+                "started": entry["started"],
+                "parent_pid": entry["ppid"],
+            }
+        )
+    return orphans
+
+
 def _hint_setup() -> None:
     """Print a stderr hint on MCP startup when a known client still lacks the
     Vanth MCP entry. stdout is the JSON-RPC protocol, so hints go to stderr
@@ -2802,4 +2920,37 @@ def main(argv: list[str] | None = None) -> None:
     }:
         raise SystemExit(cli_main(args))
     _hint_setup()
-    mcp.run()
+    _run_mcp_server()
+
+
+def _run_mcp_server() -> None:
+    """Run the MCP stdio server under a parent-liveness + idle watchdog.
+
+    Agent clients (codex/opencode) launch ``vanth`` as a stdio MCP server. If a
+    session dies without closing stdin, or the client accumulates cached
+    workers, those processes would otherwise linger forever holding
+    ``vanth.exe``. The watchdog (see ``vanth.process_watch``) self-terminates
+    the process when the parent dies or the process is idle, while never
+    killing a blocking tool call (``job_wait``/``job_tail --follow``) mid-flight.
+    """
+    from .process_watch import start_watchdog
+
+    thread, tracker = start_watchdog()
+
+    # Bump the in-flight counter around every tool call so a long-running
+    # blocking call (job_wait with a filter) is never idle-reaped mid-call.
+    original_call_tool = mcp.call_tool
+
+    async def guarded_call_tool(name: str, arguments: dict[str, object]) -> object:
+        with tracker:
+            return await original_call_tool(name, arguments)
+
+    mcp.call_tool = guarded_call_tool  # type: ignore[method-assign]
+
+    try:
+        mcp.run()
+    finally:
+        if thread is not None and thread.is_alive():
+            # The stdio loop ended (client closed stdin or sent exit): no need
+            # for the watchdog anymore; it would only fire a redundant exit.
+            pass

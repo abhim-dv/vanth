@@ -175,10 +175,20 @@ def _print_setup_status() -> None:
         pass
 
 
-def cmd_doctor(home: Path, *, json_out: bool = False) -> int:
+def cmd_doctor(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     client = VanthClient(home=home)
+    reap = "--reap-orphans" in argv
     try:
         client.ensure()
+        if reap:
+            result = client.post("/reap-orphans", {})
+            if json_out:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                print(f"vanth doctor: reaped {len(result.get('reaped', []))} orphaned MCP server(s)")
+                for entry in result.get("failed", []):
+                    print(f"  failed:      pid {entry['pid']}: {entry['error']}")
+            return 0
         report = client.get("/doctor")
     except Exception as exc:
         print(f"vanth doctor: failed to reach daemon: {exc}")
@@ -196,6 +206,11 @@ def cmd_doctor(home: Path, *, json_out: bool = False) -> int:
         print(f"  opencode:      {'available' if report.get('opencode', {}).get('available') else 'MISSING'}")
         print(f"  quick_check:   {report.get('quick_check')}")
         print(f"  disk_free:     {_fmt_bytes(report.get('disk_free_bytes', 0))}")
+        orphaned = report.get("orphaned_mcp_servers") or []
+        if orphaned:
+            print(f"  orphaned_mcp: {len(orphaned)} (reap with `vanth doctor --reap-orphans`)")
+            for entry in orphaned[:5]:
+                print(f"    pid {entry['pid']} parent {entry['parent_pid']} started {entry['started']}")
         for warning in report.get("warnings", []):
             print(f"  WARNING:       {warning}")
         _print_setup_status()
@@ -819,7 +834,8 @@ def _usage() -> str:
         "\n"
         "commands:\n"
         "  status         show daemon health, running jobs, and MCP client state\n"
-        "  doctor         full health report (schema, deliveries, tools)\n"
+        "  doctor         full health report (schema, deliveries, tools);\n"
+        "                 --reap-orphans terminates orphaned MCP servers\n"
         "  list, ps       list jobs (running by default; --all for terminal)\n"
         "  logs, tail     show a job's stdout/stderr output (--grep filters lines)\n"
         "  diff           diff the run specs of two jobs\n"
@@ -854,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "status":
         return cmd_status(home, json_out=json_out)
     if command == "doctor":
-        return cmd_doctor(home, json_out=json_out)
+        return cmd_doctor(argv[1:], home, json_out=json_out)
     if command == "restart":
         return cmd_restart(home, json_out=json_out)
     if command == "setup":

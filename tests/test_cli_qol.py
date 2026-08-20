@@ -251,6 +251,22 @@ def test_artifacts_json(daemon):
     assert any(artifact["name"] == "b" for artifact in payload["artifacts"])
 
 
+def test_doctor_reap_orphans(daemon):
+    tmp_path, client, port = daemon
+    result = run_cli(tmp_path / "state", "doctor", "--reap-orphans", port=port)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "orphaned" in result.stdout.lower() or "reaped" in result.stdout.lower()
+
+
+def test_doctor_reports_orphans_field(daemon):
+    tmp_path, client, port = daemon
+    result = run_cli(tmp_path / "state", "doctor", "--json", port=port)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert "orphaned_mcp_servers" in payload
+    assert isinstance(payload["orphaned_mcp_servers"], list)
+
+
 def test_artifacts_unknown_job(daemon):
     tmp_path, _, port = daemon
     result = run_cli(tmp_path / "state", "artifacts", "job_nope", port=port)

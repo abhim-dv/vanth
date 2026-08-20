@@ -343,6 +343,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().retry_delivery(parsed.path.split("/")[2]))
             elif parsed.path == "/cleanup":
                 ok(self, get_manager().cleanup(**payload))
+            elif parsed.path == "/reap-orphans":
+                ok(self, get_manager().reap_orphans())
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
                 ok(self, get_manager().metric_ingest(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wake"):

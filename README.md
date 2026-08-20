@@ -107,6 +107,12 @@ uv run vanth-monitor
 | Command | Purpose |
 |---|---|
 | `uv run vanth` | MCP stdio server (bridge to the daemon); also the human CLI below |
+
+The MCP stdio server self-terminates when its launching client dies or closes
+stdin, and reaps itself after `VANTH_WATCH_IDLE` seconds of idle (default 1800;
+`0` disables), so stale sessions never leave orphaned `vanth` processes. Blocking
+tool calls are never reaped mid-flight. `vanth doctor --reap-orphans` cleans up
+any orphans from older versions.
 | `uv run vanthd` | The background HTTP daemon |
 | `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
 | `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin, dispatches it to Codex |

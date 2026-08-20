@@ -1,4 +1,4 @@
-"""Generate a deterministic schema-v5 database fixture for Go conformance.
+"""Generate a deterministic schema-v9 database fixture for Go conformance.
 
 The fixture is checked in at testdata/state/jobs.sqlite so the Go test suite
 can run without Python present. Values are fixed (no timestamps or absolute
@@ -37,7 +37,8 @@ def seed(db_path: Path) -> None:
               runner_heartbeat_at TEXT, stop_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
               started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
               notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
-              env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL
+              env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
+              trigger_json TEXT
             );
             CREATE TABLE events (
               event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -82,7 +83,7 @@ def seed(db_path: Path) -> None:
               created_at TEXT NOT NULL
             );
             CREATE INDEX idx_artifacts_job ON artifacts(job_id, created_at);
-            PRAGMA user_version=8;
+            PRAGMA user_version=9;
             """
         )
         stamp = "2026-01-01T00:00:00Z"

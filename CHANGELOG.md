@@ -2,6 +2,29 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased / next (1.6.x)
+
+### Robustness
+
+- **NEW - MCP process watchdog**: the `vanth` MCP stdio server now self-terminates
+  when its launching client (codex/opencode) dies or closes stdin, and reaps
+  itself when idle for `VANTH_WATCH_IDLE` seconds (default 1800, `0` disables).
+  Previously a force-killed session or a client that accumulates cached workers
+  left `vanth.exe` processes running forever (observed: a new process every few
+  minutes, none ever reaped). A blocking tool call (`job_wait`, `job_tail
+  --follow`) is never killed mid-flight. Tuning: `VANTH_WATCH_INTERVAL`,
+  `VANTH_WATCH_GRACE`, `VANTH_WATCH_PARENT_PID`.
+- **`vanth doctor` reports orphaned MCP servers**: `orphaned_mcp_servers` lists
+  `vanth` processes whose launching client is gone, and
+  `vanth doctor --reap-orphans` terminates them. Doctor now warns when orphans
+  are found.
+- **Schema constants reconciled**: Go `internal/state/state.go` and the Go
+  conformance fixture generator now report schema v9 (matching
+  `migrations.py`), including the `trigger_json` column.
+- **Legacy `artifact_read` HTTP retrieval is gated**: http(s) artifact reads are
+  disabled by default; opt in with `VANTH_ALLOW_HTTP_ARTIFACT_READ=1`. This path
+  is legacy and is never used by managed artifacts.
+
 ## 1.5.0 - 2026-08-20
 
 ### Agent + user QoL

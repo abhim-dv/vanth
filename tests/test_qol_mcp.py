@@ -163,6 +163,43 @@ def test_artifact_read_truncation(tmp_path):
         manager.close()
 
 
+def test_artifact_read_http_gated_by_env(tmp_path, monkeypatch):
+    import http.server
+    import threading
+
+    body = b"remote payload"
+    server = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        uri = f"http://127.0.0.1:{server.server_port}/payload"
+        manager = JobManager(tmp_path / "state")
+        try:
+            job_id = start_job(manager, "import time; time.sleep(0.3)")
+            wait_event(manager, job_id, "started")
+            added = manager.artifact_add(job_id, name="remote", uri=uri, kind="checkpoint")
+            with pytest.raises(ValueError, match="http.*disabled"):
+                manager.artifact_read(added["artifact_id"])
+            monkeypatch.setenv("VANTH_ALLOW_HTTP_ARTIFACT_READ", "1")
+            read = manager.artifact_read(added["artifact_id"])
+            assert base64.b64decode(read["content_base64"]) == body
+            wait_event(manager, job_id, "completed")
+        finally:
+            manager.close()
+    finally:
+        server.shutdown()
+        thread.join()
+
+
 def test_daemon_wake_enqueues_delivery_on_completion(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
