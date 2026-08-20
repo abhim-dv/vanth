@@ -25,8 +25,26 @@ manager: JobManager | None = None
 manager_lock = threading.Lock()
 shutdown_event = threading.Event()
 _httpd: "TrackingHTTPServer | None" = None
+_remote_store = None
 DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+def get_remote_store():
+    """Open (once) the controller-side RemoteStore on the shared home dir."""
+    global _remote_store
+    with manager_lock:
+        if _remote_store is None:
+            import sqlite3
+
+            db = sqlite3.connect(canonical_home() / "remote.sqlite")
+            db.row_factory = sqlite3.Row
+            from .migrations import configure_connection
+            from .remote.store import RemoteStore
+
+            configure_connection(db)
+            _remote_store = RemoteStore(db)
+    return _remote_store
 
 
 class RequestTooLarge(ValueError):
@@ -229,6 +247,14 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, report, 200 if report["ok"] else 503)
             elif parsed.path == "/doctor":
                 ok(self, get_manager().doctor())
+            elif parsed.path == "/remotes":
+                from .remote.pairing import list_remotes
+
+                ok(self, {"remotes": list_remotes(store=get_remote_store())})
+            elif parsed.path == "/remotes/doctor":
+                from .remote.pairing import doctor_remote
+
+                ok(self, doctor_remote(remote_id=query.get("remote_id", [None])[0], store=get_remote_store()))
             elif parsed.path == "/view":
                 ok(self, get_manager().agent_view(query.get("thread_id", [None])[0], int(query.get("limit", ["50"])[0])))
             elif parsed.path == "/jobs":
@@ -345,6 +371,19 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().cleanup(**payload))
             elif parsed.path == "/reap-orphans":
                 ok(self, get_manager().reap_orphans())
+            elif parsed.path == "/remotes/pair":
+                from .remote.pairing import pair_remote
+
+                ok(self, pair_remote(
+                    target=payload.get("target", ""),
+                    name=payload.get("name"),
+                    allow_root=bool(payload.get("allow_root", False)),
+                    store=get_remote_store(),
+                ))
+            elif parsed.path == "/remotes/remove":
+                from .remote.pairing import remove_remote
+
+                ok(self, remove_remote(remote_id=payload.get("remote_id"), store=get_remote_store()))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
                 ok(self, get_manager().metric_ingest(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wake"):

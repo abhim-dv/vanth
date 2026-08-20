@@ -267,6 +267,27 @@ def test_doctor_reports_orphans_field(daemon):
     assert isinstance(payload["orphaned_mcp_servers"], list)
 
 
+def test_remote_list_empty(daemon):
+    tmp_path, client, port = daemon
+    result = run_cli(tmp_path / "state", "remote", "list", port=port)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_remote_doctor_reports_binaries(daemon):
+    tmp_path, client, port = daemon
+    result = run_cli(tmp_path / "state", "remote", "doctor", "--json", port=port)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert "binaries" in payload
+    assert payload["binaries"]["ssh"]
+
+
+def test_remote_unknown_subcommand(daemon):
+    tmp_path, _, port = daemon
+    result = run_cli(tmp_path / "state", "remote", "frobnicate", port=port)
+    assert result.returncode == 2
+
+
 def test_artifacts_unknown_job(daemon):
     tmp_path, _, port = daemon
     result = run_cli(tmp_path / "state", "artifacts", "job_nope", port=port)

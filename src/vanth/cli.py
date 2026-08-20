@@ -650,6 +650,113 @@ def cmd_diff(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     return 0
 
 
+def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    """`vanth remote <pair|list|doctor|remove>` — remote execution pairing."""
+    if not argv or argv[0] in {"--help", "-h", "help"}:
+        print("usage: vanth remote <pair|list|doctor|remove> [options]\n"
+              "  pair <target>   pair a remote host (user@host[:port]) [--name N] [--allow-root]\n"
+              "  list            list paired remotes\n"
+              "  doctor          report SSH binaries and remote state [--remote <id>]\n"
+              "  remove <id>     remove a remote [--yes]", file=sys.stderr)
+        return 2 if not argv else 0
+    sub = argv[0]
+    client = VanthClient(home=home)
+    if sub == "pair":
+        args = argv[1:]
+        allow_root = "--allow-root" in args
+        name = None
+        if "--name" in args:
+            i = args.index("--name")
+            if i + 1 < len(args):
+                name = args[i + 1]
+        targets = [a for a in args if not a.startswith("--")]
+        if not targets:
+            print("vanth remote pair: missing target (user@host[:port])", file=sys.stderr)
+            return 2
+        target = targets[0]
+        try:
+            client.ensure()
+            result = client.post("/remotes/pair", {"target": target, "name": name, "allow_root": allow_root})
+        except Exception as exc:
+            print(f"vanth remote pair: failed to reach daemon: {exc}", file=sys.stderr)
+            return 1
+        if result.get("result") == "error" or "error" in result:
+            print(f"vanth remote pair: {result.get('error', 'pairing failed')}", file=sys.stderr)
+            return 1
+        if json_out:
+            print(json.dumps(result, indent=2, default=str))
+            return 0
+        print(f"vanth remote pair: paired {target} ({result.get('remote_id')})")
+        return 0
+    if sub == "list":
+        try:
+            client.ensure()
+            result = client.get("/remotes")
+        except Exception as exc:
+            print(f"vanth remote list: failed to reach daemon: {exc}", file=sys.stderr)
+            return 1
+        remotes = result.get("remotes", result if isinstance(result, list) else [])
+        if json_out:
+            print(json.dumps(result, indent=2, default=str))
+            return 0
+        if not remotes:
+            print("vanth remote list: no remotes paired")
+            return 0
+        for row in remotes:
+            print(f"  {row.get('remote_id')}  {row.get('target')}  state={row.get('state')}")
+        return 0
+    if sub == "doctor":
+        remote_id = None
+        if "--remote" in argv:
+            i = argv.index("--remote")
+            if i + 1 < len(argv):
+                remote_id = argv[i + 1]
+        try:
+            client.ensure()
+            result = client.get("/remotes/doctor", {"remote_id": remote_id} if remote_id else None)
+        except Exception as exc:
+            print(f"vanth remote doctor: failed to reach daemon: {exc}", file=sys.stderr)
+            return 1
+        if json_out:
+            print(json.dumps(result, indent=2, default=str))
+            return 0
+        bins = result.get("binaries") or {}
+        missing = [name for name, path in bins.items() if not path]
+        print("vanth remote doctor:")
+        print(f"  ssh:        {bins.get('ssh') or 'MISSING'}")
+        print(f"  ssh-keygen: {bins.get('ssh-keygen') or 'MISSING'}")
+        print(f"  scp:        {bins.get('scp') or 'MISSING'}")
+        if missing:
+            print("  WARNING: OpenSSH binaries missing — remote execution unavailable")
+        for row in result.get("remotes") or []:
+            print(f"  remote:     {row.get('remote_id')} {row.get('target')} state={row.get('state')}")
+        return 0 if not missing else 1
+    if sub == "remove":
+        args = argv[1:]
+        targets = [a for a in args if not a.startswith("--")]
+        if not targets:
+            print("vanth remote remove: missing remote_id", file=sys.stderr)
+            return 2
+        remote_id = targets[0]
+        assume_yes = "--yes" in args
+        if not assume_yes:
+            print(f"vanth remote remove: this removes local keys/config for {remote_id}; pass --yes to confirm", file=sys.stderr)
+            return 1
+        try:
+            client.ensure()
+            result = client.post("/remotes/remove", {"remote_id": remote_id})
+        except Exception as exc:
+            print(f"vanth remote remove: failed to reach daemon: {exc}", file=sys.stderr)
+            return 1
+        if result.get("result") == "error":
+            print(f"vanth remote remove: {result.get('error')}", file=sys.stderr)
+            return 1
+        print(f"vanth remote remove: removed {remote_id}")
+        return 0
+    print(f"vanth remote: unknown subcommand {sub!r}", file=sys.stderr)
+    return 2
+
+
 def cmd_stop(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     if not argv:
         print("vanth stop: missing job id", file=sys.stderr)
@@ -843,6 +950,7 @@ def _usage() -> str:
         "  artifacts      list a job's artifacts\n"
         "  prune          manually clean up terminal jobs (default dry-run)\n"
         "  restart        gracefully restart the daemon (jobs survive)\n"
+        "  remote         pair/list/doctor/remove remote execution hosts\n"
         "  setup          register the MCP server in your clients' configs (one-shot)\n"
         "  autostart      enable/disable/status (daemon survives reboots)\n"
         "  version        print the installed package version\n"
@@ -889,6 +997,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_artifacts(argv[1:], home, json_out=json_out)
     if command == "prune":
         return cmd_prune(argv[1:], home, json_out=json_out)
+    if command == "remote":
+        return cmd_remote(argv[1:], home, json_out=json_out)
     print(f"vanth: unknown command {command!r}", file=sys.stderr)
     return 2
 

@@ -55,6 +55,7 @@ vanth = "vanth.server:main"
 vanthd = "vanth.daemon:main"
 vanth-codex-notify = "vanth.codex_bridge:main"
 vanth-monitor = "vanth.monitor:main"
+vanth-remote-helper = "vanth.remote.helper:main"
 
 [build-system]
 requires = ["hatchling"]

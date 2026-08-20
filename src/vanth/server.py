@@ -2916,7 +2916,7 @@ def main(argv: list[str] | None = None) -> None:
     if args and args[0] in {
         "status", "doctor", "restart", "setup", "--help", "-h", "help",
         "list", "ps", "logs", "tail", "stop", "artifacts", "prune",
-        "autostart", "--version", "version",
+        "autostart", "--version", "version", "remote",
     }:
         raise SystemExit(cli_main(args))
     _hint_setup()
