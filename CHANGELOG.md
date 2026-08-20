@@ -2,7 +2,7 @@
 
 All notable changes to Vanth are documented here.
 
-## Unreleased / next (1.4.x)
+## 1.4.1 - 2026-08-20
 
 ### Agent + user QoL
 
