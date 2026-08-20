@@ -112,8 +112,10 @@ def test_dashboard_returns_series(manager):
     assert len(dash["series"][job_id]["loss"]) == 4
 
 
-def test_schema_version_is_8(manager):
-    assert manager.doctor()["schema_version"] == 8
+def test_schema_version_is_current(manager):
+    from vanth.migrations import LATEST_SCHEMA_VERSION
+
+    assert manager.doctor()["schema_version"] == LATEST_SCHEMA_VERSION
 
 
 def test_progress_derived_series(manager):

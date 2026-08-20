@@ -412,10 +412,11 @@ events.
 | `job_list` | Recent jobs, filterable by `status` / `thread_id` / `name` / `tags` |
 | `job_view` | Agent-facing summaries sorted by attention priority |
 | `job_events` | Structured events for a job (forward via `since_event_id`, or latest-first via `reverse`) |
-| `job_tail` | Bounded stdout/stderr log tail with byte offsets (`follow`/`timeout_seconds` optional) |
+| `job_tail` | Bounded stdout/stderr log tail with byte offsets (`follow`/`timeout_seconds`/`grep` optional) |
 | `job_metrics_query` | Read stored scalar metric series (loss, acc, progress.percent, ...) |
 | `job_metric_compare` | Compare one metric across jobs (latest/mean/min/max/sum/count) |
 | `job_run_summary` | One-call "did it work?" — status, runtime, progress, metrics, artifacts |
+| `job_diff` | Diff the run specs of two jobs (command/env/cwd/tags/wake targets) |
 | `job_artifact_add` | Attach an artifact (checkpoint, CSV, output) to a job |
 | `job_artifacts` | List artifacts attached to a job |
 | `job_dashboard` | Downsampled chart-data view for any renderer |
@@ -452,11 +453,15 @@ job_start(
   notify_on=["progress","checkpoint","failed","completed"],
   origin_thread_id="019f...",        # the agent thread that launched it
   tags=["training","gpu"],           # optional
-  wake_targets=[...]                 # optional, see below
+  wake_targets=[...],                # optional, see below
+  trigger={"job_id": "job_A", "status": "completed"}  # optional DAG: start after job_A completes
 )
 ```
 
-Returns `job_id`, `status`, `worker_pid`, and the log/event paths.
+Returns `job_id`, `status`, `worker_pid`, and the log/event paths. With
+`trigger` set, the job is created `queued` and starts automatically when the
+parent job reaches that status (or is `cancelled` if the parent ends
+differently).
 
 ### job_send — feed stdin to an interactive job
 

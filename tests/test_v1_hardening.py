@@ -36,8 +36,10 @@ def test_future_schema_is_rejected_and_existing_schema_migrates_with_backup(tmp_
     manager.close()
 
     migrated = JobManager(home)
+    from vanth.migrations import LATEST_SCHEMA_VERSION
+
     assert migrated.status("job_old")["status"] == "completed"
-    assert migrated.doctor()["schema_version"] == 8
+    assert migrated.doctor()["schema_version"] == LATEST_SCHEMA_VERSION
     assert len(list((home / "backups").glob("*.sqlite"))) == 1
     migrated.close()
 

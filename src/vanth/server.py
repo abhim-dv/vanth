@@ -336,9 +336,77 @@ class JobManager:
             try:
                 self._dispatch_due_deliveries()
                 self._reconcile_running_jobs()
+                self._fire_triggered_jobs()
                 self._maybe_auto_cleanup()
             except Exception:
                 self.logger.exception("maintenance iteration failed")
+
+    def _fire_triggered_jobs(self) -> None:
+        """Launch queued jobs whose trigger parent has reached the status.
+
+        Lightweight DAG: a job started with ``trigger={"job_id": A, "status":
+        S}`` stays ``queued`` until A reaches S, then its runner is launched.
+        """
+        try:
+            with self.db_lock:
+                rows = self.db.execute(
+                    "SELECT job_id, trigger_json FROM jobs WHERE status='queued'"
+                ).fetchall()
+                parents: dict[str, str] = {}
+                triggers: dict[str, tuple[str, str]] = {}
+                for row in rows:
+                    trigger = json.loads(row["trigger_json"] or "null")
+                    if isinstance(trigger, dict) and trigger.get("job_id") and trigger.get("status"):
+                        triggers[row["job_id"]] = (trigger["job_id"], trigger["status"])
+                        parents.setdefault(trigger["job_id"], None)
+                if not triggers:
+                    return
+                for parent in parents:
+                    status_row = self.db.execute(
+                        "SELECT status FROM jobs WHERE job_id=?", (parent,)
+                    ).fetchone()
+                    if status_row:
+                        parents[parent] = status_row["status"]
+            to_launch = [
+                job_id for job_id, (parent, status) in triggers.items()
+                if parents.get(parent) == status
+            ]
+            to_cancel = [
+                (job_id, parent, status)
+                for job_id, (parent, status) in triggers.items()
+                if parents.get(parent) in TERMINAL_STATUSES and parents.get(parent) != status
+            ]
+            for job_id in to_launch:
+                row = self._row(
+                    "SELECT stdout_path, stderr_path, events_path FROM jobs WHERE job_id=?",
+                    (job_id,),
+                )
+                if not row:
+                    continue
+                spec_path = self.specs_dir / f"{job_id}.json"
+                self._launch(
+                    job_id,
+                    Path(row["stdout_path"]),
+                    Path(row["stderr_path"]),
+                    Path(row["events_path"]),
+                    spec_path,
+                )
+            for job_id, parent, status in to_cancel:
+                with self.db_lock:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
+                        (now_iso(), now_iso(), job_id),
+                    ).rowcount
+                    self.db.commit()
+                if changed:
+                    self._emit(
+                        job_id,
+                        "cancelled",
+                        message=f"Trigger parent {parent} reached a different terminal status than {status}",
+                        data={"trigger": {"job_id": parent, "status": status}, "parent_status": parents.get(parent)},
+                    )
+        except Exception:
+            self.logger.exception("triggered-job fire failed")
 
     def _running_count(self) -> int:
         with self.db_lock:
@@ -843,6 +911,7 @@ class JobManager:
         tags: list[str] | None = None,
         notes: str | None = None,
         interactive: bool = False,
+        trigger: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         validate_wake_targets(wake_targets)
@@ -854,7 +923,9 @@ class JobManager:
             raise ValueError("command must be a non-empty string")
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise ValueError("timeout_seconds must be an integer >= 1")
-        if self.max_running_jobs and self._running_count() >= self.max_running_jobs:
+        trigger = self._validate_trigger(trigger)
+        queued = trigger is not None
+        if self.max_running_jobs and not queued and self._running_count() >= self.max_running_jobs:
             raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
@@ -894,18 +965,19 @@ class JobManager:
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
                   timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
-                  stdout_path, stderr_path, events_path)
-                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stdout_path, stderr_path, events_path, trigger_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     name,
                     command,
                     cwd,
+                    "queued" if queued else "running",
                     created_at,
                     created_at,
-                    created_at,
-                    created_at,
+                    None if queued else created_at,
+                    None if queued else created_at,
                     timeout_seconds,
                     json.dumps(notify_on or []),
                     origin_thread_id,
@@ -917,11 +989,47 @@ class JobManager:
                     str(stdout_path),
                     str(stderr_path),
                     str(events_path),
+                    json.dumps(trigger, separators=(",", ":")) if trigger else None,
                 ),
             )
             self.db.commit()
             self._insert_wake_targets(job_id, wake_targets or [], created_at)
             self.db.commit()
+        if queued:
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "trigger": trigger,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "events_path": str(events_path),
+                "message": f"Job queued; will start when {trigger['job_id']} reaches {trigger['status']}",
+            }
+        return self._launch(job_id, stdout_path, stderr_path, events_path, spec_path)
+
+    def _validate_trigger(self, trigger: dict[str, str] | None) -> dict[str, str] | None:
+        if trigger is None:
+            return None
+        if not isinstance(trigger, dict):
+            raise ValueError("trigger must be an object with job_id and status")
+        job_id = trigger.get("job_id")
+        status = trigger.get("status")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("trigger.job_id must be a non-empty string")
+        if status not in TERMINAL_STATUSES:
+            raise ValueError(f"trigger.status must be one of {sorted(TERMINAL_STATUSES)}")
+        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+            raise ValueError(f"Unknown trigger job_id: {job_id}")
+        return {"job_id": job_id, "status": status}
+
+    def _launch(
+        self,
+        job_id: str,
+        stdout_path: Path,
+        stderr_path: Path,
+        events_path: Path,
+        spec_path: Path,
+    ) -> dict[str, Any]:
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
@@ -965,7 +1073,10 @@ class JobManager:
         self.processes[job_id] = proc
         threading.Thread(target=self._watch_runner, args=(job_id, proc), daemon=True).start()
         with self.db_lock:
-            self.db.execute("UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=?", (proc.pid, now_iso(), job_id))
+            self.db.execute(
+                "UPDATE jobs SET status='running', started_at=?, runner_heartbeat_at=?, worker_pid=?, updated_at=? WHERE job_id=?",
+                (now_iso(), now_iso(), proc.pid, now_iso(), job_id),
+            )
             self.db.commit()
         return {
             "job_id": job_id,
@@ -1244,6 +1355,7 @@ class JobManager:
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
         return_progress: bool = False,
+        metric_ge: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(
             None,
@@ -1253,6 +1365,7 @@ class JobManager:
             since_event_id,
             timeout_seconds,
             return_progress,
+            metric_ge,
         )
 
     def wait_sync(
@@ -1262,8 +1375,9 @@ class JobManager:
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
         return_progress: bool = False,
+        metric_ge: dict[str, float] | None = None,
     ) -> dict[str, Any]:
-        return self._wait(job_id, filters, since_event_id, timeout_seconds, return_progress)
+        return self._wait(job_id, filters, since_event_id, timeout_seconds, return_progress, metric_ge)
 
     def _wait(
         self,
@@ -1272,11 +1386,20 @@ class JobManager:
         since_event_id: str | None = None,
         timeout_seconds: int = 3600,
         return_progress: bool = False,
+        metric_ge: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 0 or timeout_seconds > 86400:
             raise ValueError("timeout_seconds must be between 0 and 86400")
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
             raise ValueError(f"Unknown job_id: {job_id}")
+        if metric_ge is not None:
+            if not isinstance(metric_ge, dict) or not metric_ge:
+                raise ValueError("metric_ge must be a non-empty object of metric names to numeric thresholds")
+            for metric, threshold in metric_ge.items():
+                if not isinstance(metric, str) or not metric:
+                    raise ValueError("metric_ge keys must be non-empty metric names")
+                if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+                    raise ValueError(f"metric_ge threshold for {metric!r} must be a number")
         deadline = time.monotonic() + timeout_seconds
         while True:
             if self.shutdown_requested.is_set():
@@ -1287,6 +1410,22 @@ class JobManager:
                 return {"result": "shutdown", "job_id": job_id, "message": "Vanth is shutting down"}
             if events:
                 return {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]}
+            if metric_ge:
+                try:
+                    for metric, threshold in metric_ge.items():
+                        value = self._latest_metric_value(job_id, metric)
+                        if value is not None and value >= threshold:
+                            return {
+                                "result": "metric",
+                                "job_id": job_id,
+                                "status": self.status(job_id)["status"],
+                                "metric": metric,
+                                "threshold": threshold,
+                                "value": value,
+                                "event": self._latest_metric_event(job_id, metric),
+                            }
+                except RuntimeError:
+                    pass
             if return_progress and "progress" not in filters:
                 try:
                     progress = self._event_query(job_id, ["progress"], since_event_id, 1)
@@ -1337,6 +1476,7 @@ class JobManager:
             "env": json.loads(row["env_json"] or "{}"),
             "notes": row["notes"],
             "run": json.loads(row["run_json"] or "{}"),
+            "trigger": json.loads(row["trigger_json"] or "null"),
             "runtime_seconds": _runtime_seconds(row["started_at"], row["ended_at"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1518,6 +1658,29 @@ class JobManager:
             }
         return result
 
+    def _latest_metric_value(self, job_id: str, metric: str) -> float | None:
+        """Return the latest stored value for one job+metric, or None."""
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT y FROM metric_series WHERE job_id=? AND metric=? ORDER BY seq DESC LIMIT 1",
+                (job_id, metric),
+            ).fetchone()
+        return float(row["y"]) if row else None
+
+    def _latest_metric_event(self, job_id: str, metric: str) -> dict[str, Any] | None:
+        """Return the event that produced the latest point for one job+metric."""
+        with self.db_lock:
+            row = self.db.execute(
+                """
+                SELECT e.* FROM events e
+                JOIN metric_series m ON m.event_id = e.event_id
+                WHERE e.job_id=? AND m.metric=?
+                ORDER BY m.seq DESC LIMIT 1
+                """,
+                (job_id, metric),
+            ).fetchone()
+        return self._event_dict(row) if row else None
+
     def metric_ingest(self, job_id: str, metrics: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
         """Record scalar metric points for a job programmatically.
 
@@ -1619,6 +1782,74 @@ class JobManager:
             "latest_metrics": latest_metrics,
             "artifacts": artifacts,
         }
+
+    def diff_spec(self, base_job_id: str, other_job_id: str) -> dict[str, Any]:
+        """Diff the run specs (command/env/cwd/timeout/etc) of two jobs."""
+        self._ensure_open()
+        base = self._row("SELECT * FROM jobs WHERE job_id=?", (base_job_id,))
+        other = self._row("SELECT * FROM jobs WHERE job_id=?", (other_job_id,))
+        if not base:
+            raise ValueError(f"Unknown job_id: {base_job_id}")
+        if not other:
+            raise ValueError(f"Unknown job_id: {other_job_id}")
+
+        fields = ["command", "cwd", "timeout_seconds", "name", "notes", "interactive"]
+        changes: list[dict[str, Any]] = []
+        for field in fields:
+            if field == "interactive":
+                base_value = json.loads(base["run_json"] or "{}").get("interactive") is True
+                other_value = json.loads(other["run_json"] or "{}").get("interactive") is True
+            else:
+                base_value = base[field]
+                other_value = other[field]
+            if base_value != other_value:
+                changes.append({
+                    "field": field,
+                    "base": base_value,
+                    "other": other_value,
+                })
+
+        base_env = json.loads(base["env_json"] or "{}")
+        other_env = json.loads(other["env_json"] or "{}")
+        env_changes: list[dict[str, Any]] = []
+        for key in sorted(set(base_env) | set(other_env)):
+            if base_env.get(key) != other_env.get(key):
+                env_changes.append({"key": key, "base": base_env.get(key), "other": other_env.get(key)})
+        if env_changes:
+            changes.append({"field": "env", "changes": env_changes})
+
+        base_tags = json.loads(base["tags_json"] or "[]")
+        other_tags = json.loads(other["tags_json"] or "[]")
+        if sorted(base_tags) != sorted(other_tags):
+            changes.append({"field": "tags", "base": base_tags, "other": other_tags})
+
+        base_targets = self._wake_targets_for_job(base_job_id)
+        other_targets = self._wake_targets_for_job(other_job_id)
+        if base_targets != other_targets:
+            changes.append({"field": "wake_targets", "base": base_targets, "other": other_targets})
+
+        return {
+            "base_job_id": base_job_id,
+            "other_job_id": other_job_id,
+            "identical": not changes,
+            "changes": changes,
+        }
+
+    def _wake_targets_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        with self.db_lock:
+            rows = self.db.execute(
+                "SELECT type, events_json, config_json FROM wake_targets WHERE job_id=? ORDER BY created_at ASC",
+                (job_id,),
+            ).fetchall()
+        return [
+            {
+                "type": row["type"],
+                "events": json.loads(row["events_json"] or "[]"),
+                **json.loads(row["config_json"] or "{}"),
+            }
+            for row in rows
+        ]
+
 
     def artifacts(self, job_id: str, limit: int = 50) -> dict[str, Any]:
         self._ensure_open()
@@ -1839,7 +2070,7 @@ class JobManager:
         return delivery
 
     def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
-             follow: bool = False, timeout_seconds: float = 5.0) -> dict[str, Any]:
+             follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None) -> dict[str, Any]:
         validate_limit(max_bytes, "max_bytes", max(self.max_log_bytes, 8192))
         if offset is not None and (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0):
             raise ValueError("offset must be a non-negative integer")
@@ -1847,6 +2078,8 @@ class JobManager:
             raise ValueError("stream must be stdout or stderr")
         if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds < 0 or timeout_seconds > 86400:
             raise ValueError("timeout_seconds must be between 0 and 86400")
+        if grep is not None and (not isinstance(grep, str) or not grep):
+            raise ValueError("grep must be a non-empty string")
         row = self._row(f"SELECT {stream}_path AS path FROM jobs WHERE job_id=?", (job_id,))
         if not row:
             raise ValueError(f"Unknown job_id: {job_id}")
@@ -1877,6 +2110,8 @@ class JobManager:
                 f.seek(min(start, size))
             content = f.read(max_bytes).decode(errors="replace")
             cursor = f.tell()
+        if grep:
+            content = "".join(line for line in content.splitlines(keepends=True) if grep in line)
         result = {
             "job_id": job_id,
             "stream": stream,
@@ -2125,9 +2360,19 @@ class JobManager:
         if isinstance(kill_after_seconds, bool) or not isinstance(kill_after_seconds, int) or kill_after_seconds < 0 or kill_after_seconds > 86400:
             raise ValueError("kill_after_seconds must be between 0 and 86400")
         proc = self.processes.get(job_id)
-        row = self._row("SELECT status, worker_pid, pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+        row = self._row("SELECT status, worker_pid, pid, stop_requested_at, trigger_json FROM jobs WHERE job_id=?", (job_id,))
         if not row:
             raise ValueError(f"Job is not running in this server: {job_id}")
+        if row and row["status"] == "queued":
+            with self.db_lock:
+                changed = self.db.execute(
+                    "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
+                    (now_iso(), now_iso(), job_id),
+                ).rowcount
+                self.db.commit()
+            if changed:
+                self._emit(job_id, "cancelled", message="Queued job cancelled before its trigger fired")
+            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Queued job cancelled"}
         if row and row["status"] != "running":
             raise ValueError(f"Job is not running: {job_id}")
         deadline = time.monotonic() + kill_after_seconds
@@ -2254,7 +2499,16 @@ def job_start(
     tags: list[str] | None = None,
     notes: str | None = None,
     interactive: bool = False,
+    trigger: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Start a background job.
+
+    ``trigger`` optionally gates launch on another job: pass
+    ``{"job_id": "A", "status": "completed"}`` to start this job only once job
+    A reaches ``completed``. The new job is created ``queued`` and its runner
+    starts automatically when the trigger fires (or it is ``cancelled`` if A
+    ends in a different terminal status).
+    """
     return get_client().post(
         "/jobs",
         {
@@ -2269,6 +2523,7 @@ def job_start(
             "tags": tags,
             "notes": notes,
             "interactive": interactive,
+            "trigger": trigger,
         },
     )
 
@@ -2344,9 +2599,9 @@ def job_delivery_attempts(delivery_id: str, limit: int = 20) -> dict[str, Any]:
 
 @mcp.tool()
 def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
-             follow: bool = False, timeout_seconds: float = 5.0) -> dict[str, Any]:
+             follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None) -> dict[str, Any]:
     return get_client().get(f"/jobs/{job_id}/tail", {"stream": stream, "max_bytes": max_bytes, "offset": offset,
-                                                     "follow": follow, "timeout_seconds": timeout_seconds})
+                                                      "follow": follow, "timeout_seconds": timeout_seconds, "grep": grep})
 
 
 @mcp.tool()
@@ -2356,11 +2611,23 @@ def job_wait(
     since_event_id: str | None = None,
     timeout_seconds: int = 3600,
     return_progress: bool = False,
+    metric_ge: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    """Wait until a matching event fires or a metric crosses a threshold.
+
+    ``filters`` is a list of event types (e.g. ``["completed", "failed"]``);
+    the first matching event (after ``since_event_id``) is returned as
+    ``{"result": "event", ...}``. ``metric_ge`` maps a metric name (e.g.
+    ``loss``, ``progress.percent``) to a numeric threshold; when the latest
+    stored value reaches it, the wait returns ``{"result": "metric", ...}``
+    with the threshold and current value. ``return_progress`` streams progress
+    events instead of blocking. Returns ``{"result": "timeout"}`` when
+    ``timeout_seconds`` elapses.
+    """
     return get_client().post(
         f"/jobs/{job_id}/wait",
         {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds,
-         "return_progress": return_progress},
+         "return_progress": return_progress, "metric_ge": metric_ge},
     )
 
 
@@ -2398,6 +2665,17 @@ def job_metric_compare(job_ids: list[str], metric: str, aggregation: str = "late
 def job_run_summary(job_id: str) -> dict[str, Any]:
     """One-call summary of a job: status, runtime, progress, latest metrics, artifacts."""
     return get_client().get(f"/jobs/{job_id}/summary")
+
+
+@mcp.tool()
+def job_diff(base_job_id: str, other_job_id: str) -> dict[str, Any]:
+    """Diff the run specs of two jobs (command, env, cwd, timeout, tags, wake targets).
+
+    Useful for comparing a job to its rerun, or two pipeline stages, to see
+    exactly what changed. Returns a list of per-field changes with base/other
+    values and `identical: true` when nothing differs.
+    """
+    return get_client().get(f"/jobs/{base_job_id}/diff", {"other": other_job_id})
 
 
 @mcp.tool()

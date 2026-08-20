@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 9
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -57,7 +57,8 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           runner_heartbeat_at TEXT, stop_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
           notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
-          env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL
+          env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
+          trigger_json TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
           event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -102,7 +103,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at);
-        PRAGMA user_version=8;
+        PRAGMA user_version=9;
         """
     )
 
@@ -207,6 +208,10 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 db.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at)")
                 db.execute("PRAGMA user_version=8")
                 version = 8
+            if version < 9:
+                _add_missing(db, "jobs", {"trigger_json": "TEXT"})
+                db.execute("PRAGMA user_version=9")
+                version = 9
             db.commit()
         except Exception:
             db.rollback()

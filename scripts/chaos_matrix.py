@@ -649,9 +649,109 @@ class AgentQoLScenario(Scenario):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class UxFeatureScenario(Scenario):
+    """Stress the v1.5 UX features through the live daemon HTTP layer:
+    job_wait metric_ge, trigger-based DAG, tail --grep, and job diff."""
+
+    name = "ux"
+
+    def run(self) -> None:
+        import socket as _socket
+        home = Path(tempfile.mkdtemp(prefix="vanth-ux-"))
+        with _socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        daemon = subprocess.Popen(
+            [sys.executable, "-m", "vanth.daemon"],
+            env={**os.environ, "VANTH_HOME": str(home / "state"), "VANTH_DAEMON_PORT": str(port)},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        try:
+            wait_for(lambda: request(port, "GET", "/health") == (200, {"ok": True}), 30, "ux daemon start")
+            token = (home / "state" / "token").read_text(encoding="utf-8").strip()
+
+            def api(method: str, path: str, body=None, qparams=None) -> dict:
+                if qparams:
+                    from urllib.parse import urlencode
+                    sep = "&" if "?" in path else "?"
+                    path = f"{path}{sep}{urlencode(qparams)}"
+                status, payload = request(port, method, path, body, {"Content-Type": "application/json"}, token)
+                assert status in {200, 201}, (method, path, status, payload)
+                return payload
+
+            # job_wait metric_ge: emit an increasing loss metric, wait for it to cross 0.5.
+            metric_code = (
+                "import json,sys;"
+                "f=lambda i: print('AGENT_EVENT '+json.dumps({'type':'metric','data':{'loss':i/10.0}}), flush=True) or "
+                "__import__('time').sleep(0.2);"
+                "[f(i) for i in range(1,11)]"
+            )
+            metric_job = api("POST", "/jobs", json.dumps({"command": cmd(metric_code)}).encode())["job_id"]
+            waited = api("POST", f"/jobs/{metric_job}/wait", json.dumps(
+                {"filters": ["completed"], "metric_ge": {"loss": 0.5}, "timeout_seconds": 30}).encode())
+            assert waited["result"] == "metric", waited
+            assert waited["metric"] == "loss" and waited["value"] >= 0.5, waited
+
+            # trigger DAG: parent fails, child queued for completed gets cancelled.
+            parent = api("POST", "/jobs", json.dumps({"command": cmd("import sys; sys.exit(1)")}).encode())["job_id"]
+            wait_for(lambda: api("GET", f"/jobs/{parent}/status")["status"] in {"completed", "failed"}, 30,
+                     f"dag parent {parent} terminal")
+            child = api("POST", "/jobs", json.dumps({"command": cmd("print('never')"),
+                                                     "trigger": {"job_id": parent, "status": "completed"}}).encode())
+            assert child["status"] == "queued", child
+            child_id = child["job_id"]
+            wait_for(lambda: api("GET", f"/jobs/{child_id}/status")["status"] in {"completed", "failed", "cancelled"}, 30,
+                     f"dag child {child_id} terminal")
+            assert api("GET", f"/jobs/{child_id}/status")["status"] == "cancelled", child_id
+
+            # trigger DAG success: parent completes, child runs.
+            ok_parent = api("POST", "/jobs", json.dumps({"command": cmd("print('ok')")}).encode())["job_id"]
+            ok_child = api("POST", "/jobs", json.dumps({"command": cmd("print('child ok')"),
+                                                        "trigger": {"job_id": ok_parent, "status": "completed"}}).encode())
+            assert ok_child["status"] == "queued", ok_child
+            ok_child_id = ok_child["job_id"]
+            wait_for(lambda: api("GET", f"/jobs/{ok_child_id}/status")["status"] in {"completed", "failed", "cancelled"}, 30,
+                     f"dag ok child {ok_child_id} terminal")
+            assert api("GET", f"/jobs/{ok_child_id}/status")["status"] == "completed", ok_child_id
+
+            # tail --grep filters server-side.
+            grep_job = api("POST", "/jobs", json.dumps({"command": cmd(
+                "print('hello world', flush=True); print('goodbye world', flush=True)")}).encode())["job_id"]
+            wait_for(lambda: api("GET", f"/jobs/{grep_job}/status")["status"] in {"completed", "failed"}, 30,
+                     f"grep job {grep_job} terminal")
+            filtered = api("GET", f"/jobs/{grep_job}/tail", qparams={"grep": "hello"})
+            assert "hello world" in filtered.get("content", "") and "goodbye world" not in filtered.get("content", ""), filtered
+
+            # job diff: identical vs changed.
+            base = api("POST", "/jobs", json.dumps({"command": cmd("print('a')"), "name": "same",
+                                                    "env": {"X": "1"}}).encode())["job_id"]
+            other = api("POST", "/jobs", json.dumps({"command": cmd("print('b')"), "name": "same",
+                                                     "env": {"X": "2"}}).encode())["job_id"]
+            diff = api("GET", f"/jobs/{base}/diff", qparams={"other": other})
+            assert diff["identical"] is False, diff
+            fields = {c["field"] for c in diff["changes"]}
+            assert "command" in fields and "env" in fields, fields
+            wait_for(lambda: api("GET", f"/jobs/{base}/status")["status"] in {"completed", "failed"}, 30,
+                     f"diff base {base} terminal")
+
+            print("  metric wait, DAG trigger (cancel+success), tail grep, job diff verified")
+        finally:
+            if sys.platform == "win32":
+                daemon.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                daemon.terminate()
+            try:
+                daemon.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=10)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 SCENARIOS = {
     scenario.name: scenario
-    for scenario in (BurstScenario, AdapterScenario, DaemonKillScenario, RunnerKillScenario, InputScenario, StateScenario, AgentFeatureScenario, AgentQoLScenario)
+    for scenario in (BurstScenario, AdapterScenario, DaemonKillScenario, RunnerKillScenario, InputScenario, StateScenario, AgentFeatureScenario, AgentQoLScenario, UxFeatureScenario)
 }
 
 

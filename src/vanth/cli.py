@@ -519,6 +519,7 @@ def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     stream = "stdout"
     max_bytes = 8192
     offset: int | None = None
+    grep: str | None = None
     i = 1
     while i < len(argv):
         arg = argv[i]
@@ -552,6 +553,12 @@ def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
             except ValueError:
                 print(f"vanth logs: invalid --offset value {argv[i]!r}", file=sys.stderr)
                 return 2
+        elif arg == "--grep":
+            i += 1
+            if i >= len(argv):
+                print("vanth logs: --grep requires a value", file=sys.stderr)
+                return 2
+            grep = argv[i]
         else:
             print(f"vanth logs: unknown option {arg!r}", file=sys.stderr)
             return 2
@@ -568,6 +575,8 @@ def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         params: dict[str, Any] = {"stream": name, "max_bytes": max_bytes}
         if offset is not None:
             params["offset"] = offset
+        if grep is not None:
+            params["grep"] = grep
         try:
             result = client.get(f"/jobs/{job_id}/tail", params)
         except Exception as exc:
@@ -586,6 +595,43 @@ def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         return 0
     for result in results:
         print(result.get("content") or "", end="")
+    return 0
+
+
+def cmd_diff(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    if len(argv) < 2:
+        print("vanth diff: requires two job ids: <job> <other>", file=sys.stderr)
+        return 2
+    base_job_id, other_job_id = argv[0], argv[1]
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+        result = client.get(f"/jobs/{base_job_id}/diff", {"other": other_job_id})
+    except Exception as exc:
+        print(f"vanth diff: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        error = result.get("error") or ""
+        if "unknown" in error.lower() or "job_id" in error.lower():
+            print(f"vanth diff: unknown job (base={base_job_id} other={other_job_id})", file=sys.stderr)
+            return 1
+        print(f"vanth diff: daemon error: {error}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if result.get("identical"):
+        print(f"vanth diff: {base_job_id} and {other_job_id} are identical")
+        return 0
+    print(f"vanth diff: {base_job_id} vs {other_job_id}")
+    for change in result.get("changes") or []:
+        field = change["field"]
+        if field == "env":
+            print(f"\n  env ({len(change.get('changes') or [])} keys changed):")
+            for entry in change.get("changes") or []:
+                print(f"    {entry['key']}: {entry.get('base')!r} -> {entry.get('other')!r}")
+        else:
+            print(f"  {field}: {change.get('base')!r} -> {change.get('other')!r}")
     return 0
 
 
@@ -775,7 +821,8 @@ def _usage() -> str:
         "  status         show daemon health, running jobs, and MCP client state\n"
         "  doctor         full health report (schema, deliveries, tools)\n"
         "  list, ps       list jobs (running by default; --all for terminal)\n"
-        "  logs, tail     show a job's stdout/stderr output\n"
+        "  logs, tail     show a job's stdout/stderr output (--grep filters lines)\n"
+        "  diff           diff the run specs of two jobs\n"
         "  stop           stop a running job\n"
         "  artifacts      list a job's artifacts\n"
         "  prune          manually clean up terminal jobs (default dry-run)\n"
@@ -818,6 +865,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(argv[1:], home, json_out=json_out)
     if command in {"logs", "tail"}:
         return cmd_logs(argv[1:], home, json_out=json_out)
+    if command == "diff":
+        return cmd_diff(argv[1:], home, json_out=json_out)
     if command == "stop":
         return cmd_stop(argv[1:], home, json_out=json_out)
     if command == "artifacts":

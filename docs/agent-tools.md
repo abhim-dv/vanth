@@ -50,6 +50,7 @@ client or daemon restarts.
 | `tags` | `string[]?` | `None` | Arbitrary labels, filterable in `job_list` |
 | `notes` | `string?` | `None` | Free-form annotation shown in the monitor |
 | `interactive` | `bool` | `false` | Open stdin for `job_send` |
+| `trigger` | `object?` | `None` | `{"job_id": A, "status": "completed"}` — start only after A reaches that status |
 
 **Response**
 
@@ -64,6 +65,12 @@ client or daemon restarts.
   "message": "Job started"
 }
 ```
+
+With `trigger` set, the job is created `queued` (no `worker_pid`) and the
+response carries `"trigger"` plus a message like `"Job queued; will start when
+job_A reaches completed"`. Its runner launches automatically once the parent
+reaches that status; if the parent ends in a different terminal status, the
+queued job is `cancelled`. `vanth stop` cancels a queued job before it fires.
 
 On runner-launch failure: `status: "failed"`, `exit_code: 1`, `message` with
 the cause. On quota exhaustion (`VANTH_MAX_RUNNING_JOBS`):
@@ -362,6 +369,7 @@ Bounded stdout/stderr log tail with byte offsets.
 | `offset` | `int?` | `None` | Byte offset to start from; `None` = last `max_bytes` bytes |
 | `follow` | `bool` | `false` | Block for new output until the job ends or `timeout_seconds` elapses |
 | `timeout_seconds` | `int?` | `None` | Follow mode cap; `None` = until the job is terminal |
+| `grep` | `string?` | `None` | Server-side substring filter; only lines containing it are returned |
 
 **Response**
 
@@ -373,7 +381,8 @@ Bounded stdout/stderr log tail with byte offsets.
 `truncated` is true when the requested window was clipped to the log size or
 the byte cap. Use `next_offset` to page forward. With `follow: true`, repeated
 blocks append as output lands; the call returns when the job is terminal or
-`timeout_seconds` is hit.
+`timeout_seconds` is hit. With `grep`, `content` holds only the matching lines
+(and `size` reflects the full log, not the filtered window).
 
 ---
 
@@ -392,6 +401,7 @@ immediately — do not poll.
 | `since_event_id` | `string?` | `None` | Only events newer than this one |
 | `timeout_seconds` | `int` | `3600` | 0–86400 |
 | `return_progress` | `bool` | `false` | Include the job's latest progress block in the response |
+| `metric_ge` | `object?` | `None` | `{metric: threshold}` — return when the latest stored value reaches the threshold |
 
 **Response**
 
@@ -404,6 +414,15 @@ immediately — do not poll.
 
 With `return_progress: true`, `progress` is the job's latest `progress` event's
 data plus `updated_at` (or `null`).
+
+With `metric_ge: {"loss": 0.5}`, the wait returns as soon as the latest stored
+value of the `loss` metric series is `>= 0.5`:
+
+```json
+{ "result": "metric", "job_id": "job_abc123", "status": "running",
+  "metric": "loss", "threshold": 0.5, "value": 0.62, "event": {...} }
+```
+
 Timeout: `{"result": "timeout", "job_id": ..., "status": ..., "message": "No matching event before timeout"}`.
 Daemon shutdown: `{"result": "shutdown", "job_id": ..., "message": "Vanth is shutting down"}`.
 
@@ -574,6 +593,36 @@ One-call "did it work?" — status, runtime, progress, metric overview, artifact
   "artifacts": [ { "artifact_id": "art_...", "name": "best.pt", "uri": "file:///...", "..." } ]
 }
 ```
+
+---
+
+## `job_diff`
+
+Compare the run specs of two jobs — e.g. a job vs its rerun, or two pipeline
+stages — and see exactly what changed (command, env, cwd, timeout, name, tags,
+wake targets).
+
+**Parameters**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `base_job_id` | `string` | required | Reference job |
+| `other_job_id` | `string` | required | Job to compare against |
+
+**Response**
+
+```json
+{
+  "base_job_id": "job_abc", "other_job_id": "job_xyz",
+  "identical": false,
+  "changes": [
+    { "field": "command", "base": "train.py --lr 0.1", "other": "train.py --lr 0.01" },
+    { "field": "env", "changes": [ { "key": "SEED", "base": "1", "other": "42" } ] }
+  ]
+}
+```
+
+`identical: true` with `changes: []` when nothing differs. CLI: `vanth diff <job> <other>`.
 
 ---
 

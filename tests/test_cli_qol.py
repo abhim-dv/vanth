@@ -178,6 +178,31 @@ def test_logs_stream_all(daemon):
     assert "ERR-LINE" in result.stdout
 
 
+def test_logs_grep_filters(daemon):
+    tmp_path, client, port = daemon
+    started = client.post("/jobs", {"command": cmd("print('foo-bar', flush=True); print('baz-qux', flush=True)")})
+    job_id = started["job_id"]
+    wait_status(client, job_id, ["completed"])
+    full = run_cli(tmp_path / "state", "logs", job_id, port=port)
+    assert "foo-bar" in full.stdout and "baz-qux" in full.stdout
+    filtered = run_cli(tmp_path / "state", "logs", job_id, "--grep", "foo", port=port)
+    assert filtered.returncode == 0, filtered.stdout + filtered.stderr
+    assert "foo-bar" in filtered.stdout
+    assert "baz-qux" not in filtered.stdout
+
+
+def test_diff_cli(daemon):
+    tmp_path, client, port = daemon
+    base = client.post("/jobs", {"command": cmd("print('a')"), "name": "same", "env": {"X": "1"}})["job_id"]
+    other = client.post("/jobs", {"command": cmd("print('b')"), "name": "same", "env": {"X": "2"}})["job_id"]
+    wait_status(client, base, ["completed"])
+    wait_status(client, other, ["completed"])
+    result = run_cli(tmp_path / "state", "diff", base, other, port=port)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "command" in result.stdout
+    assert "env" in result.stdout
+
+
 def test_stop_job(daemon):
     tmp_path, client, port = daemon
     started = client.post("/jobs", {"command": cmd("import time; time.sleep(30)")})

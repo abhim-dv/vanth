@@ -247,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                                               query.get("types") or None, int(query.get("limit", ["20"])[0]),
                                               query.get("reverse", ["false"])[0].lower() in {"1", "true", "yes"}))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/tail"):
-                ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None, query.get("follow", ["false"])[0] == "true", float(query.get("timeout_seconds", ["5"])[0])))
+                ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None, query.get("follow", ["false"])[0] == "true", float(query.get("timeout_seconds", ["5"])[0]), query.get("grep", [None])[0]))
             elif parsed.path == "/deliveries":
                 ok(self, get_manager().deliveries(query.get("job_id", [None])[0], query.get("status", [None])[0], int(query.get("limit", ["20"])[0])))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/attempts"):
@@ -262,6 +262,11 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/summary"):
                 ok(self, get_manager().run_summary(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/diff"):
+                ok(self, get_manager().diff_spec(
+                    parsed.path.split("/")[2],
+                    query.get("other", [None])[0],
+                ))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
                 ok(self, get_manager().artifacts(parsed.path.split("/")[2], int(query.get("limit", ["50"])[0])))
             elif parsed.path.startswith("/artifacts/") and parsed.path.endswith("/content"):
@@ -316,7 +321,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive"}
+                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger"}
                 if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)

@@ -2,6 +2,34 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased / next (1.5.x)
+
+### Agent + user QoL
+
+- **MCP tool `job_wait` gains `metric_ge`**: wait until a named metric (e.g.
+  `loss`, `progress.percent`) reaches a numeric threshold, returning
+  `{"result": "metric", ...}` instead of blocking for an event. Combined with
+  the existing multi-event `filters`, one call can wait on "loss < 0.5 OR job
+  completes".
+- **NEW - job DAG via `trigger`**: `job_start(..., trigger={"job_id": A,
+  "status": "completed"})` creates the job `queued`; its runner starts
+  automatically once A reaches that status. If A ends in a different terminal
+  status, the queued job is `cancelled`. Lightweight — one column, no graph
+  engine. `vanth stop` cancels a queued job before it fires.
+- **MCP tool `job_tail` gains `grep`**: server-side line filtering on stdout /
+  stderr, so agents can pull only the matching lines without shipping the whole
+  log. CLI: `vanth logs <id> --grep <pattern>`.
+- **NEW - MCP tool `job_diff` + CLI `vanth diff`**: compare the run specs
+  (command, env, cwd, timeout, tags, wake targets) of two jobs — e.g. a job vs
+  its rerun — returning per-field base/other changes or `identical: true`.
+
+### Docs + CI
+
+- Schema v9: `jobs.trigger_json` column (migrated automatically from v8).
+- Chaos matrix gains a `ux` scenario covering metric waits, DAG trigger
+  (cancel + success), tail grep, and job diff through the live daemon HTTP
+  layer. All 9 scenarios pass.
+
 ## 1.4.1 - 2026-08-20
 
 ### Agent + user QoL
