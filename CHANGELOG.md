@@ -21,6 +21,15 @@ All notable changes to Vanth are documented here.
   `["completed", "failed"]`). `add_wake_target` now validates wake targets
   against `validate_wake_targets`, rejecting unsupported types.
 
+### Docs + CI
+
+- **Docs**: documented that `codex_thread` wakes require a thread that has
+  already had at least one turn (a persisted rollout); resuming a zero-turn
+  thread fails with `no rollout found for thread id`.
+- **CI**: the flaky Windows python job now runs on `pull_request` only (not
+  `push`), so pushes stop triggering the intermittent
+  `test_stop_after_restart_kills_runner_and_workload` pid-teardown flake.
+
 ## 1.4.0 - 2026-08-19
 
 ### Agent + user QoL

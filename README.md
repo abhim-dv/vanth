@@ -673,6 +673,11 @@ Resumes a Codex thread through the local app-server:
 
 Protocol: `initialize -> thread/resume -> turn/start`.
 
+The target thread must already have had at least one turn (a persisted
+"rollout"). Resuming a brand-new, zero-turn thread fails with
+`no rollout found for thread id <id>` — the intended wake target is an
+existing/active conversation, not a never-started one.
+
 ### opencode_thread
 
 Resumes an OpenCode session:
@@ -997,6 +1002,9 @@ Start it through `job_start` and watch it in `vanth monitor`.
   Refresh the wake target's `session_id` (or start a new session) and
   `job_retry_delivery` to re-dispatch. Per-target opt-out: `skip_probe: true`;
   global opt-out: `VANTH_OPENCODE_SKIP_PROBE=1`.
+- **Codex wake failed with `no rollout found for thread id`**: the target
+  thread has never had a turn. Start a first turn in that thread (or target an
+  existing, active conversation) before waking it.
 - **Monitor shows nothing / empty state**: confirm `VANTH_HOME` points at the
   daemon's home, and that `jobs.sqlite` exists there.
 
