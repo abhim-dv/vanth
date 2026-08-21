@@ -1,0 +1,568 @@
+"""Durable artifact operations: idempotent, leased, fenced (Phase 5).
+
+Every public method goes through the same durable-operation pattern:
+
+1. ``_begin`` computes ``request_digest(method, payload, idempotency_key)``
+   (reusing :func:`vanth.remote.protocol.request_digest`) and inserts the
+   operation row in one transaction. Replays by idempotency key return the
+   existing row; a different digest for the same key raises a
+   ``PROTOCOL_REPLAY_MISMATCH`` error.
+2. A worker claims the op: fresh ``claim_token``, ``claimed_at``,
+   ``lease_expires_at`` (now + lease seconds), ``attempts += 1`` and
+   ``lease_generation += 1``.
+3. Completion is **fenced**: only the claim token recorded on the row may
+   move the op to a terminal status, and only while its lease is unexpired.
+   ``reclaim_expired()`` re-claims expired ops under a new generation and
+   token, so a stale worker's token can never commit afterwards.
+
+Publication transaction boundary (``put_file``): bytes are staged, hashed,
+and made durable in the blob store *first*; then one catalog transaction
+inserts the immutable version row, moves the root's latest pointer, and marks
+the operation completed. A crash before that transaction leaves only
+discoverable staging state (no version row); a crash after it replays to the
+same version via the stored result.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from ..remote.protocol import request_digest
+from .catalog import Catalog, new_id, now_iso
+from .local_store import LocalBlobStore
+from .manifest import build_manifest, manifest_digest
+
+__all__ = ["ArtifactOperations", "DEFAULT_LEASE_SECONDS"]
+
+DEFAULT_LEASE_SECONDS = 300
+
+
+def _mint_key(prefix: str) -> str:
+    return f"{prefix}-{secrets.token_hex(12)}"
+
+
+class ArtifactOperations:
+    def __init__(
+        self,
+        catalog: Catalog,
+        blobs: LocalBlobStore,
+        journalless: bool = True,
+        *,
+        lease_seconds: int | None = None,
+    ) -> None:
+        self.catalog = catalog
+        self.blobs = blobs
+        self.journalless = journalless
+        if lease_seconds is None:
+            try:
+                lease_seconds = max(30, int(os.environ.get("VANTH_ARTIFACT_LEASE_SECONDS", DEFAULT_LEASE_SECONDS)))
+            except ValueError:
+                lease_seconds = DEFAULT_LEASE_SECONDS
+        self.lease_seconds = int(lease_seconds)
+        # Test hook: called between staging and blob publication so crash cases
+        # can inject a failure while staging state is still discoverable.
+        self.crash_hook = None
+
+    # ------------------------------------------------------------------
+    # Durable operation plumbing
+    # ------------------------------------------------------------------
+
+    def _op_dict(self, row) -> dict[str, Any]:
+        return {
+            "op_id": row["op_id"],
+            "idempotency_key": row["idempotency_key"],
+            "method": row["method"],
+            "request_digest": row["request_digest"],
+            "payload": json.loads(row["payload_json"] or "{}"),
+            "status": row["status"],
+            "claim_token": row["claim_token"],
+            "lease_expires_at": row["lease_expires_at"],
+            "lease_generation": int(row["lease_generation"]),
+            "attempts": int(row["attempts"]),
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _begin(self, method: str, payload: dict[str, Any], idempotency_key: str) -> tuple[dict[str, Any], bool]:
+        """Insert or replay the operation row. Returns ``(op, replayed)``."""
+        digest = request_digest(method, payload, idempotency_key)
+        db = self.catalog.db
+        with self.catalog.lock:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = db.execute(
+                    "SELECT * FROM operations WHERE idempotency_key=?", (idempotency_key,)
+                ).fetchone()
+                if existing:
+                    if existing["request_digest"] != digest:
+                        raise ValueError(
+                            "PROTOCOL_REPLAY_MISMATCH: idempotency key was reused with a different request"
+                        )
+                    op = self._op_dict(existing)
+                    db.commit()
+                    return op, True
+                stamp = now_iso()
+                db.execute(
+                    """
+                    INSERT INTO operations(op_id, idempotency_key, method, request_digest, payload_json,
+                      status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        new_id("aop"), idempotency_key, method, digest,
+                        json.dumps(payload, separators=(",", ":")), stamp, stamp,
+                    ),
+                )
+                row = db.execute(
+                    "SELECT * FROM operations WHERE idempotency_key=?", (idempotency_key,)
+                ).fetchone()
+                db.commit()
+                return self._op_dict(row), False
+            except BaseException:
+                db.rollback()
+                raise
+
+    def _claim(self, op_id: str) -> dict[str, Any]:
+        """Claim (or re-claim an expired op): new token, generation, and lease."""
+        db = self.catalog.db
+        token = secrets.token_hex(16)
+        now = datetime.now(timezone.utc)
+        expires = (now + timedelta(seconds=self.lease_seconds)).isoformat().replace("+00:00", "Z")
+        with self.catalog.lock:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                changed = db.execute(
+                    """
+                    UPDATE operations SET status='running', claim_token=?, claimed_at=?, lease_expires_at=?,
+                      attempts=attempts+1, lease_generation=lease_generation+1, updated_at=?
+                    WHERE op_id=? AND status IN ('pending','running','failed')
+                    """,
+                    (token, now.isoformat().replace("+00:00", "Z"), expires, now_iso(), op_id),
+                ).rowcount
+                if not changed:
+                    db.rollback()
+                    raise ValueError(f"operation cannot be claimed: {op_id}")
+                row = db.execute("SELECT * FROM operations WHERE op_id=?", (op_id,)).fetchone()
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return self._op_dict(row)
+
+    def _finish(
+        self,
+        op_id: str,
+        claim_token: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Fenced terminal transition: token must match and the lease must be live.
+
+        A reclaim assigns a new token (and bumps ``lease_generation``), so a
+        matching token implies the worker still owns the current generation;
+        an expired lease can never be committed even before reclaim happens.
+        """
+        db = self.catalog.db
+        with self.catalog.lock:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                changed = db.execute(
+                    """
+                    UPDATE operations SET status=?, result_json=?, error=?, updated_at=?,
+                      claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                    WHERE op_id=? AND claim_token=? AND status='running'
+                      AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                    """,
+                    (
+                        status,
+                        json.dumps(result, separators=(",", ":")) if result is not None else None,
+                        error,
+                        now_iso(),
+                        op_id,
+                        claim_token,
+                        now_iso(),
+                    ),
+                ).rowcount
+                if not changed:
+                    db.rollback()
+                    raise ValueError(
+                        f"stale worker: operation {op_id} cannot be finished with this claim "
+                        "(expired lease or reclaimed generation)"
+                    )
+                row = db.execute("SELECT * FROM operations WHERE op_id=?", (op_id,)).fetchone()
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return self._op_dict(row)
+
+    def complete(self, op_id: str, claim_token: str, result: dict[str, Any]) -> dict[str, Any]:
+        return self._finish(op_id, claim_token, status="completed", result=result)
+
+    def fail(self, op_id: str, claim_token: str, error: str) -> dict[str, Any]:
+        return self._finish(op_id, claim_token, status="failed", error=error)
+
+    def reclaim_expired(self) -> list[dict[str, Any]]:
+        """Re-claim every expired running op under a fresh generation."""
+        db = self.catalog.db
+        with self.catalog.lock:
+            rows = db.execute(
+                "SELECT op_id FROM operations WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                (now_iso(),),
+            ).fetchall()
+        return [self._claim(row["op_id"]) for row in rows]
+
+    def get_operation(self, op_id: str) -> dict[str, Any]:
+        row = self.catalog.db.execute("SELECT * FROM operations WHERE op_id=?", (op_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown op_id: {op_id}")
+        return self._op_dict(row)
+
+    # ------------------------------------------------------------------
+    # Root / version helpers
+    # ------------------------------------------------------------------
+
+    def _get_or_create_root(self, name: str) -> dict[str, Any]:
+        db = self.catalog.db
+        with self.catalog.lock:
+            row = db.execute("SELECT * FROM roots WHERE name=?", (name,)).fetchone()
+            if row:
+                return dict(row)
+            stamp = now_iso()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    "INSERT INTO roots(root_id, name, latest_version_id, created_at, updated_at) VALUES (?, ?, NULL, ?, ?)",
+                    (new_id("rot"), name, stamp, stamp),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                row = db.execute("SELECT * FROM roots WHERE name=?", (name,)).fetchone()
+                if not row:
+                    raise
+                return dict(row)
+            row = db.execute("SELECT * FROM roots WHERE name=?", (name,)).fetchone()
+            return dict(row)
+
+    def _get_version(self, version_id: str):
+        return self.catalog.db.execute("SELECT * FROM versions WHERE version_id=?", (version_id,)).fetchone()
+
+    # ------------------------------------------------------------------
+    # Public operations
+    # ------------------------------------------------------------------
+
+    def put_file(
+        self,
+        name: str,
+        *,
+        data: bytes | bytearray | memoryview | None = None,
+        source_path: str | os.PathLike[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Publish file content as an immutable version of root ``name``.
+
+        Identical content published to the same root collapses onto the
+        existing ``(root_id, manifest_digest)`` version with
+        ``deduplicated=True``; identical bytes also deduplicate physically in
+        the blob store. Publishing different content to the same root creates
+        a new immutable version and advances the root's latest pointer.
+        """
+        if isinstance(name, bool) or not isinstance(name, str) or not name.strip():
+            raise ValueError("name must be a non-empty string")
+        if (data is None) == (source_path is None):
+            raise ValueError("provide exactly one of data or source_path")
+        if source_path is not None:
+            data = Path(source_path).read_bytes()
+        data = bytes(data)
+        manifest = build_manifest(data, name)
+        mdigest = manifest_digest(manifest)
+        key = idempotency_key or _mint_key("aput")
+        payload = {"name": name, "manifest_digest": mdigest}
+        op, replayed = self._begin("artifact.put_file", payload, key)
+        if replayed and op["status"] == "completed":
+            return {**op["result"], "replayed": True}
+        claimed = self._claim(op["op_id"])
+        token = claimed["claim_token"]
+        try:
+            root = self._get_or_create_root(name)
+            existing = self.catalog.db.execute(
+                "SELECT * FROM versions WHERE root_id=? AND manifest_digest=?", (root["root_id"], mdigest)
+            ).fetchone()
+            if existing:
+                result = {
+                    "version_id": existing["version_id"],
+                    "root_id": root["root_id"],
+                    "name": name,
+                    "manifest_digest": mdigest,
+                    "size_bytes": int(existing["size_bytes"]),
+                    "sha256": manifest["sha256"],
+                    "deduplicated": True,
+                }
+                self.complete(op["op_id"], token, result)
+                return result
+            staged = self.blobs.stage(data)
+            if self.crash_hook is not None:
+                self.crash_hook(op["op_id"])
+            self.blobs.publish_staged(staged, manifest["sha256"])
+            # Publication transaction boundary: the blob is durable above; the
+            # single transaction below commits version + root pointer + op result.
+            db = self.catalog.db
+            with self.catalog.lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    row = db.execute(
+                        "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
+                        (root["root_id"], mdigest),
+                    ).fetchone()
+                    deduplicated = bool(row)
+                    version_id = row["version_id"] if row else self.catalog.new_version_id()
+                    if not row:
+                        db.execute(
+                            "INSERT INTO versions(version_id, root_id, manifest_digest, manifest_json, size_bytes, created_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                version_id,
+                                root["root_id"],
+                                mdigest,
+                                json.dumps(manifest, separators=(",", ":")),
+                                manifest["size_bytes"],
+                                now_iso(),
+                            ),
+                        )
+                    db.execute(
+                        "UPDATE roots SET latest_version_id=?, updated_at=? WHERE root_id=?",
+                        (version_id, now_iso(), root["root_id"]),
+                    )
+                    result = {
+                        "version_id": version_id,
+                        "root_id": root["root_id"],
+                        "name": name,
+                        "manifest_digest": mdigest,
+                        "size_bytes": manifest["size_bytes"],
+                        "sha256": manifest["sha256"],
+                        "deduplicated": deduplicated,
+                    }
+                    changed = db.execute(
+                        """
+                        UPDATE operations SET status='completed', result_json=?, updated_at=?,
+                          claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                        WHERE op_id=? AND claim_token=? AND status='running'
+                          AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                        """,
+                        (
+                            json.dumps(result, separators=(",", ":")),
+                            now_iso(),
+                            op["op_id"],
+                            token,
+                            now_iso(),
+                        ),
+                    ).rowcount
+                    if not changed:
+                        raise ValueError(
+                            f"stale worker: operation {op['op_id']} cannot be completed with this claim "
+                            "(expired lease or reclaimed generation)"
+                        )
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+            return result
+        except BaseException as exc:
+            try:
+                self.fail(op["op_id"], token, str(exc))
+            except ValueError:
+                pass
+            raise
+
+    def resolve(
+        self,
+        name_or_root_id: str,
+        *,
+        alias: str | None = None,
+        version_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve to one immutable version: explicit version, alias pin, or root latest."""
+        key = idempotency_key or _mint_key("ares")
+        payload = {"target": name_or_root_id, "alias": alias, "version_id": version_id}
+        op, replayed = self._begin("artifact.resolve", payload, key)
+        if replayed and op["status"] == "completed":
+            return {**op["result"], "replayed": True}
+        claimed = self._claim(op["op_id"])
+        token = claimed["claim_token"]
+        try:
+            if version_id is not None:
+                row = self._get_version(version_id)
+                if not row:
+                    raise ValueError(f"Unknown version_id: {version_id}")
+                resolved_via = "version"
+            elif alias is not None:
+                alias_row = self.catalog.db.execute(
+                    """
+                    SELECT v.* FROM aliases a JOIN versions v ON v.version_id=a.version_id
+                    WHERE a.alias_name=?
+                    """,
+                    (alias,),
+                ).fetchone()
+                if not alias_row:
+                    raise ValueError(f"Unknown alias: {alias}")
+                row = alias_row
+                resolved_via = "alias"
+            else:
+                root_row = self.catalog.db.execute(
+                    "SELECT * FROM roots WHERE name=? OR root_id=?", (name_or_root_id, name_or_root_id)
+                ).fetchone()
+                if not root_row:
+                    raise ValueError(f"Unknown root: {name_or_root_id}")
+                if not root_row["latest_version_id"]:
+                    raise ValueError(f"Root has no versions yet: {name_or_root_id}")
+                row = self._get_version(root_row["latest_version_id"])
+                resolved_via = "latest"
+            root_row = self.catalog.db.execute(
+                "SELECT * FROM roots WHERE root_id=?", (row["root_id"],)
+            ).fetchone()
+            result = {
+                "root_id": row["root_id"],
+                "root_name": root_row["name"] if root_row else None,
+                "version_id": row["version_id"],
+                "manifest_digest": row["manifest_digest"],
+                "size_bytes": int(row["size_bytes"]),
+                "resolved_via": resolved_via,
+            }
+            self.complete(op["op_id"], token, result)
+            return result
+        except BaseException as exc:
+            try:
+                self.fail(op["op_id"], token, str(exc))
+            except ValueError:
+                pass
+            raise
+
+    def info(self, version_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Manifest plus blob existence and verification flag for one version."""
+        key = idempotency_key or _mint_key("ainf")
+        payload = {"version_id": version_id}
+        op, replayed = self._begin("artifact.info", payload, key)
+        if replayed and op["status"] == "completed":
+            return {**op["result"], "replayed": True}
+        claimed = self._claim(op["op_id"])
+        token = claimed["claim_token"]
+        try:
+            row = self._get_version(version_id)
+            if not row:
+                raise ValueError(f"Unknown version_id: {version_id}")
+            manifest = json.loads(row["manifest_json"])
+            sha256 = manifest["sha256"]
+            result = {
+                "version_id": version_id,
+                "root_id": row["root_id"],
+                "manifest_digest": row["manifest_digest"],
+                "manifest": manifest,
+                "size_bytes": int(row["size_bytes"]),
+                "blob_exists": self.blobs.has_blob(sha256),
+                "verified": self.blobs.verify_blob(sha256),
+            }
+            self.complete(op["op_id"], token, result)
+            return result
+        except BaseException as exc:
+            try:
+                self.fail(op["op_id"], token, str(exc))
+            except ValueError:
+                pass
+            raise
+
+    def materialize(
+        self,
+        version_id: str,
+        dest_path: str | os.PathLike[str],
+        *,
+        idempotency_key: str | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Write a version's blob to ``dest_path`` atomically; refuses to clobber."""
+        dest = Path(dest_path)
+        key = idempotency_key or _mint_key("amat")
+        payload = {"version_id": version_id, "dest_path": str(dest), "overwrite": bool(overwrite)}
+        op, replayed = self._begin("artifact.materialize", payload, key)
+        if replayed and op["status"] == "completed":
+            return {**op["result"], "replayed": True}
+        claimed = self._claim(op["op_id"])
+        token = claimed["claim_token"]
+        try:
+            row = self._get_version(version_id)
+            if not row:
+                raise ValueError(f"Unknown version_id: {version_id}")
+            manifest = json.loads(row["manifest_json"])
+            sha256 = manifest["sha256"]
+            if not self.blobs.has_blob(sha256):
+                raise ValueError(f"blob missing for version {version_id}: {sha256}")
+            existed = dest.exists()
+            if existed and not overwrite:
+                raise ValueError(f"destination already exists: {dest}")
+            staged = self.blobs.stage(self.blobs.blob_path(sha256))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged, dest)
+            result = {
+                "version_id": version_id,
+                "dest_path": str(dest),
+                "size_bytes": int(row["size_bytes"]),
+                "sha256": sha256,
+                "overwritten": existed,
+            }
+            self.complete(op["op_id"], token, result)
+            return result
+        except BaseException as exc:
+            try:
+                self.fail(op["op_id"], token, str(exc))
+            except ValueError:
+                pass
+            raise
+
+    def verify(self, version_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Re-hash the referenced blob. Verification failure is a RESULT (ok=False), not an exception."""
+        key = idempotency_key or _mint_key("aver")
+        payload = {"version_id": version_id}
+        op, replayed = self._begin("artifact.verify", payload, key)
+        if replayed and op["status"] == "completed":
+            return {**op["result"], "replayed": True}
+        claimed = self._claim(op["op_id"])
+        token = claimed["claim_token"]
+        try:
+            row = self._get_version(version_id)
+            if not row:
+                raise ValueError(f"Unknown version_id: {version_id}")
+            manifest = json.loads(row["manifest_json"])
+            expected = manifest["sha256"]
+            actual = None
+            if self.blobs.has_blob(expected):
+                digest = hashlib.sha256()
+                with self.blobs.blob_path(expected).open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                actual = digest.hexdigest()
+            ok = actual == expected
+            result = {
+                "ok": ok,
+                "ok_bool": ok,
+                "expected_sha256": expected,
+                "actual_sha256": actual,
+            }
+            self.complete(op["op_id"], token, result)
+            return result
+        except BaseException as exc:
+            try:
+                self.fail(op["op_id"], token, str(exc))
+            except ValueError:
+                pass
+            raise

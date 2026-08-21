@@ -2820,6 +2820,41 @@ def job_artifact_read(artifact_id: str, max_bytes: int = 262144) -> dict[str, An
     return get_client().get(f"/artifacts/{artifact_id}/content", {"max_bytes": max_bytes})
 
 
+@mcp.tool()
+def artifact_put(path: str, name: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Publish a local file into the managed artifact store as an immutable version.
+
+    ``name`` selects the file root; identical content re-published to the same
+    root deduplicates onto the existing version.
+    """
+    return get_client().post("/artifacts/put", {"path": path, "name": name, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def artifact_resolve(name: str, alias: str | None = None, version_id: str | None = None) -> dict[str, Any]:
+    """Resolve a root (latest), alias pin, or explicit version to one immutable version."""
+    return get_client().get("/artifacts/resolve", {"name": name, "alias": alias, "version_id": version_id})
+
+
+@mcp.tool()
+def artifact_info(version_id: str) -> dict[str, Any]:
+    """Manifest plus blob existence and verification flag for one artifact version."""
+    return get_client().get(f"/artifacts/info/{version_id}")
+
+
+@mcp.tool()
+def artifact_materialize(version_id: str, dest_path: str, overwrite: bool = False) -> dict[str, Any]:
+    """Write an artifact version's content to dest_path atomically (existing destinations fail unless overwrite)."""
+    return get_client().post("/artifacts/materialize",
+                             {"version_id": version_id, "dest_path": dest_path, "overwrite": overwrite})
+
+
+@mcp.tool()
+def artifact_verify(version_id: str) -> dict[str, Any]:
+    """Re-hash the stored content of an artifact version and report ok/expected/actual."""
+    return get_client().post("/artifacts/verify", {"version_id": version_id})
+
+
 def _build_wake_target(
     target: dict[str, Any] | None,
     events: list[str] | None,

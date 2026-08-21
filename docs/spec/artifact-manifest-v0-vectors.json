@@ -1,0 +1,77 @@
+{
+  "version": "0",
+  "description": "Golden conformance vectors for artifact manifest v0 (file-only preview). digest_sha256 = lowercase hex SHA-256 of the UTF-8 bytes of `canonical`. Produced by the reference implementation (src/vanth/artifacts/manifest.py) and hand-checked: hello-txt and empty-file use well-known content SHA-256 values.",
+  "canonicalization": {
+    "notes": [
+      "Reuses vanth.remote.protocol.canonical_json (RFC 8785): keys sort by UTF-16 code-unit order, minimal escapes, no whitespace.",
+      "manifest_digest = SHA256(UTF8(canonical))."
+    ]
+  },
+  "vectors": [
+    {
+      "id": "hello-txt",
+      "manifest": {
+        "manifest_version": 0,
+        "kind": "file",
+        "size_bytes": 12,
+        "sha256": "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447",
+        "name": "hello.txt"
+      },
+      "canonical": "{\"kind\":\"file\",\"manifest_version\":0,\"name\":\"hello.txt\",\"sha256\":\"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447\",\"size_bytes\":12}",
+      "digest_sha256": "7bfd9e7f718b18b9736eda465b8e91496afda607e9476cfb0ddeee89e71c9be3"
+    },
+    {
+      "id": "empty-file",
+      "manifest": {
+        "manifest_version": 0,
+        "kind": "file",
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "name": "empty.bin"
+      },
+      "canonical": "{\"kind\":\"file\",\"manifest_version\":0,\"name\":\"empty.bin\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"size_bytes\":0}",
+      "digest_sha256": "64a7434d956a720ce6c64299d7b4d4a18ed8ff0986ba4533fc7f6ee241e366aa"
+    },
+    {
+      "id": "escape-heavy-name",
+      "manifest": {
+        "manifest_version": 0,
+        "kind": "file",
+        "size_bytes": 3,
+        "sha256": "26a66b061e8f48f39927c312f25293959729eee95978e2892d49d3512a5cc092",
+        "name": "we\"ird\\name\u0001.bin"
+      },
+      "canonical": "{\"kind\":\"file\",\"manifest_version\":0,\"name\":\"we\\\"ird\\\\name\\u0001.bin\",\"sha256\":\"26a66b061e8f48f39927c312f25293959729eee95978e2892d49d3512a5cc092\",\"size_bytes\":3}",
+      "digest_sha256": "23368fd0e1165c0313a6cfd7527808e3456fdb961a95c7d0b545273a86fbe74c"
+    },
+    {
+      "id": "unicode-name",
+      "manifest": {
+        "manifest_version": 0,
+        "kind": "file",
+        "size_bytes": 22,
+        "sha256": "47629884f205c27c7c70128ca5d56573ba8b594f9996ec3303817ad20d1e7121",
+        "name": "café menu ☃.txt"
+      },
+      "canonical": "{\"kind\":\"file\",\"manifest_version\":0,\"name\":\"café menu ☃.txt\",\"sha256\":\"47629884f205c27c7c70128ca5d56573ba8b594f9996ec3303817ad20d1e7121\",\"size_bytes\":22}",
+      "digest_sha256": "db890517fa7dd0b1f6582f20580c6525d84f9feef62dff96750eedc90726e83d"
+    }
+  ],
+  "rejected_cases": [
+    {
+      "id": "wrong-kind",
+      "description": "validate_manifest rejects any kind other than 'file' in v0.",
+      "input": {"manifest_version": 0, "kind": "directory", "size_bytes": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "name": "x"}
+    },
+    {
+      "id": "wrong-version",
+      "description": "validate_manifest rejects manifest_version != 0 in this build.",
+      "input": {"manifest_version": 1, "kind": "file", "size_bytes": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "name": "x"}
+    },
+    {
+      "id": "bad-sha-format",
+      "description": "validate_manifest rejects sha256 that is not 64 lowercase hex chars.",
+      "input": {"manifest_version": 0, "kind": "file", "size_bytes": 0, "sha256": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855", "name": "x"}
+    }
+  ]
+}

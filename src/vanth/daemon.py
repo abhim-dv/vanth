@@ -57,6 +57,25 @@ def get_remote_control():
     return RemoteControl(get_remote_store())
 
 
+_artifacts_ops = None
+
+
+def get_artifacts():
+    """Open (once) the artifact catalog, blob store, and operations engine."""
+    global _artifacts_ops
+    with manager_lock:
+        if _artifacts_ops is None:
+            from .artifacts.catalog import open_catalog
+            from .artifacts.local_store import LocalBlobStore, default_store_root
+            from .artifacts.operations import ArtifactOperations
+
+            home = canonical_home()
+            catalog = open_catalog(home)
+            blobs = LocalBlobStore(default_store_root(home), catalog)
+            _artifacts_ops = ArtifactOperations(catalog, blobs)
+    return _artifacts_ops
+
+
 def _remote_epoch(remote_id: str):
     """Best-effort expected state epoch for a remote (None when not yet seen)."""
     from .remote.ssh import VanthRemoteError
@@ -445,6 +464,15 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().artifacts(parsed.path.split("/")[2], int(query.get("limit", ["50"])[0])))
             elif parsed.path.startswith("/artifacts/") and parsed.path.endswith("/content"):
                 ok(self, get_manager().artifact_read(parsed.path.split("/")[2], int(query.get("max_bytes", ["262144"])[0])))
+            elif parsed.path == "/artifacts/resolve":
+                ok(self, get_artifacts().resolve(
+                    query.get("name", [""])[0],
+                    alias=query.get("alias", [None])[0],
+                    version_id=query.get("version_id", [None])[0],
+                    idempotency_key=query.get("idempotency_key", [None])[0],
+                ))
+            elif parsed.path.startswith("/artifacts/info/"):
+                ok(self, get_artifacts().info(parsed.path.split("/")[2]))
             elif parsed.path == "/cleanup/preview":
                 ok(self, get_manager().cleanup_preview(int(query.get("older_than_seconds", ["0"])[0])))
             elif parsed.path == "/metrics/compare":
@@ -571,6 +599,27 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().add_wake_target(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
                 ok(self, get_manager().artifact_add(parsed.path.split("/")[2], **payload))
+            elif parsed.path == "/artifacts/put":
+                data = None
+                if payload.get("data_b64") is not None:
+                    import base64
+
+                    data = base64.b64decode(payload["data_b64"])
+                ok(self, get_artifacts().put_file(
+                    payload.get("name"),
+                    data=data,
+                    source_path=payload.get("path"),
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
+            elif parsed.path == "/artifacts/materialize":
+                ok(self, get_artifacts().materialize(
+                    payload["version_id"],
+                    payload["dest_path"],
+                    overwrite=bool(payload.get("overwrite", False)),
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
+            elif parsed.path == "/artifacts/verify":
+                ok(self, get_artifacts().verify(payload["version_id"], idempotency_key=payload.get("idempotency_key")))
             elif parsed.path == "/shutdown":
                 _stop_httpd()
                 ok(self, {"result": "shutting_down"})
