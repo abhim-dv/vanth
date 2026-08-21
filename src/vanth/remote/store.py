@@ -121,6 +121,7 @@ class RemoteStore:
         """Add columns introduced after the initial DDL to existing databases."""
         for table, column, definition in (
             ("remotes", "snapshot_cursor_json", "TEXT"),
+            ("remotes", "feed_cursor_json", "TEXT"),
             ("remote_shadows", "state_epoch", "INTEGER NOT NULL DEFAULT 1"),
             ("remote_shadows", "suppressed_at", "TEXT"),
             ("remote_shadows", "superseded_at", "TEXT"),
@@ -560,6 +561,31 @@ class RemoteStore:
             return None
         return json.loads(row["snapshot_cursor_json"])
 
+    def set_feed_cursor(self, remote_id: str, cursor: dict[str, Any] | None, *, commit: bool = True) -> None:
+        """Persist the controller's change-feed cursor for a remote (Phase 4)."""
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "UPDATE remotes SET feed_cursor_json=?, updated_at=? WHERE remote_id=?",
+                (json.dumps(cursor, separators=(",", ":")) if cursor is not None else None,
+                 now_iso(), remote_id),
+            )
+            if commit:
+                self.db.commit()
+        except BaseException:
+            if commit:
+                self.db.rollback()
+            raise
+
+    def get_feed_cursor(self, remote_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT feed_cursor_json FROM remotes WHERE remote_id=?", (remote_id,)
+        ).fetchone()
+        if not row or not row["feed_cursor_json"]:
+            return None
+        return json.loads(row["feed_cursor_json"])
+
     @staticmethod
     def _shadow_dict(row) -> dict[str, Any]:
         result = dict(row)
@@ -573,7 +599,17 @@ class RemoteOperationStore:
     def __init__(self, db) -> None:
         self.db = db
         self.db.executescript(REMOTE_OPERATION_DDL)
+        self._ensure_columns()
         self.db.commit()
+
+    def _ensure_columns(self) -> None:
+        """Add columns introduced after the initial DDL to existing databases."""
+        for table, column, definition in (
+            ("remote_state", "feed_epoch", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in existing:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def record_operation(
         self, *, idempotency_key: str, method: str, payload: dict[str, Any], digest: str,
@@ -725,13 +761,40 @@ class RemoteOperationStore:
         return int(row["state_epoch"]) if row else 1
 
     def set_state_epoch(self, epoch: int) -> None:
+        """Set the remote's state epoch (a database restore).
+
+        A restore bumps BOTH epochs: ``state_epoch`` becomes the new timeline
+        version and ``feed_epoch`` increments so controllers holding a feed
+        cursor from the previous timeline can never resume it against the new
+        one — they detect the mismatch and fall back to a full snapshot.
+        """
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            raise ValueError("epoch must be an integer >= 1")
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("UPDATE remote_state SET state_epoch=? WHERE id=1", (int(epoch),))
+            row = self.db.execute(
+                "SELECT state_epoch, feed_epoch FROM remote_state WHERE id=1"
+            ).fetchone()
+            current = int(row["state_epoch"]) if row else 1
+            feed_epoch = int(row["feed_epoch"]) if row and row["feed_epoch"] else 1
+            if int(epoch) != current:
+                feed_epoch += 1
+            self.db.execute(
+                "UPDATE remote_state SET state_epoch=?, feed_epoch=? WHERE id=1",
+                (int(epoch), feed_epoch),
+            )
             self.db.commit()
         except BaseException:
             self.db.rollback()
             raise
+
+    def get_feed_epoch(self) -> int:
+        """The remote's feed epoch (bumped on every restore alongside state_epoch)."""
+        try:
+            row = self.db.execute("SELECT feed_epoch FROM remote_state WHERE id=1").fetchone()
+            return int(row["feed_epoch"]) if row and row["feed_epoch"] else 1
+        except Exception:
+            return 1
 
     def get_remote_job_origin(self, remote_job_id: str) -> dict[str, Any] | None:
         row = self.db.execute(

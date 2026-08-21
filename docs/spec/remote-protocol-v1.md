@@ -257,6 +257,34 @@ result carries `"kind": "log_range"` plus:
 Request payload: `remote_job_id` (required), `stream`, `offset`, `size`
 (`size` capped at half the maximum frame size).
 
+### 4.7 `job.feed`
+
+One bounded batch of the remote's durable change-feed outbox (Phase 4). The
+remote records every controller-relevant change — job upserts and job
+tombstones — as append-only rows pinned to `(state_epoch, feed_epoch, seq)`.
+The response result carries `"kind": "feed"` plus:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| kind | string | `"feed"` |
+| state_epoch | integer | remote's current timeline version |
+| feed_epoch | integer | bumped on every restore (alongside `state_epoch`) |
+| cursor | object | `{state_epoch, feed_epoch, seq}` — pass back for the next batch |
+| changes | array | `{seq, kind, job_id, payload, created_at}` rows strictly after the cursor's seq within the current epochs |
+| has_more | boolean | true when more rows follow this batch |
+| oldest_seq | integer | oldest retained seq (gap detection) |
+| high_water_seq | integer | newest seq overall (cursor reset after recovery) |
+
+Request payload: `cursor` (optional object), `limit` (default 100, max 500),
+`wait_ms` (bounded long-poll, default 0, max 10000) — when no rows are
+available the remote polls up to that duration before returning an empty
+batch. Controllers advance their stored cursor only after transactionally
+applying a whole batch. A cursor whose epochs disagree with the response
+(remote database restore bumps both epochs), or that predates retained
+history (`seq + 1 < oldest_seq` once compaction lands), is gapped: the
+controller recovers through a Phase 3 full snapshot and resets its feed
+cursor to `high_water_seq`.
+
 ## 5. Error codes
 
 The full registry is `remote-errors-v1.json`. Codes used by this document:

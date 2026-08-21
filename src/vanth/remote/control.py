@@ -100,9 +100,11 @@ class DefaultSessionTransport:
 class RemoteControl:
     """Controller-side durable request execution against a paired remote."""
 
-    def __init__(self, store: RemoteStore, *, transport: Any | None = None, home: str | Path | None = None) -> None:
+    def __init__(self, store: RemoteStore, *, transport: Any | None = None, home: str | Path | None = None,
+                 journal: Any | None = None) -> None:
         self.store = store
         self.transport = transport or DefaultSessionTransport()
+        self.journal = journal
         if home is None:
             from ..paths import canonical_home
 
@@ -145,9 +147,29 @@ class RemoteControl:
         except BaseException:
             self.store.db.rollback()
             raise
+        if self.journal is not None:
+            try:
+                self.journal.record(request)
+            except Exception:
+                pass
         return request
 
     def run_request(self, remote_id: str, request: dict[str, Any], *, expected_state_epoch: int | None = None) -> dict[str, Any]:
+        """Run one request and journal the outcome when a journal is attached.
+
+        Terminal outcomes (``completed``/``failed``) resolve the journal
+        entry; a lost/``submitting`` request stays ``pending`` so the CLI can
+        list and retry it with the original key.
+        """
+        result = self._run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
+        if self.journal is not None and result.get("status") in ("completed", "failed"):
+            try:
+                self.journal.mark_resolved(request["request_id"])
+            except Exception:
+                pass
+        return result
+
+    def _run_request(self, remote_id: str, request: dict[str, Any], *, expected_state_epoch: int | None = None) -> dict[str, Any]:
         """Send one request over one SSH session and record the outcome.
 
         The request is durably transitioned ``creating -> submitting`` before
@@ -162,7 +184,16 @@ class RemoteControl:
         try:
             self.store.update_request_status(request["request_id"], "submitting")
         except ValueError:
-            return self.store.get_request_by_key(remote_id, request["idempotency_key"])
+            # Only a request that already LEFT ``submitting`` (accepted or
+            # terminal) short-circuits here; a lost/``submitting`` request may
+            # be re-driven by the Phase 4 retry path — the remote's operation
+            # idempotency still guarantees at most one acceptance per key.
+            row = self.store.db.execute(
+                "SELECT status FROM remote_requests WHERE request_id=?",
+                (request["request_id"],),
+            ).fetchone()
+            if not row or row["status"] != "submitting":
+                return self.store.get_request_by_key(remote_id, request["idempotency_key"])
         frame = self._build_request_frame(remote_id, request)
         try:
             session = self.transport.open_session(remote_row, home=self.home)
@@ -292,6 +323,133 @@ class RemoteControl:
             if not snapshot.get("has_more"):
                 break
         return totals
+
+    # ------------------------------------------------------------------
+    # Incremental change feed (Phase 4)
+    # ------------------------------------------------------------------
+
+    def feed_sync(self, remote_id: str, *, wait_ms: int = 0) -> dict[str, Any]:
+        """Apply one incremental change-feed batch transactionally.
+
+        Sends ``job.feed`` with the stored per-remote feed cursor and applies
+        each change (``job.upsert`` -> upsert_shadow at the change's epoch,
+        ``job.tombstone`` -> suppress_shadow) plus the cursor advance in ONE
+        local ``BEGIN IMMEDIATE`` — the cursor only advances if the whole
+        batch applied.
+
+        Cursor-gap recovery: when the batch's epochs disagree with the stored
+        cursor (a remote database restore bumps both), or the cursor predates
+        available history (``cursor.seq + 1 < oldest_seq`` once compaction
+        exists), falls back to :meth:`sync_snapshot`, then resets the feed
+        cursor to the remote's current high-water mark.
+
+        Returns ``{"mode": "feed"|"snapshot", ...}``.
+        """
+        cursor = self.store.get_feed_cursor(remote_id)
+        payload: dict[str, Any] = {}
+        if cursor is not None:
+            payload["cursor"] = cursor
+        if wait_ms:
+            payload["wait_ms"] = wait_ms
+        request = self.submit(
+            remote_id, "job.feed", payload,
+            idempotency_key="feed-" + secrets.token_hex(8),
+        )
+        if request["status"] == "creating":
+            request = self.run_request(remote_id, request)
+        if request.get("error"):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", str(request["error"]))
+        result = request.get("response") or {}
+        if result.get("kind") != "feed":
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "unexpected job.feed response")
+
+        if self._cursor_is_gapped(remote_id, cursor, result):
+            totals = self.sync_snapshot(remote_id)
+            new_cursor = {
+                "state_epoch": int(result.get("state_epoch") or 1),
+                "feed_epoch": int(result.get("feed_epoch") or 1),
+                "seq": int(result.get("high_water_seq") or 0),
+            }
+            self.store.set_feed_cursor(remote_id, new_cursor)
+            return {
+                "mode": "snapshot",
+                "snapshot": totals,
+                "cursor": new_cursor,
+                "state_epoch": new_cursor["state_epoch"],
+                "feed_epoch": new_cursor["feed_epoch"],
+            }
+
+        changes = result.get("changes") or []
+        epoch = int(result.get("state_epoch") or 1)
+        next_cursor = result.get("cursor") or {}
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            applied = suppressed = 0
+            for change in changes:
+                kind = change.get("kind")
+                job_id = str(change.get("job_id") or "")
+                feed_change = change.get("payload") or {}
+                if kind == "job.upsert":
+                    shadow = self.store.upsert_shadow(
+                        remote_id=remote_id,
+                        remote_job_id=job_id,
+                        status=str(feed_change.get("status") or "unknown"),
+                        payload=feed_change,
+                        state_epoch=epoch,
+                        commit=False,
+                    )
+                    if shadow is not None:
+                        applied += 1
+                elif kind == "job.tombstone":
+                    self.store.suppress_shadow(remote_id, job_id, commit=False)
+                    suppressed += 1
+            self.store.set_feed_cursor(remote_id, {
+                "state_epoch": epoch,
+                "feed_epoch": int(result.get("feed_epoch") or 1),
+                "seq": int(next_cursor.get("seq") or 0),
+            }, commit=False)
+            # Adopt a newer remote timeline in the same tx (mirrors apply_snapshot).
+            self.store.db.execute(
+                "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                (epoch, now_iso(), remote_id, epoch),
+            )
+            self.store.db.commit()
+        except BaseException:
+            self.store.db.rollback()
+            raise
+        return {
+            "mode": "feed",
+            "applied": applied,
+            "suppressed": suppressed,
+            "changes": len(changes),
+            "has_more": bool(result.get("has_more")),
+            "cursor": next_cursor,
+            "state_epoch": epoch,
+            "feed_epoch": int(result.get("feed_epoch") or 1),
+        }
+
+    @staticmethod
+    def _cursor_is_gapped(remote_id: str, cursor: dict[str, Any] | None,
+                          result: dict[str, Any]) -> bool:
+        """True when a stored cursor can no longer be resumed against the feed."""
+        if cursor is None:
+            return False
+        remote_state_epoch = result.get("state_epoch")
+        remote_feed_epoch = result.get("feed_epoch")
+        if remote_state_epoch is not None and int(cursor.get("state_epoch", -1)) != int(remote_state_epoch):
+            return True
+        if remote_feed_epoch is not None and int(cursor.get("feed_epoch", -1)) != int(remote_feed_epoch):
+            return True
+        oldest_seq = result.get("oldest_seq")
+        if oldest_seq is not None and int(cursor.get("seq") or 0) + 1 < int(oldest_seq):
+            return True
+        return False
+
+    def rotate_credentials(self, remote_id: str) -> None:
+        """Credential rotation is a stub until basic pairing is stable."""
+        raise VanthRemoteProtocolError(
+            "UNSUPPORTED_FEATURE", "credential rotation lands after basic pairing is stable"
+        )
 
     def log_range(self, remote_id: str, remote_job_id: str, *, stream: str = "stdout",
                   offset: int = 0, size: int = 65536) -> dict[str, Any]:

@@ -653,14 +653,76 @@ def cmd_diff(argv: list[str], home: Path, *, json_out: bool = False) -> int:
 def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     """`vanth remote <pair|list|doctor|remove>` — remote execution pairing."""
     if not argv or argv[0] in {"--help", "-h", "help"}:
-        print("usage: vanth remote <pair|list|doctor|remove> [options]\n"
+        print("usage: vanth remote <pair|list|doctor|remove|pending|retry> [options]\n"
               "  pair <target>   pair a remote host (user@host[:port]) [--name N] [--allow-root]\n"
               "  list            list paired remotes\n"
               "  doctor          report SSH binaries and remote state [--remote <id>]\n"
-              "  remove <id>     remove a remote [--yes]", file=sys.stderr)
+              "  remove <id>     remove a remote [--yes]\n"
+              "  pending         list unresolved client requests [--remote <id>]\n"
+              "  retry <req_id>  re-run an unresolved request with its original key", file=sys.stderr)
         return 2 if not argv else 0
     sub = argv[0]
     client = VanthClient(home=home)
+    if sub == "pending":
+        from .remote.journal import RequestJournal
+
+        remote_filter = None
+        if "--remote" in argv:
+            i = argv.index("--remote")
+            if i + 1 < len(argv):
+                remote_filter = argv[i + 1]
+        journal = RequestJournal(home / "client-requests.sqlite")
+        try:
+            rows = journal.pending(remote_filter)
+        finally:
+            journal.close()
+        if json_out:
+            print(json.dumps({"pending": rows}, indent=2, default=str))
+            return 0
+        if not rows:
+            print("vanth remote pending: no unresolved requests")
+            return 0
+        for row in rows:
+            print(f"  {row['request_id']}  {row['remote_id']}  {row['method']}  key={row['idempotency_key']}  since={row['created_at']}")
+        return 0
+    if sub == "retry":
+        from .remote.journal import RequestJournal
+
+        targets = [a for a in argv[1:] if not a.startswith("--")]
+        if not targets:
+            print("vanth remote retry: missing request_id", file=sys.stderr)
+            return 2
+        request_id = targets[0]
+        journal = RequestJournal(home / "client-requests.sqlite")
+        try:
+            entry = journal.get(request_id)
+        finally:
+            journal.close()
+        if not entry:
+            print(f"vanth remote retry: unknown request_id {request_id}", file=sys.stderr)
+            return 1
+        import sqlite3 as _sqlite3
+
+        from .remote.control import RemoteControl
+        from .remote.store import RemoteStore
+
+        db = _sqlite3.connect(home / "remote.sqlite")
+        db.row_factory = _sqlite3.Row
+        db.execute("PRAGMA busy_timeout=30000")
+        store = RemoteStore(db)
+        control = RemoteControl(store)
+        # Re-submit with the ORIGINAL method/payload/key: replay returns the
+        # same durable request (never a second job), then run it.
+        request = control.submit(
+            entry["remote_id"], entry["method"], entry["payload"] or {},
+            idempotency_key=entry["idempotency_key"],
+        )
+        result = control.run_request(entry["remote_id"], request)
+        if json_out:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(f"vanth remote retry: {request_id} status={result.get('status')}")
+        return 0 if result.get("status") in ("completed", "failed") else 1
     if sub == "pair":
         args = argv[1:]
         allow_root = "--allow-root" in args
@@ -950,7 +1012,7 @@ def _usage() -> str:
         "  artifacts      list a job's artifacts\n"
         "  prune          manually clean up terminal jobs (default dry-run)\n"
         "  restart        gracefully restart the daemon (jobs survive)\n"
-        "  remote         pair/list/doctor/remove remote execution hosts\n"
+        "  remote         pair/list/doctor/remove/pending/retry remote execution hosts\n"
         "  setup          register the MCP server in your clients' configs (one-shot)\n"
         "  autostart      enable/disable/status (daemon survives reboots)\n"
         "  version        print the installed package version\n"

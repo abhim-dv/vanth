@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .feed import FeedStore
 from .protocol import (
     VanthRemoteProtocolError,
     decode_frame,
@@ -72,6 +73,7 @@ class RemoteJobManager:
         self.store = store
         self.manager = manager
         self.home = home
+        self.feed = FeedStore(store.db)
         self.dispatcher_stop = threading.Event()
         self.dispatcher_thread: threading.Thread | None = None
         self.poll_interval = float(__import__("os").environ.get("VANTH_REMOTE_POLL_INTERVAL", "0.2"))
@@ -128,6 +130,8 @@ class RemoteJobManager:
             return self.handle_snapshot_request(frame, payload)
         if method == "job.log_range":
             return self.handle_log_range_request(frame, payload)
+        if method == "job.feed":
+            return self.handle_feed_request(frame, payload)
         return self._handle_mutation(frame, method, payload, idempotency_key, digest)
 
     def _handle_status(self, frame: dict[str, Any], payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
@@ -183,6 +187,11 @@ class RemoteJobManager:
                 "status": op["status"],
                 "replayed": True,
             })
+        # Outbox recording happens strictly AFTER the acceptance transaction
+        # commits: a crash between the two leaves the job discoverable via
+        # snapshot recovery, never a phantom feed row.
+        if job_id:
+            self._record_job_upsert(job_id)
         return self._response_frame(frame, {
             "op_id": op["op_id"],
             "job_id": job_id,
@@ -314,6 +323,8 @@ class RemoteJobManager:
                     logging.getLogger("vanth.remote").exception(
                         "operation terminal sync failed op=%s job=%s", row["op_id"], job_id
                     )
+                else:
+                    self._record_job_upsert(job_id)
 
     def mark_terminal_from_job(self, job_id: str, status: str) -> None:
         """Called by the remote daemon when a local runner records a terminal
@@ -329,6 +340,8 @@ class RemoteJobManager:
             import logging
 
             logging.getLogger("vanth.remote").exception("operation terminal sync failed op=%s job=%s", op_id, job_id)
+        else:
+            self._record_job_upsert(job_id)
 
     # ------------------------------------------------------------------
     # Unsupported (Phase 3/4) frames
@@ -394,6 +407,92 @@ class RemoteJobManager:
             "jobs": jobs,
             "events": events,
             "has_more": has_more,
+        })
+
+    # ------------------------------------------------------------------
+    # Change feed (Phase 4)
+    # ------------------------------------------------------------------
+
+    FEED_DEFAULT_LIMIT = 100
+    FEED_MAX_LIMIT = 500
+    FEED_MAX_WAIT_MS = 10000
+    FEED_POLL_INTERVAL = 0.025
+
+    def _record_job_upsert(self, job_id: str, status: str | None = None) -> None:
+        """Append a ``job.upsert`` outbox row with the minimal job row.
+
+        Best-effort: feed recording must never break dispatch or acceptance.
+        """
+        try:
+            payload: dict[str, Any] = {"job_id": job_id}
+            row = self.manager.db.execute(
+                "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                "FROM jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if row:
+                payload = dict(row)
+            elif status:
+                payload["status"] = status
+            self.feed.append("job.upsert", job_id=job_id, payload=payload)
+        except Exception:
+            import logging
+
+            logging.getLogger("vanth.remote").exception("feed append failed job=%s", job_id)
+
+    def handle_feed_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Serve one bounded batch of outbox changes after the caller's cursor.
+
+        Reads rows strictly after ``cursor.seq`` within the CURRENT
+        ``(state_epoch, feed_epoch)``; when no rows exist and ``wait_ms`` is
+        requested, long-polls up to that duration before returning an empty
+        batch. The result carries ``oldest_seq``/``high_water_seq`` so the
+        controller can detect cursor gaps and reset its cursor to the
+        high-water mark.
+        """
+        from .protocol import (
+            FEED_DEFAULT_LIMIT,
+            FEED_MAX_LIMIT,
+            FEED_MAX_WAIT_MS,
+        )
+
+        payload = payload if payload is not None else (frame.get("payload") or {})
+        limit = int(payload.get("limit") or FEED_DEFAULT_LIMIT)
+        if limit < 1:
+            return self._error_frame(frame, code="INVALID_REQUEST", message="limit must be >= 1")
+        limit = min(limit, FEED_MAX_LIMIT)
+        wait_ms = int(payload.get("wait_ms") or 0)
+        if wait_ms < 0:
+            return self._error_frame(frame, code="INVALID_REQUEST", message="wait_ms must be >= 0")
+        wait_ms = min(wait_ms, FEED_MAX_WAIT_MS)
+        cursor = payload.get("cursor")
+        if cursor is not None and not isinstance(cursor, dict):
+            return self._error_frame(frame, code="INVALID_REQUEST", message="cursor must be an object")
+
+        deadline = time.monotonic() + (wait_ms / 1000.0)
+        while True:
+            batch = self.feed.read(cursor, limit=limit)
+            if batch["changes"] or wait_ms <= 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(self.FEED_POLL_INTERVAL)
+
+        last_seq = int(cursor.get("seq") or 0) if isinstance(cursor, dict) else 0
+        for change in batch["changes"]:
+            last_seq = max(last_seq, change["seq"])
+        next_cursor = {
+            "state_epoch": batch["state_epoch"],
+            "feed_epoch": batch["feed_epoch"],
+            "seq": last_seq,
+        }
+        return self._response_frame(frame, {
+            "kind": "feed",
+            "state_epoch": batch["state_epoch"],
+            "feed_epoch": batch["feed_epoch"],
+            "cursor": next_cursor,
+            "changes": batch["changes"],
+            "has_more": batch["has_more"],
+            "oldest_seq": batch["oldest_seq"],
+            "high_water_seq": batch["high_water_seq"],
         })
 
     def handle_log_range_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:

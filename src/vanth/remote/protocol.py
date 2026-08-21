@@ -18,7 +18,7 @@ FRAME_KINDS = ("hello", "request", "response", "error", "snapshot", "log_range")
 
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
-VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range")
+VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed")
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
@@ -258,6 +258,11 @@ SNAPSHOT_ALLOWED = {"cursor"}
 LOG_RANGE_REQUIRED = {"remote_job_id"}
 LOG_RANGE_ALLOWED = {"remote_job_id", "stream", "offset", "size"}
 
+FEED_DEFAULT_LIMIT = 100
+FEED_MAX_LIMIT = 500
+FEED_MAX_WAIT_MS = 10000
+FEED_ALLOWED = {"cursor", "limit", "wait_ms"}
+
 VALID_LOG_STREAMS = {"stdout", "stderr"}
 
 START_ALLOWED = set(START_OPTIONAL_FIELDS)
@@ -397,6 +402,17 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         cursor = payload.get("cursor")
         if cursor is not None and not isinstance(cursor, dict):
             raise VanthRemoteProtocolError("INVALID_REQUEST", "cursor must be an object")
+    elif method == "job.feed":
+        _check_required_and_unknown(payload, set(), FEED_ALLOWED, "payload")
+        cursor = payload.get("cursor")
+        if cursor is not None and not isinstance(cursor, dict):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "cursor must be an object")
+        _check_numeric_field(payload, "limit", minimum=1)
+        if (payload.get("limit") or FEED_DEFAULT_LIMIT) > FEED_MAX_LIMIT:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", f"limit must be <= {FEED_MAX_LIMIT}")
+        _check_numeric_field(payload, "wait_ms", minimum=0)
+        if (payload.get("wait_ms") or 0) > FEED_MAX_WAIT_MS:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", f"wait_ms must be <= {FEED_MAX_WAIT_MS}")
     elif method == "job.log_range":
         _check_required_and_unknown(payload, LOG_RANGE_REQUIRED, LOG_RANGE_ALLOWED, "payload")
         _check_string_field(payload, "remote_job_id", required=True)

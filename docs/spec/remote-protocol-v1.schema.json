@@ -34,7 +34,7 @@
     },
     "method": {
       "type": "string",
-      "enum": ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range"]
+      "enum": ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed"]
     },
     "payload": {
       "type": "object",
@@ -119,6 +119,10 @@
             "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.snapshot" } } }
           },
           {
+            "if": { "properties": { "method": { "const": "job.feed" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.feed" } } }
+          },
+          {
             "if": { "properties": { "method": { "const": "job.log_range" } }, "required": ["method"] },
             "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.log_range" } } }
           }
@@ -192,6 +196,18 @@
       "additionalProperties": false,
       "properties": {
         "cursor": { "type": "object" }
+      }
+    },
+    "payload_job.feed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": "object",
+          "description": "{state_epoch, feed_epoch, seq} resume point."
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "wait_ms": { "type": "integer", "minimum": 0, "maximum": 10000 }
       }
     },
     "payload_job.log_range": {
