@@ -377,20 +377,10 @@ class JobManager:
                 if parents.get(parent) in TERMINAL_STATUSES and parents.get(parent) != status
             ]
             for job_id in to_launch:
-                row = self._row(
-                    "SELECT stdout_path, stderr_path, events_path FROM jobs WHERE job_id=?",
-                    (job_id,),
-                )
-                if not row:
+                launch = self.prepare_launch(job_id)
+                if launch is None:
                     continue
-                spec_path = self.specs_dir / f"{job_id}.json"
-                self._launch(
-                    job_id,
-                    Path(row["stdout_path"]),
-                    Path(row["stderr_path"]),
-                    Path(row["events_path"]),
-                    spec_path,
-                )
+                self._launch_prepared(launch)
             for job_id, parent, status in to_cancel:
                 with self.db_lock:
                     changed = self.db.execute(
@@ -941,22 +931,18 @@ class JobManager:
             None,
         )
         origin_thread_id = origin_thread_id or os.environ.get("CODEX_THREAD_ID")
-        spec_path = self.specs_dir / f"{job_id}.json"
-        spec_path.write_text(
-            json.dumps(
-                {
-                    "command": command,
-                    "cwd": cwd,
-                    "env": env or {},
-                    "timeout_seconds": timeout_seconds,
-                    "max_log_bytes": self.max_log_bytes,
-                    "stdout_path": str(stdout_path),
-                    "stderr_path": str(stderr_path),
-                    "interactive": interactive,
-                },
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
+        spec_path = self._write_spec(
+            job_id,
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env or {},
+                "timeout_seconds": timeout_seconds,
+                "max_log_bytes": self.max_log_bytes,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "interactive": interactive,
+            },
         )
         run_info = capture_run_metadata(cwd=cwd, notes=notes)
         run_payload = {**run_info, "interactive": interactive}
@@ -1021,6 +1007,19 @@ class JobManager:
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
             raise ValueError(f"Unknown trigger job_id: {job_id}")
         return {"job_id": job_id, "status": status}
+
+    def _write_spec(self, job_id: str, spec: dict[str, Any]) -> Path:
+        """Write a job's run spec JSON and return its path.
+
+        Shared by ``start`` and the remote dispatcher so both local and remote
+        launches reuse one serialization path.
+        """
+        path = self.specs_dir / f"{job_id}.json"
+        path.write_text(
+            json.dumps(spec, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        return path
 
     def _launch(
         self,
@@ -1087,6 +1086,56 @@ class JobManager:
             "events_path": str(events_path),
             "message": "Job started",
         }
+
+    def prepare_launch(self, job_id: str) -> dict[str, Any]:
+        """Prepare a job already inserted in a runnable state for launch.
+
+        Writes the spec JSON (command/cwd/env/timeout/etc. from the row) and
+        returns a launch dict. This is the shared explicit operation used by the
+        local dispatcher and the remote dispatcher so a remote launch never
+        calls ``JobManager.start`` directly. Returns ``None`` when the job is
+        unknown or not launchable.
+        """
+        self._ensure_open()
+        row = self._row(
+            "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json FROM jobs WHERE job_id=?",
+            (job_id,),
+        )
+        if not row:
+            return None
+        interactive = json.loads(row["run_json"] or "{}").get("interactive") is True
+        spec = {
+            "command": row["command"],
+            "cwd": row["cwd"],
+            "env": json.loads(row["env_json"] or "{}"),
+            "timeout_seconds": row["timeout_seconds"],
+            "max_log_bytes": self.max_log_bytes,
+            "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
+            "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
+            "interactive": interactive,
+        }
+        spec_path = self._write_spec(job_id, spec)
+        return {
+            "job_id": job_id,
+            "stdout_path": Path(spec["stdout_path"]),
+            "stderr_path": Path(spec["stderr_path"]),
+            "events_path": self.events_dir / f"{job_id}.jsonl",
+            "spec_path": spec_path,
+        }
+
+    def _launch_prepared(self, launch: dict[str, Any]) -> dict[str, Any]:
+        """Launch a job prepared by :meth:`prepare_launch` (wraps ``_launch``).
+
+        Shared by ``_fire_triggered_jobs`` and the remote dispatcher. Keeps the
+        existing ``_launch`` behavior byte-for-byte for local jobs.
+        """
+        return self._launch(
+            launch["job_id"],
+            launch["stdout_path"],
+            launch["stderr_path"],
+            launch["events_path"],
+            launch["spec_path"],
+        )
 
     async def rerun(self, job_id: str, **overrides: Any) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(
@@ -2541,6 +2590,8 @@ def job_start(
     notes: str | None = None,
     interactive: bool = False,
     trigger: dict[str, str] | None = None,
+    remote_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Start a background job.
 
@@ -2549,6 +2600,10 @@ def job_start(
     A reaches ``completed``. The new job is created ``queued`` and its runner
     starts automatically when the trigger fires (or it is ``cancelled`` if A
     ends in a different terminal status).
+
+    Pass ``remote_id`` to run the job on a paired remote host instead of the
+    local daemon. Remote mutations require ``idempotency_key`` (8..128 chars in
+    ``[A-Za-z0-9_-]``); when omitted the daemon mints one.
     """
     return get_client().post(
         "/jobs",
@@ -2565,6 +2620,8 @@ def job_start(
             "notes": notes,
             "interactive": interactive,
             "trigger": trigger,
+            "remote_id": remote_id,
+            "idempotency_key": idempotency_key,
         },
     )
 
@@ -2572,7 +2629,8 @@ def job_start(
 @mcp.tool()
 def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | None = None,
               timeout_seconds: int | None = None, name: str | None = None, tags: list[str] | None = None,
-              notes: str | None = None, cwd: str | None = None, interactive: bool | None = None) -> dict[str, Any]:
+              notes: str | None = None, cwd: str | None = None, interactive: bool | None = None,
+              remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
     payload = {key: value for key, value in {
         "command": command,
         "env": env,
@@ -2582,6 +2640,8 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
         "notes": notes,
         "cwd": cwd,
         "interactive": interactive,
+        "remote_id": remote_id,
+        "idempotency_key": idempotency_key,
     }.items() if value is not None}
     return get_client().post(f"/jobs/{job_id}/rerun", payload)
 
@@ -2592,8 +2652,8 @@ def job_status_batch(job_ids: list[str], limit: int = 500) -> dict[str, Any]:
 
 
 @mcp.tool()
-def job_status(job_id: str) -> dict[str, Any]:
-    return get_client().get(f"/jobs/{job_id}/status")
+def job_status(job_id: str, remote_id: str | None = None) -> dict[str, Any]:
+    return get_client().get(f"/jobs/{job_id}/status", {"remote_id": remote_id})
 
 
 @mcp.tool()
@@ -2653,6 +2713,7 @@ def job_wait(
     timeout_seconds: int = 3600,
     return_progress: bool = False,
     metric_ge: dict[str, float] | None = None,
+    remote_id: str | None = None,
 ) -> dict[str, Any]:
     """Wait until a matching event fires or a metric crosses a threshold.
 
@@ -2664,17 +2725,24 @@ def job_wait(
     with the threshold and current value. ``return_progress`` streams progress
     events instead of blocking. Returns ``{"result": "timeout"}`` when
     ``timeout_seconds`` elapses.
+
+    With ``remote_id`` the wait polls ``RemoteControl.status`` every 0.2s until
+    the remote reports a terminal status or the timeout elapses (a real
+    cross-machine event push arrives in Phase 4); ``since_event_id``,
+    ``return_progress`` and ``metric_ge`` are ignored in that mode.
     """
     return get_client().post(
         f"/jobs/{job_id}/wait",
         {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds,
-         "return_progress": return_progress, "metric_ge": metric_ge},
+         "return_progress": return_progress, "metric_ge": metric_ge, "remote_id": remote_id},
     )
 
 
 @mcp.tool()
-def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
-    return get_client().post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after_seconds})
+def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10,
+             remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+    return get_client().post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after_seconds,
+                                                       "remote_id": remote_id, "idempotency_key": idempotency_key})
 
 
 @mcp.tool()

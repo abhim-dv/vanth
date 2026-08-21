@@ -9,7 +9,7 @@ This document is the normative human-readable contract for the v1 remote
 protocol. The machine-checkable companions are:
 
 - `remote-protocol-v1.schema.json` — JSON Schema (draft 2020-12) covering every
-  frame kind and the three request methods.
+  frame kind and the request methods.
 - `remote-errors-v1.json` — the stable error registry (code → status, message).
 - `remote-ddl-v1.sql` — the controller and remote-side sqlite DDL.
 - `request-digest-vectors-v1.json` — golden canonicalization + digest vectors.
@@ -66,7 +66,7 @@ A mutation or action request from the controller to the remote.
 | **kind** | string | `"request"` |
 | request_id | string | controller request id (`req_…`) |
 | **idempotency_key** | string | `[A-Za-z0-9_-]{8,128}`, caller-supplied |
-| **method** | string | one of `job.start`, `job.stop`, `job.rerun` |
+| **method** | string | one of `job.start`, `job.stop`, `job.rerun`, `job.status` |
 | **payload** | object | method payload (see §4) |
 | **digest** | string | SHA-256 of the canonical request triple (see §3) |
 | sent_at | string | ISO-8601 UTC |
@@ -173,8 +173,8 @@ byte-for-byte.
 Every `request` frame carries a caller-supplied `idempotency_key` at the frame
 level (required; `[A-Za-z0-9_-]{8,128}`) — it is **not** part of the payload.
 The request digest covers the triple `{method, payload, idempotency_key}`.
-Field semantics reuse Vanth's local `JobManager.start` / `stop` / `rerun`
-(`src/vanth/server.py`).
+Field semantics reuse Vanth's local `JobManager.start` / `stop` / `rerun` /
+`status` (`src/vanth/server.py`).
 
 ### 4.1 `job.start`
 
@@ -208,6 +208,16 @@ No field other than those above is allowed.
 `job_id` is required. All other fields are optional overrides of the original
 run spec: `command`, `env`, `timeout_seconds` (`>= 1`), `name`, `tags`,
 `notes`, `cwd`, `interactive`.
+
+### 4.4 `job.status`
+
+A read of a remote job's current status.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| job_id | string | yes | remote job id to query |
+
+No field other than `job_id` is allowed.
 
 ## 5. Error codes
 

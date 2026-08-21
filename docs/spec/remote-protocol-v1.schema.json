@@ -34,7 +34,7 @@
     },
     "method": {
       "type": "string",
-      "enum": ["job.start", "job.stop", "job.rerun"]
+      "enum": ["job.start", "job.stop", "job.rerun", "job.status"]
     },
     "payload": {
       "type": "object",
@@ -109,6 +109,10 @@
           {
             "if": { "properties": { "method": { "const": "job.rerun" } }, "required": ["method"] },
             "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.rerun" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "job.status" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.status" } } }
           }
         ]
       }
@@ -166,6 +170,14 @@
     "idempotency_key": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]{8,128}$"
+    },
+    "payload_job.status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id"],
+      "properties": {
+        "job_id": { "type": "string" }
+      }
     },
     "payload_job.start": {
       "type": "object",

@@ -18,7 +18,7 @@ FRAME_KINDS = ("hello", "request", "response", "error", "snapshot", "log_range")
 
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
-VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun")
+VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun", "job.status")
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
@@ -253,6 +253,7 @@ START_OPTIONAL_FIELDS = {
 }
 STOP_OPTIONAL_FIELDS = {"signal", "kill_after_seconds"}
 RERUN_OPTIONAL_FIELDS = {"command", "env", "timeout_seconds", "name", "tags", "notes", "cwd", "interactive"}
+STATUS_ALLOWED = {"job_id"}
 
 START_ALLOWED = set(START_OPTIONAL_FIELDS)
 STOP_ALLOWED = {"job_id"} | STOP_OPTIONAL_FIELDS
@@ -383,6 +384,9 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         _check_numeric_field(payload, "timeout_seconds", minimum=1)
         _check_string_array_field(payload, "tags")
         _check_boolean_field(payload, "interactive")
+    elif method == "job.status":
+        _check_required_and_unknown(payload, {"job_id"}, STATUS_ALLOWED, "payload")
+        _check_string_field(payload, "job_id", required=True)
 
 
 def validate_frame(frame: dict[str, Any]) -> dict[str, Any]:

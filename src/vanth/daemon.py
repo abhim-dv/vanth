@@ -8,6 +8,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import secrets
 import signal
 import threading
 import time
@@ -18,7 +19,7 @@ from typing import Any
 
 from .client import auth_token_path, ensure_auth_token
 from .paths import canonical_home, secure_home_permissions
-from .server import JobManager
+from .server import TERMINAL_STATUSES, JobManager
 
 
 manager: JobManager | None = None
@@ -26,6 +27,8 @@ manager_lock = threading.Lock()
 shutdown_event = threading.Event()
 _httpd: "TrackingHTTPServer | None" = None
 _remote_store = None
+_remote_job_mgr = None
+_remote_job_mgr_lock = threading.Lock()
 DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -45,6 +48,120 @@ def get_remote_store():
             configure_connection(db)
             _remote_store = RemoteStore(db)
     return _remote_store
+
+
+def get_remote_control():
+    """Controller-side RemoteControl bound to the shared store (job routing)."""
+    from .remote.control import RemoteControl
+
+    return RemoteControl(get_remote_store())
+
+
+def _remote_epoch(remote_id: str):
+    """Best-effort expected state epoch for a remote (None when not yet seen)."""
+    from .remote.ssh import VanthRemoteError
+
+    try:
+        return get_remote_store().get_remote(remote_id).get("state_epoch")
+    except (ValueError, VanthRemoteError):
+        return None
+
+
+def _remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate a local job payload to a remote protocol payload."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if key in {
+            "command", "cwd", "name", "env", "timeout_seconds", "notify_on",
+            "wake_targets", "origin_thread_id", "tags", "notes", "interactive",
+            "trigger", "signal", "kill_after_seconds", "overrides",
+        }
+    }
+
+
+def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Route a remote mutation through RemoteControl with a caller-supplied key."""
+    control = get_remote_control()
+    key = payload.pop("idempotency_key", None)
+    if key is None:
+        key = "ctr-" + secrets.token_hex(16)[:12]
+    expected = _remote_epoch(remote_id)
+    if method == "job.start":
+        request = control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected)
+        if request["status"] != "creating":
+            return request
+        return control.run_request(remote_id, request, expected_state_epoch=expected)
+    if method == "job.stop":
+        return control.stop(
+            remote_id, payload["job_id"],
+            signal=payload.get("signal", "terminate"),
+            kill_after_seconds=payload.get("kill_after_seconds", 10),
+            idempotency_key=key, expected_state_epoch=expected,
+        )
+    if method == "job.rerun":
+        overrides = {k: v for k, v in payload.items() if k != "job_id"}
+        return control.rerun(remote_id, payload["job_id"], overrides, idempotency_key=key, expected_state_epoch=expected)
+    return control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected)
+
+
+def _remote_wait(remote_id: str, remote_job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Wait on a remote job by polling RemoteControl.status every 0.2s.
+
+    A real cross-machine event push is Phase 4; until then wait is a bounded
+    poll of the remote's ``job.status`` method. Returns when the remote reports
+    a terminal status or the timeout elapses.
+    """
+    timeout_seconds = float(payload.get("timeout_seconds", 3600))
+    filters = payload.get("filters") or ["completed", "failed", "timeout", "cancelled", "orphaned"]
+    deadline = time.monotonic() + timeout_seconds
+    control = get_remote_control()
+    while True:
+        try:
+            result = control.status(
+                remote_id, remote_job_id,
+                idempotency_key="wait-" + secrets.token_hex(16)[:12],
+                expected_state_epoch=_remote_epoch(remote_id),
+            )
+        except Exception:
+            result = {}
+        status = None
+        if isinstance(result, dict):
+            response = result.get("response") or {}
+            if isinstance(response, dict):
+                status = response.get("status")
+        if status and status in TERMINAL_STATUSES:
+            return {"result": "status", "job_id": remote_job_id, "status": status, "response": result}
+        if time.monotonic() >= deadline:
+            return {"result": "timeout", "job_id": remote_job_id, "status": status, "message": "No terminal status before timeout"}
+        time.sleep(min(0.2, deadline - time.monotonic()))
+
+
+def _remote_job_manager():
+    """Remote daemon-side RemoteJobManager singleton (POST /remote/helper).
+
+    On a real remote host the daemon's ``jobs.sqlite`` is its local job store;
+    the remote operation tables are created alongside it on the same connection
+    so the acceptance transaction (operation + queued job + origin mapping +
+    launch intent) commits atomically with the job row the dispatcher launches.
+    """
+    global _remote_job_mgr
+    with _remote_job_mgr_lock:
+        if _remote_job_mgr is None:
+            import sqlite3
+            from pathlib import Path
+
+            from .migrations import configure_connection
+            from .remote.remote import RemoteJobManager
+            from .remote.store import RemoteOperationStore
+
+            home = canonical_home()
+            db = sqlite3.connect(home / "jobs.sqlite", check_same_thread=False)
+            db.row_factory = sqlite3.Row
+            configure_connection(db)
+            _remote_job_mgr = RemoteJobManager(RemoteOperationStore(db), get_manager(), home=home)
+            _remote_job_mgr.start()
+    return _remote_job_mgr
 
 
 class RequestTooLarge(ValueError):
@@ -172,6 +289,9 @@ def _stop_httpd(*args: Any) -> None:
     shutdown_event.set()
     if manager is not None:
         manager.begin_shutdown()
+    global _remote_job_mgr
+    if _remote_job_mgr is not None:
+        _remote_job_mgr.stop()
     server = _httpd
     if server is not None:
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -267,7 +387,20 @@ class Handler(BaseHTTPRequestHandler):
                 job_ids = [jid for jid in ids.split(",") if jid] if ids else []
                 ok(self, get_manager().status_batch(job_ids, int(query.get("limit", ["500"])[0])))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/status"):
-                ok(self, get_manager().status(parsed.path.split("/")[2]))
+                remote_id = query.get("remote_id", [None])[0]
+                if remote_id:
+                    from .remote.ssh import VanthRemoteError
+
+                    try:
+                        ok(self, get_remote_control().status(
+                            remote_id, parsed.path.split("/")[2],
+                            idempotency_key="st-" + secrets.token_hex(16)[:12],
+                            expected_state_epoch=_remote_epoch(remote_id),
+                        ))
+                    except VanthRemoteError as exc:
+                        error(self, str(exc), 409)
+                else:
+                    ok(self, get_manager().status(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/events"):
                 ok(self, get_manager().events(parsed.path.split("/")[2], query.get("since_event_id", [None])[0],
                                               query.get("types") or None, int(query.get("limit", ["20"])[0]),
@@ -354,13 +487,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/jobs":
-                ok(self, asyncio.run(get_manager().start(**payload)))
+                remote_id = payload.pop("remote_id", None)
+                payload.pop("idempotency_key", None)
+                if remote_id:
+                    ok(self, _remote_submit(remote_id, "job.start", _remote_payload(payload)))
+                else:
+                    ok(self, asyncio.run(get_manager().start(**payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/rerun"):
-                ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2], **payload)))
+                remote_id = payload.pop("remote_id", None)
+                if remote_id:
+                    job_id = parsed.path.split("/")[2]
+                    ok(self, _remote_submit(remote_id, "job.rerun", {"job_id": job_id, **payload}))
+                else:
+                    ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2], **payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wait"):
-                ok(self, get_manager().wait_sync(parsed.path.split("/")[2], **payload))
+                remote_id = payload.pop("remote_id", None)
+                if remote_id:
+                    ok(self, _remote_wait(remote_id, parsed.path.split("/")[2], payload))
+                else:
+                    ok(self, get_manager().wait_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/stop"):
-                ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
+                remote_id = payload.pop("remote_id", None)
+                if remote_id:
+                    ok(self, _remote_submit(remote_id, "job.stop", {"job_id": parsed.path.split("/")[2], **payload}))
+                else:
+                    ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/send"):
                 ok(self, get_manager().send_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/mark"):
@@ -384,6 +535,21 @@ class Handler(BaseHTTPRequestHandler):
                 from .remote.pairing import remove_remote
 
                 ok(self, remove_remote(remote_id=payload.get("remote_id"), store=get_remote_store()))
+            elif parsed.path == "/remote/helper":
+                frame = payload.get("frame", payload)
+                remote = _remote_job_manager()
+                kind = frame.get("kind")
+                if kind == "request":
+                    response = remote.handle_request(frame)
+                elif kind == "snapshot":
+                    response = remote.handle_snapshot_request(frame)
+                elif kind == "log_range":
+                    response = remote.handle_log_range_request(frame)
+                else:
+                    from .remote.protocol import VanthRemoteProtocolError
+
+                    raise VanthRemoteProtocolError("PROTOCOL_UNKNOWN_KIND", f"unknown frame kind: {frame.get('kind')!r}")
+                ok(self, response)
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
                 ok(self, get_manager().metric_ingest(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wake"):

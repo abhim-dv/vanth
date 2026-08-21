@@ -172,6 +172,37 @@ class RemoteStore:
             raise ValueError(f"Unknown remote_id: {remote_id}")
         return row[0]
 
+    def check_state_epoch(self, remote_id: str, expected_epoch: int | None) -> None:
+        """Refuse to mutate through a stale state epoch.
+
+        ``expected_epoch`` is the remote's current ``state_epoch`` as reported
+        by its latest ``hello`` frame. When it is ``None`` (no handshake yet)
+        nothing is enforced; when it disagrees with the controller's stored
+        expectation the call raises ``VanthRemoteError`` so a restored or
+        rotated timeline can never be mutated through a stale snapshot.
+        """
+        if expected_epoch is None:
+            return
+        row = self.db.execute("SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown remote_id: {remote_id}")
+        if int(row["state_epoch"]) != expected_epoch:
+            from .ssh import VanthRemoteError
+
+            raise VanthRemoteError(
+                f"state_epoch mismatch: controller expects {row['state_epoch']}, remote reported {expected_epoch}"
+            )
+
+    def set_state_epoch(self, remote_id: str, state_epoch: int) -> dict[str, Any]:
+        if isinstance(state_epoch, bool) or not isinstance(state_epoch, int) or state_epoch < 1:
+            raise ValueError("state_epoch must be an integer >= 1")
+        self.db.execute(
+            "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=?",
+            (state_epoch, now_iso(), remote_id),
+        )
+        self.db.commit()
+        return self.get_remote(remote_id)
+
     @staticmethod
     def _remote_dict(row) -> dict[str, Any]:
         return dict(row)
@@ -188,10 +219,12 @@ class RemoteStore:
         method: str,
         payload: dict[str, Any],
         digest: str,
+        commit: bool = True,
     ) -> dict[str, Any]:
         if not self.db.execute("SELECT remote_id FROM remotes WHERE remote_id=?", (remote_id,)).fetchone():
             raise ValueError(f"Unknown remote_id: {remote_id}")
-        self.db.execute("BEGIN IMMEDIATE")
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
                 "SELECT * FROM remote_requests WHERE remote_id=? AND idempotency_key=?",
@@ -201,7 +234,8 @@ class RemoteStore:
                 if existing["digest"] != digest:
                     raise VanthRemoteProtocolError("PROTOCOL_REPLAY_MISMATCH")
                 result = self._request_dict(existing)
-                self.db.commit()
+                if commit:
+                    self.db.commit()
                 return result
             request_id = "req_" + secrets.token_hex(16)
             stamp = now_iso()
@@ -219,10 +253,12 @@ class RemoteStore:
             result = self._request_dict(self.db.execute(
                 "SELECT * FROM remote_requests WHERE request_id=?", (request_id,)
             ).fetchone())
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return result
         except BaseException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
 
     def get_request_by_key(self, remote_id: str, idempotency_key: str) -> dict[str, Any]:
@@ -234,10 +270,45 @@ class RemoteStore:
             raise ValueError(f"no request found for key {idempotency_key!r} on remote {remote_id!r}")
         return self._request_dict(row)
 
+    def record_submitting_shadow(self, remote_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Create the ``submitting`` shadow in the same transaction as the request.
+
+        Called inside the caller's ``BEGIN IMMEDIATE``; never commits. The
+        shadow's ``remote_job_id`` is not yet known, so it is keyed by the
+        request id. ``update_request_status`` (which commits) also persists the
+        final shadow once the remote returns a job id.
+        """
+        remote_job_id = request["request_id"]
+        payload = {
+            "request_id": request["request_id"],
+            "idempotency_key": request["idempotency_key"],
+            "method": request["method"],
+            "status": "submitting",
+        }
+        if not self.db.execute(
+            "SELECT shadow_id FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
+            (remote_id, remote_job_id),
+        ).fetchone():
+            stamp = now_iso()
+            self.db.execute(
+                """
+                INSERT INTO remote_shadows(shadow_id, remote_id, remote_job_id, status, payload_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("shd_" + secrets.token_hex(16), remote_id, remote_job_id, "submitting",
+                 json.dumps(payload, separators=(",", ":")), stamp, stamp),
+            )
+        return self._shadow_dict(self.db.execute(
+            "SELECT * FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
+            (remote_id, remote_job_id),
+        ).fetchone())
+
     def update_request_status(
-        self, request_id: str, status: str, *, response: dict[str, Any] | None = None, error: str | None = None
+        self, request_id: str, status: str, *, response: dict[str, Any] | None = None, error: str | None = None,
+        commit: bool = True
     ) -> dict[str, Any]:
-        self.db.execute("BEGIN IMMEDIATE")
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute(
                 "SELECT status FROM remote_requests WHERE request_id=?", (request_id,)
@@ -255,12 +326,14 @@ class RemoteStore:
                 """,
                 (status, response_json, error_json, now_iso(), request_id),
             )
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return self._request_dict(self.db.execute(
                 "SELECT * FROM remote_requests WHERE request_id=?", (request_id,)
             ).fetchone())
         except BaseException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
 
     @staticmethod
@@ -276,8 +349,10 @@ class RemoteStore:
     # Replay tombstones
     # ------------------------------------------------------------------
 
-    def record_replay_tombstone(self, remote_id: str, idempotency_key: str, digest: str) -> dict[str, Any]:
-        self.db.execute("BEGIN IMMEDIATE")
+    def record_replay_tombstone(self, remote_id: str, idempotency_key: str, digest: str,
+                                commit: bool = True) -> dict[str, Any]:
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
                 "SELECT * FROM remote_replay_tombstones WHERE remote_id=? AND idempotency_key=?",
@@ -285,7 +360,8 @@ class RemoteStore:
             ).fetchone()
             if existing:
                 result = self._tombstone_dict(existing)
-                self.db.commit()
+                if commit:
+                    self.db.commit()
                 return result
             tombstone_id = "tomb_" + secrets.token_hex(16)
             self.db.execute(
@@ -298,10 +374,12 @@ class RemoteStore:
             result = self._tombstone_dict(self.db.execute(
                 "SELECT * FROM remote_replay_tombstones WHERE tombstone_id=?", (tombstone_id,)
             ).fetchone())
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return result
         except BaseException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
 
     def get_replay_tombstone(self, remote_id: str, idempotency_key: str) -> dict[str, Any]:
@@ -328,8 +406,10 @@ class RemoteStore:
         remote_job_id: str,
         status: str,
         payload: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
-        self.db.execute("BEGIN IMMEDIATE")
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
                 "SELECT shadow_id FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
@@ -354,10 +434,12 @@ class RemoteStore:
                 "SELECT * FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
                 (remote_id, remote_job_id),
             ).fetchone())
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return result
         except BaseException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
 
     @staticmethod
@@ -376,9 +458,11 @@ class RemoteOperationStore:
         self.db.commit()
 
     def record_operation(
-        self, *, idempotency_key: str, method: str, payload: dict[str, Any], digest: str
+        self, *, idempotency_key: str, method: str, payload: dict[str, Any], digest: str,
+        commit: bool = True,
     ) -> dict[str, Any]:
-        self.db.execute("BEGIN IMMEDIATE")
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
                 "SELECT * FROM remote_operations WHERE idempotency_key=?", (idempotency_key,)
@@ -387,7 +471,8 @@ class RemoteOperationStore:
                 if existing["digest"] != digest:
                     raise VanthRemoteProtocolError("PROTOCOL_REPLAY_MISMATCH")
                 result = self._operation_dict(existing)
-                self.db.commit()
+                if commit:
+                    self.db.commit()
                 return result
             op_id = "op_" + secrets.token_hex(16)
             stamp = now_iso()
@@ -404,10 +489,12 @@ class RemoteOperationStore:
             result = self._operation_dict(self.db.execute(
                 "SELECT * FROM remote_operations WHERE op_id=?", (op_id,)
             ).fetchone())
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return result
         except BaseException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
 
     def get_operation(self, idempotency_key: str) -> dict[str, Any]:
@@ -419,9 +506,11 @@ class RemoteOperationStore:
         return self._operation_dict(row)
 
     def update_operation_status(
-        self, op_id: str, status: str, *, payload: dict[str, Any] | None = None
+        self, op_id: str, status: str, *, payload: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
-        self.db.execute("BEGIN IMMEDIATE")
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute(
                 "SELECT status FROM remote_operations WHERE op_id=?", (op_id,)
@@ -437,13 +526,45 @@ class RemoteOperationStore:
                 """,
                 (status, payload_json, now_iso(), op_id),
             )
-            self.db.commit()
+            if commit:
+                self.db.commit()
             return self._operation_dict(self.db.execute(
                 "SELECT * FROM remote_operations WHERE op_id=?", (op_id,)
             ).fetchone())
         except BaseException:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise
+
+    def record_queued_job(self, *, op_id: str, remote_job_id: str, origin: str) -> None:
+        """Persist the job-origin mapping that keeps a remote job recoverable.
+
+        Runs inside the caller's ``BEGIN IMMEDIATE`` (the acceptance
+        transaction); never commits. The mapping maps an operation's ``op_id``
+        to the ``job_`` row the remote daemon inserted plus a durable launch
+        intent (status ``queued``). It is a separate table from the local
+        ``jobs`` table so remote machinery never feeds local PID/heartbeat/
+        cleanup code.
+        """
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS remote_job_origins (
+              op_id TEXT PRIMARY KEY,
+              remote_job_id TEXT NOT NULL,
+              origin TEXT NOT NULL,
+              launch_intent TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(remote_job_id)
+            )
+            """,
+        )
+        self.db.execute(
+            """
+            INSERT OR REPLACE INTO remote_job_origins(op_id, remote_job_id, origin, launch_intent, created_at)
+            VALUES (?, ?, ?, 'queued', ?)
+            """,
+            (op_id, remote_job_id, origin, now_iso()),
+        )
 
     def record_replay_tombstone(self, idempotency_key: str, digest: str) -> dict[str, Any]:
         self.db.execute("BEGIN IMMEDIATE")
@@ -479,6 +600,24 @@ class RemoteOperationStore:
         if not row:
             raise ValueError(f"no replay tombstone for key {idempotency_key!r}")
         return self._tombstone_dict(row)
+
+    def get_remote_job_origin(self, remote_job_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM remote_job_origins WHERE remote_job_id=?", (remote_job_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_remote_job_origin_op(self, op_id: str) -> str | None:
+        row = self.db.execute(
+            "SELECT remote_job_id FROM remote_job_origins WHERE op_id=?", (op_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_remote_operation_by_job(self, remote_job_id: str) -> str | None:
+        row = self.db.execute(
+            "SELECT op_id FROM remote_job_origins WHERE remote_job_id=?", (remote_job_id,)
+        ).fetchone()
+        return row[0] if row else None
 
     @staticmethod
     def _operation_dict(row) -> dict[str, Any]:

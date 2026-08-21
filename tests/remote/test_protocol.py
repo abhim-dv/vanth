@@ -252,6 +252,29 @@ def test_valid_stop_default_signal():
     assert validate_frame(frame) == frame
 
 
+def test_job_status_is_a_valid_method():
+    payload = {"job_id": "job_x"}
+    frame = {
+        "version": "1", "kind": "request", "idempotency_key": "key-1234-abcd",
+        "method": "job.status", "payload": payload,
+        "digest": request_digest("job.status", payload, "key-1234-abcd"),
+        "sent_at": "2026-08-20T12:00:00Z",
+    }
+    assert validate_frame(frame) == frame
+
+
+def test_job_status_requires_job_id():
+    frame = {
+        "version": "1", "kind": "request", "idempotency_key": "key-1234-abcd",
+        "method": "job.status", "payload": {},
+        "digest": request_digest("job.status", {}, "key-1234-abcd"),
+        "sent_at": "2026-08-20T12:00:00Z",
+    }
+    with pytest.raises(VanthRemoteProtocolError) as exc:
+        validate_frame(frame)
+    assert exc.value.code == "INVALID_REQUEST"
+
+
 def test_canonical_json_golden_vectors():
     data = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))
     for vector in data["vectors"]:

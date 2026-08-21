@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 EXPECTED_KINDS = ["hello", "request", "response", "error", "snapshot", "log_range"]
-EXPECTED_METHODS = ["job.start", "job.stop", "job.rerun"]
+EXPECTED_METHODS = ["job.start", "job.stop", "job.rerun", "job.status"]
 EXPECTED_CODES = [
     "PROTOCOL_MALFORMED",
     "PROTOCOL_OVERSIZED",
