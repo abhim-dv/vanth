@@ -2980,6 +2980,23 @@ def artifact_storage_profile_probe(profile_id: str) -> dict[str, Any]:
     return get_client().post(f"/artifacts/storage-profiles/{profile_id}/probe", {})
 
 
+@mcp.tool()
+def artifact_push_remote(remote_id: str, version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Publish a local managed artifact version to a paired remote (chunked, resumable; no credentials cross the wire)."""
+    return get_client().post("/artifacts/push-remote",
+                             {"remote_id": remote_id, "version_id": version_id,
+                              "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def artifact_pull_remote(remote_id: str, version_id: str, dest_path: str,
+                         idempotency_key: str | None = None) -> dict[str, Any]:
+    """Materialize a remote artifact version onto this machine via the controller broker (chunked, resumable)."""
+    return get_client().post("/artifacts/pull-remote",
+                             {"remote_id": remote_id, "version_id": version_id,
+                              "dest_path": dest_path, "idempotency_key": idempotency_key})
+
+
 def _build_wake_target(
     target: dict[str, Any] | None,
     events: list[str] | None,

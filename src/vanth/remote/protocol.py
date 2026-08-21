@@ -18,7 +18,19 @@ FRAME_KINDS = ("hello", "request", "response", "error", "snapshot", "log_range")
 
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
-VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed")
+VALID_REQUEST_METHODS = (
+    "job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed",
+    "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete",
+)
+
+TRANSFER_DIRECTIONS = {"pull", "push"}
+
+TRANSFER_INIT_ALLOWED = {
+    "transfer_id", "direction", "root_name", "manifest_digest", "total_bytes",
+    "sha256", "version_id",
+}
+BLOB_CHUNK_ALLOWED = {"transfer_id", "offset", "data_b64", "sha256", "size"}
+TRANSFER_COMPLETE_ALLOWED = {"transfer_id", "sha256"}
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
@@ -358,6 +370,17 @@ def _check_boolean_field(payload: dict[str, Any], key: str) -> None:
         raise VanthRemoteProtocolError("INVALID_REQUEST", f"{key} must be a boolean")
 
 
+def _check_hex64_field(payload: dict[str, Any], key: str, *, required: bool = False) -> None:
+    """A 64-char lowercase hex digest field (sha256 / manifest_digest)."""
+    value = payload.get(key)
+    if value is None:
+        if required:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", f"{key} is required")
+        return
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise VanthRemoteProtocolError("INVALID_REQUEST", f"{key} must be a 64-char lowercase hex string")
+
+
 def validate_request(method: str, payload: dict[str, Any]) -> None:
     """Validate an already-decoded request's method and payload."""
     if method not in VALID_REQUEST_METHODS:
@@ -429,6 +452,39 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         size = payload.get("size")
         if size is not None and size > DEFAULT_MAX_FRAME_BYTES // 2:
             raise VanthRemoteProtocolError("INVALID_REQUEST", f"size must be <= {DEFAULT_MAX_FRAME_BYTES // 2}")
+    elif method == "artifact.transfer_init":
+        # Register/resume a durable bulk transfer on the remote side. For
+        # "push" the controller already knows the content identity, so the
+        # digest/size/sha fields are required up front; for "pull" they are
+        # advisory placeholders — the authoritative values come from the
+        # remote's own version row and are returned in the init response.
+        direction = payload.get("direction")
+        push_required = {"transfer_id", "direction", "root_name", "manifest_digest", "total_bytes", "sha256"}
+        pull_required = {"transfer_id", "direction"}
+        if isinstance(direction, str) and direction == "pull":
+            required = pull_required
+        else:
+            required = push_required
+        _check_required_and_unknown(payload, required, TRANSFER_INIT_ALLOWED, "payload")
+        for field in ("transfer_id", "root_name", "manifest_digest"):
+            _check_string_field(payload, field)
+        _check_string_field(payload, "version_id")
+        _check_numeric_field(payload, "total_bytes", minimum=0)
+        _check_hex64_field(payload, "sha256")
+    elif method == "artifact.blob_chunk":
+        # One chunk at a byte offset. Push chunks carry data_b64+sha256; pull
+        # chunk REQUESTS omit them and carry a size instead (the response
+        # carries the requested bytes).
+        _check_required_and_unknown(payload, {"transfer_id", "offset"}, BLOB_CHUNK_ALLOWED, "payload")
+        _check_string_field(payload, "transfer_id")
+        _check_numeric_field(payload, "offset", minimum=0)
+        _check_string_field(payload, "data_b64")
+        _check_hex64_field(payload, "sha256")
+        _check_numeric_field(payload, "size", minimum=0)
+    elif method == "artifact.transfer_complete":
+        _check_required_and_unknown(payload, TRANSFER_COMPLETE_ALLOWED, TRANSFER_COMPLETE_ALLOWED, "payload")
+        _check_string_field(payload, "transfer_id")
+        _check_hex64_field(payload, "sha256")
 
 
 def validate_frame(frame: dict[str, Any]) -> dict[str, Any]:

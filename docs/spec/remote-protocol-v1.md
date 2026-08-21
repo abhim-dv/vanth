@@ -285,6 +285,78 @@ history (`seq + 1 < oldest_seq` once compaction lands), is gapped: the
 controller recovers through a Phase 3 full snapshot and resets its feed
 cursor to `high_water_seq`.
 
+### 4.8 `artifact.transfer_init`
+
+Registers — or resumes — a durable bulk artifact transfer on the remote
+(Phase 9). Transfers live in the `remote_transfers` table on the remote
+database; chunks are acknowledged with strict offset continuity and per-chunk
+checksums, and nothing is published until `artifact.transfer_complete`.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| transfer_id | string | yes | controller-minted transfer identity |
+| direction | string | yes | `"push"` (controller → remote) or `"pull"` (remote → controller) |
+| root_name | string | push: yes | root the content is published under |
+| manifest_digest | string | push: yes | manifest digest of the pushed version |
+| total_bytes | integer | push: yes | exact byte count (`>= 0`) |
+| sha256 | string | push: yes | whole-content SHA-256 (64-char lowercase hex) |
+| version_id | string | pull only | the remote version to serve |
+
+For `pull`, the four content fields are advisory placeholders: the remote's
+own catalog is authoritative and the init response returns the resolved
+values. The response result carries `{transfer_id, direction, root_name,
+manifest_digest, total_bytes, sha256, acked_offset, resumed, state_epoch}`.
+Re-registering the same `transfer_id` with a different content identity is
+rejected with `PROTOCOL_REPLAY_MISMATCH`; re-registering with the same
+identity resumes at the stored `acked_offset`.
+
+### 4.9 `artifact.blob_chunk`
+
+One chunk at a strict byte offset.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| transfer_id | string | yes | registered transfer |
+| offset | integer | yes | must equal the remote's `acked_offset` exactly |
+| data_b64 | string | push: yes | base64 chunk bytes |
+| sha256 | string | push: yes | SHA-256 of the decoded chunk bytes |
+| size | integer | pull requests | requested window size (`> 0`) |
+
+Push handling: the remote verifies `offset == acked_offset`, decodes base64,
+verifies the chunk checksum, seeks+writes into its staging file at exactly
+that offset, fsyncs, and advances `acked_offset` in one transaction before
+responding `{transfer_id, acked_offset, state_epoch}`. A chunk whose offset
+disagrees with the acknowledgement point is rejected with an error frame whose
+message carries `expected_offset=<n>` so the controller can resume from the
+acknowledged point without resending acked bytes. A chunk that would overflow
+`total_bytes` is rejected.
+
+Pull handling: the request omits `data_b64`/`sha256` and carries `size`; the
+response serves the requested window as
+`{offset, size, data_b64, sha256, acked_offset, state_epoch}`.
+
+Every transfer response also reports the remote's current `state_epoch`. If
+it changed since registration the transfer stops rather than rebinding:
+further chunks are refused until a new epoch-consistent transfer exists.
+
+### 4.10 `artifact.transfer_complete`
+
+Finalizes a transfer once both sides agree on the whole content.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| transfer_id | string | yes | registered transfer |
+| sha256 | string | yes | expected whole-content SHA-256 |
+
+The remote hashes what IT received/staged, refuses unless the staged byte
+count equals `total_bytes` AND both digests match, then:
+
+- push: publishes through the standard fenced durable operation
+  (`put_file`) under an idempotency key derived from the `transfer_id`,
+  returning `{version_id}` — replays collapse onto the same immutable
+  version, so a duplicated completion can never publish twice;
+- pull: verifies source stability and returns the existing `{version_id}`.
+
 ## 5. Error codes
 
 The full registry is `remote-errors-v1.json`. Codes used by this document:

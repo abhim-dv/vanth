@@ -46,6 +46,7 @@ from .protocol import (
     validate_request,
 )
 from .store import RemoteOperationStore
+from .transfer import TransferRegistry, _TRANSFER_METHODS
 from ..server import TERMINAL_STATUSES, now_iso
 
 
@@ -74,10 +75,32 @@ class RemoteJobManager:
         self.manager = manager
         self.home = home
         self.feed = FeedStore(store.db)
+        self.transfers = TransferRegistry(
+            store.db,
+            epoch_fn=self._remote_state_epoch,
+            ops_factory=self._remote_artifact_ops,
+            staging_dir=(Path(home) / "remote-transfers") if home else None,
+        )
         self.dispatcher_stop = threading.Event()
         self.dispatcher_thread: threading.Thread | None = None
         self.poll_interval = float(__import__("os").environ.get("VANTH_REMOTE_POLL_INTERVAL", "0.2"))
         self._shutdown = False
+
+    def _remote_artifact_ops(self) -> Any:
+        """The remote host's own ArtifactOperations (Phase 9 publication)."""
+        from ..artifacts.catalog import open_catalog
+        from ..artifacts.local_store import LocalBlobStore, default_store_root
+        from ..artifacts.operations import ArtifactOperations
+
+        if not self.home:
+            from ..paths import canonical_home
+
+            home = canonical_home()
+        else:
+            home = Path(self.home)
+        catalog = open_catalog(home)
+        blobs = LocalBlobStore(default_store_root(home), catalog)
+        return ArtifactOperations(catalog, blobs)
 
     def start(self) -> "RemoteJobManager":
         self.dispatcher_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
@@ -126,6 +149,8 @@ class RemoteJobManager:
         validate_request(method, payload)
         if method == "job.status":
             return self._handle_status(frame, payload, idempotency_key)
+        if method in _TRANSFER_METHODS:
+            return self._handle_transfer_frame(frame, method, payload)
         if method == "job.snapshot":
             return self.handle_snapshot_request(frame, payload)
         if method == "job.log_range":
@@ -133,6 +158,21 @@ class RemoteJobManager:
         if method == "job.feed":
             return self.handle_feed_request(frame, payload)
         return self._handle_mutation(frame, method, payload, idempotency_key, digest)
+
+    def _handle_transfer_frame(self, frame: dict[str, Any], method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Route artifact transfer frames to the Phase 9 TransferRegistry."""
+        try:
+            if method == "artifact.transfer_init":
+                result = self.transfers.init(payload)
+            elif method == "artifact.blob_chunk":
+                result = self.transfers.chunk(payload)
+            else:
+                result = self.transfers.complete(payload)
+        except VanthRemoteProtocolError as exc:
+            return self._error_frame(frame, code=exc.code, message=str(exc))
+        except Exception as exc:
+            return self._error_frame(frame, code="INVALID_REQUEST", message=str(exc))
+        return self._response_frame(frame, result)
 
     def _handle_status(self, frame: dict[str, Any], payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
         job_id = payload["job_id"]

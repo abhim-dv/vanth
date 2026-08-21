@@ -119,6 +119,26 @@ def get_artifact_storage_profiles():
     return _artifact_storage_profiles
 
 
+_artifact_broker = None
+
+
+def get_artifact_broker():
+    """Open (once) the Phase 9 remote artifact transfer broker.
+
+    Combines the controller-side RemoteControl (bulk session seam) with the
+    local ArtifactOperations (source versions + resume ledger). The transfer
+    path never touches storage-profile credentials: only content identifiers
+    and base64 bytes cross the wire.
+    """
+    global _artifact_broker
+    with manager_lock:
+        if _artifact_broker is None:
+            from .remote.transfer import RemoteArtifactBroker
+
+            _artifact_broker = RemoteArtifactBroker(get_remote_control(), get_artifacts())
+    return _artifact_broker
+
+
 def _remote_epoch(remote_id: str):
     """Best-effort expected state epoch for a remote (None when not yet seen)."""
     from .remote.ssh import VanthRemoteError
@@ -730,6 +750,16 @@ class Handler(BaseHTTPRequestHandler):
                     payload.get("kind", "s3"), payload.get("config")))
             elif parsed.path.startswith("/artifacts/storage-profiles/") and parsed.path.endswith("/probe"):
                 ok(self, get_artifact_storage_profiles().probe(parsed.path.split("/")[2]))
+            elif parsed.path == "/artifacts/push-remote":
+                ok(self, get_artifact_broker().push_blob(
+                    payload["remote_id"], payload["version_id"],
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
+            elif parsed.path == "/artifacts/pull-remote":
+                ok(self, get_artifact_broker().pull_blob(
+                    payload["remote_id"], payload["version_id"], payload["dest_path"],
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
             elif parsed.path == "/shutdown":
                 _stop_httpd()
                 ok(self, {"result": "shutting_down"})

@@ -34,7 +34,8 @@
     },
     "method": {
       "type": "string",
-      "enum": ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed"]
+      "enum": ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed",
+               "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete"]
     },
     "payload": {
       "type": "object",
@@ -125,6 +126,18 @@
           {
             "if": { "properties": { "method": { "const": "job.log_range" } }, "required": ["method"] },
             "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.log_range" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "artifact.transfer_init" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_artifact.transfer_init" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "artifact.blob_chunk" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_artifact.blob_chunk" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "artifact.transfer_complete" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_artifact.transfer_complete" } } }
           }
         ]
       }
@@ -270,6 +283,41 @@
         "tags": { "type": "array", "items": { "type": "string" } },
         "notes": { "type": "string" },
         "interactive": { "type": "boolean" }
+      }
+    },
+    "payload_artifact.transfer_init": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transfer_id", "direction"],
+      "properties": {
+        "transfer_id": { "type": "string", "minLength": 1 },
+        "direction": { "type": "string", "enum": ["push", "pull"] },
+        "root_name": { "type": "string" },
+        "manifest_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "version_id": { "type": "string" }
+      }
+    },
+    "payload_artifact.blob_chunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transfer_id", "offset"],
+      "properties": {
+        "transfer_id": { "type": "string", "minLength": 1 },
+        "offset": { "type": "integer", "minimum": 0 },
+        "data_b64": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "payload_artifact.transfer_complete": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transfer_id", "sha256"],
+      "properties": {
+        "transfer_id": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
     }
   }
