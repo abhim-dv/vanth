@@ -76,6 +76,35 @@ def get_artifacts():
     return _artifacts_ops
 
 
+_artifact_collections = None
+
+
+def get_artifact_collections():
+    """Open (once) the Phase 7 collections/aliases/lineage engine."""
+    global _artifact_collections
+    with manager_lock:
+        if _artifact_collections is None:
+            from .artifacts.collections import Collections
+
+            _artifact_collections = Collections(get_artifacts().catalog, get_artifacts())
+    return _artifact_collections
+
+
+_artifact_lifecycle = None
+
+
+def get_artifact_lifecycle():
+    """Open (once) the Phase 7 lifecycle engine (delete/pin/GC/backup-restore)."""
+    global _artifact_lifecycle
+    with manager_lock:
+        if _artifact_lifecycle is None:
+            from .artifacts.lifecycle import Lifecycle
+
+            ops = get_artifacts()
+            _artifact_lifecycle = Lifecycle(ops.catalog, ops)
+    return _artifact_lifecycle
+
+
 def _remote_epoch(remote_id: str):
     """Best-effort expected state epoch for a remote (None when not yet seen)."""
     from .remote.ssh import VanthRemoteError
@@ -473,6 +502,10 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             elif parsed.path.startswith("/artifacts/info/"):
                 ok(self, get_artifacts().info(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/artifacts/collections/"):
+                ok(self, get_artifact_collections().get_collection(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/artifacts/lineage/"):
+                ok(self, {"version_id": parsed.path.split("/")[2], "lineage": get_artifact_collections().lineage_for(parsed.path.split("/")[2])})
             elif parsed.path == "/cleanup/preview":
                 ok(self, get_manager().cleanup_preview(int(query.get("older_than_seconds", ["0"])[0])))
             elif parsed.path == "/metrics/compare":
@@ -626,6 +659,56 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             elif parsed.path == "/artifacts/verify":
                 ok(self, get_artifacts().verify(payload["version_id"], idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/collections":
+                ok(self, get_artifact_collections().create_collection(
+                    payload.get("name"), idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/collections/append":
+                ok(self, get_artifact_collections().append_version(
+                    payload.get("collection") or payload.get("name"),
+                    payload.get("version_id"),
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
+            elif parsed.path == "/artifacts/alias-set":
+                ok(self, get_artifact_collections().alias_set(
+                    payload.get("alias_name"),
+                    payload.get("root_id"),
+                    payload.get("expected_version_id"),
+                    payload.get("new_version_id"),
+                    idempotency_key=payload.get("idempotency_key"),
+                    updated_by=payload.get("updated_by"),
+                ))
+            elif parsed.path == "/artifacts/lineage":
+                ok(self, get_artifact_collections().link_lineage(
+                    payload.get("producer_kind"),
+                    payload.get("producer_id"),
+                    payload.get("consumer_kind"),
+                    payload.get("consumer_id"),
+                    payload.get("version_id"),
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
+            elif parsed.path == "/artifacts/delete-request":
+                ok(self, get_artifact_lifecycle().request_delete(
+                    payload.get("version_id"), idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/restore-version":
+                ok(self, get_artifact_lifecycle().restore(
+                    payload.get("version_id"), idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/pin":
+                ok(self, get_artifact_lifecycle().pin(
+                    payload.get("version_id"), payload.get("hold_reason"),
+                    idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/unpin":
+                ok(self, get_artifact_lifecycle().unpin(
+                    payload.get("version_id"), idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/gc":
+                ok(self, get_artifact_lifecycle().gc(
+                    dry_run=bool(payload.get("dry_run", True)),
+                    idempotency_key=payload.get("idempotency_key")))
+            elif parsed.path == "/artifacts/backup":
+                ok(self, {"backup_path": str(get_artifact_lifecycle().backup())})
+            elif parsed.path == "/artifacts/begin-restore":
+                ok(self, get_artifact_lifecycle().begin_restore(payload.get("backup_path")))
+            elif parsed.path == "/artifacts/complete-restore":
+                ok(self, get_artifact_lifecycle().complete_restore())
             elif parsed.path == "/shutdown":
                 _stop_httpd()
                 ok(self, {"result": "shutting_down"})

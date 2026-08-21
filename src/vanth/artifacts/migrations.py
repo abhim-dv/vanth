@@ -4,6 +4,19 @@ Mirrors :mod:`vanth.migrations`: a single ``PRAGMA user_version`` counter, a
 backup before any upgrade, and a transactional v0 -> latest path. Connection
 tuning is reused verbatim from ``vanth.migrations.configure_connection`` so
 both databases share WAL, foreign keys, and the busy timeout.
+
+Schema v2 (Phase 7) adds:
+
+- ``collections`` / ``collection_versions``: named collections with
+  monotonic, append-only, immutable version membership.
+- ``aliases.pinned_at`` / ``aliases.updated_by``: alias CAS provenance.
+- ``lineage``: producer/consumer links ('job' | 'remote_job' | 'version' |
+  'alias') to resolved immutable versions.
+- ``versions.deleted_at`` / ``delete_requested_at`` / ``pin_hold``:
+  lifecycle columns (logical delete + pin/hold) used by GC.
+- ``catalog_state``: small key/value table holding the
+  ``recovery_required`` marker that locks a restored catalog out of
+  mutations until recovery completes.
 """
 
 from __future__ import annotations
@@ -21,7 +34,7 @@ __all__ = [
     "migrate_artifacts",
 ]
 
-ARTIFACTS_LATEST_SCHEMA_VERSION = 1
+ARTIFACTS_LATEST_SCHEMA_VERSION = 2
 
 
 def _backup_before_migration(db: sqlite3.Connection, home: Path) -> Path:
@@ -37,6 +50,45 @@ def _backup_before_migration(db: sqlite3.Connection, home: Path) -> Path:
     return path
 
 
+def _ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """Additive ALTER TABLE for columns missing on an older layout."""
+    existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+V2_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS collections (
+         collection_id TEXT PRIMARY KEY,
+         name TEXT NOT NULL UNIQUE,
+         created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS collection_versions (
+         collection_id TEXT NOT NULL, version_id TEXT NOT NULL,
+         ordinal INTEGER NOT NULL, created_at TEXT NOT NULL,
+         PRIMARY KEY(collection_id, version_id))""",
+    "CREATE INDEX IF NOT EXISTS idx_collection_versions_ord ON collection_versions(collection_id, ordinal)",
+    """CREATE TABLE IF NOT EXISTS lineage (
+         lin_id TEXT PRIMARY KEY,
+         producer_kind TEXT NOT NULL, producer_id TEXT NOT NULL,
+         consumer_kind TEXT NOT NULL, consumer_id TEXT NOT NULL,
+         version_id TEXT NOT NULL, created_at TEXT NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS idx_lineage_version ON lineage(version_id)",
+    "CREATE TABLE IF NOT EXISTS catalog_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+)
+
+V2_VERSION_COLUMNS = {
+    "deleted_at": "TEXT",
+    "delete_requested_at": "TEXT",
+    "pin_hold": "TEXT",
+}
+
+V2_ALIAS_COLUMNS = {
+    "pinned_at": "TEXT",
+    "updated_by": "TEXT",
+}
+
+
 def _create_latest_schema(db: sqlite3.Connection) -> None:
     db.executescript(
         """
@@ -49,6 +101,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           version_id TEXT PRIMARY KEY, root_id TEXT NOT NULL,
           manifest_digest TEXT NOT NULL, manifest_json TEXT NOT NULL,
           size_bytes INTEGER NOT NULL,
+          deleted_at TEXT, delete_requested_at TEXT, pin_hold TEXT,
           created_at TEXT NOT NULL,
           UNIQUE(root_id, manifest_digest)
         );
@@ -58,12 +111,12 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           latest_version_id TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
-        -- Aliases are last-write-wins in Phase 5: an upsert moves the alias to
-        -- a new pinned version. Compare-and-swap alias movement arrives in
-        -- Phase 7; until then readers must treat aliases as advisory pins.
+        -- Phase 7: alias movement requires compare-and-swap via
+        -- Collections.alias_set; there is no silent last-write-wins path.
         CREATE TABLE IF NOT EXISTS aliases (
           alias_name TEXT PRIMARY KEY, root_id TEXT NOT NULL,
-          version_id TEXT NOT NULL, updated_at TEXT NOT NULL
+          version_id TEXT NOT NULL, updated_at TEXT NOT NULL,
+          pinned_at TEXT, updated_by TEXT
         );
         CREATE TABLE IF NOT EXISTS operations (
           op_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
@@ -76,9 +129,15 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status, lease_expires_at);
-        PRAGMA user_version=1;
         """
     )
+    for statement in V2_STATEMENTS:
+        db.execute(statement)
+    # Fresh layouts already carry the v2 columns; ensure-columns keeps this
+    # idempotent for partial/older layouts that reach this path.
+    _ensure_columns(db, "aliases", V2_ALIAS_COLUMNS)
+    _ensure_columns(db, "versions", V2_VERSION_COLUMNS)
+    db.execute(f"PRAGMA user_version={ARTIFACTS_LATEST_SCHEMA_VERSION}")
 
 
 def migrate_artifacts(db: sqlite3.Connection, home: str | Path) -> Path | None:
@@ -139,6 +198,13 @@ def migrate_artifacts(db: sqlite3.Connection, home: str | Path) -> Path | None:
                     "CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status, lease_expires_at)",
                 ):
                     db.execute(statement)
+            if version < 2:
+                # v1 -> v2: collections, lineage, lifecycle columns, and the
+                # catalog_state key/value table (recovery_required marker).
+                for statement in V2_STATEMENTS:
+                    db.execute(statement)
+                _ensure_columns(db, "aliases", V2_ALIAS_COLUMNS)
+                _ensure_columns(db, "versions", V2_VERSION_COLUMNS)
             db.execute(f"PRAGMA user_version={ARTIFACTS_LATEST_SCHEMA_VERSION}")
             db.commit()
         except BaseException:

@@ -37,11 +37,32 @@ from pathlib import Path
 from typing import Any
 
 from ..remote.protocol import request_digest
-from .catalog import Catalog, new_id, now_iso
+from .catalog import Catalog, is_recovery_required, new_id, now_iso
 from .local_store import LocalBlobStore
 from .manifest import build_manifest, build_manifest_from_tree, manifest_digest
 
-__all__ = ["ArtifactOperations", "DEFAULT_LEASE_SECONDS"]
+__all__ = ["ArtifactOperations", "DEFAULT_LEASE_SECONDS", "MUTATING_METHODS"]
+
+DEFAULT_LEASE_SECONDS = 300
+
+# Durable-op methods that mutate catalog state. While the ``recovery_required``
+# marker is set (a backup restore is in progress), every one of these is
+# refused until recovery completes; read-style ops stay available.
+MUTATING_METHODS = frozenset(
+    {
+        "artifact.put_file",
+        "artifact.put_dir",
+        "collection.create",
+        "collection.append_version",
+        "collection.alias_set",
+        "collection.link_lineage",
+        "lifecycle.request_delete",
+        "lifecycle.restore",
+        "lifecycle.pin",
+        "lifecycle.unpin",
+        "lifecycle.gc",
+    }
+)
 
 DEFAULT_LEASE_SECONDS = 300
 
@@ -95,10 +116,18 @@ class ArtifactOperations:
         }
 
     def _begin(self, method: str, payload: dict[str, Any], idempotency_key: str) -> tuple[dict[str, Any], bool]:
-        """Insert or replay the operation row. Returns ``(op, replayed)``."""
+        """Insert or replay the operation row. Returns ``(op, replayed)``.
+
+        Mutating methods are refused while ``recovery_required`` is set —
+        a restored catalog stays locked out of every mutation until
+        ``complete_restore`` clears the marker (replays of already-completed
+        operations still return their recorded result).
+        """
         digest = request_digest(method, payload, idempotency_key)
         db = self.catalog.db
         with self.catalog.lock:
+            if method in MUTATING_METHODS and is_recovery_required(db):
+                raise ValueError("recovery_required: complete restore first")
             db.execute("BEGIN IMMEDIATE")
             try:
                 existing = db.execute(
@@ -280,6 +309,14 @@ class ArtifactOperations:
         ``deduplicated=True``; identical bytes also deduplicate physically in
         the blob store. Publishing different content to the same root creates
         a new immutable version and advances the root's latest pointer.
+
+        Tombstone note (Phase 7): blobs are content-addressed files with no
+        catalog rows, so a delete-requested (logically deleted) version's
+        ``(root_id, manifest_digest)`` match is treated as a NORMAL dedup
+        hit — the version row still exists, which by definition means it was
+        not hard-deleted (GC removes rows outright, so any row found here is
+        live). Re-publication therefore never resurrects hard-deleted
+        content; it simply re-publishes the bytes as a fresh version.
         """
         if isinstance(name, bool) or not isinstance(name, str) or not name.strip():
             raise ValueError("name must be a non-empty string")

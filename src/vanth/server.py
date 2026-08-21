@@ -2866,6 +2866,102 @@ def artifact_verify(version_id: str) -> dict[str, Any]:
     return get_client().post("/artifacts/verify", {"version_id": version_id})
 
 
+@mcp.tool()
+def artifact_collection_create(name: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Create a named artifact collection for monotonic immutable version lists."""
+    return get_client().post("/artifacts/collections", {"name": name, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def artifact_collection_append(collection: str, version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Append an immutable version to a collection with a monotonic ordinal (duplicate append is a no-op)."""
+    return get_client().post("/artifacts/collections/append",
+                             {"collection": collection, "version_id": version_id, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def artifact_collection_get(name: str) -> dict[str, Any]:
+    """Get a collection's ordered versions (by monotonic ordinal)."""
+    return get_client().get(f"/artifacts/collections/{name}")
+
+
+@mcp.tool()
+def artifact_alias_set(alias_name: str, root_id: str, new_version_id: str,
+                       expected_version_id: str | None = None, updated_by: str | None = None) -> dict[str, Any]:
+    """Compare-and-swap an alias pin: moves only if it currently points at expected_version_id.
+
+    Pass expected_version_id=None to create a new alias; any mismatch fails
+    with ALIAS_CAS_MISMATCH and never silently moves the alias.
+    """
+    return get_client().post("/artifacts/alias-set",
+                             {"alias_name": alias_name, "root_id": root_id, "new_version_id": new_version_id,
+                              "expected_version_id": expected_version_id, "updated_by": updated_by})
+
+
+@mcp.tool()
+def artifact_link_lineage(producer_kind: str, producer_id: str, consumer_kind: str, consumer_id: str,
+                          version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Link a producer/consumer identity ('job'|'remote_job'|'version'|'alias') to one immutable version."""
+    return get_client().post("/artifacts/lineage",
+                             {"producer_kind": producer_kind, "producer_id": producer_id,
+                              "consumer_kind": consumer_kind, "consumer_id": consumer_id,
+                              "version_id": version_id, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def artifact_lineage_for(version_id: str) -> dict[str, Any]:
+    """List all lineage links recorded against one immutable version."""
+    return get_client().get(f"/artifacts/lineage/{version_id}")
+
+
+@mcp.tool()
+def artifact_delete_request(version_id: str) -> dict[str, Any]:
+    """Logically delete an artifact version (content stays until GC reclaims it); rejects aliased versions."""
+    return get_client().post("/artifacts/delete-request", {"version_id": version_id})
+
+
+@mcp.tool()
+def artifact_restore(version_id: str) -> dict[str, Any]:
+    """Clear a pending delete request on an artifact version."""
+    return get_client().post("/artifacts/restore-version", {"version_id": version_id})
+
+
+@mcp.tool()
+def artifact_pin(version_id: str, hold_reason: str) -> dict[str, Any]:
+    """Pin/hold an artifact version so GC can never reclaim it."""
+    return get_client().post("/artifacts/pin", {"version_id": version_id, "hold_reason": hold_reason})
+
+
+@mcp.tool()
+def artifact_unpin(version_id: str) -> dict[str, Any]:
+    """Remove a pin/hold from an artifact version."""
+    return get_client().post("/artifacts/unpin", {"version_id": version_id})
+
+
+@mcp.tool()
+def artifact_gc(dry_run: bool = True) -> dict[str, Any]:
+    """Fenced garbage collection of unreachable versions/blobs; dry_run=True only reports candidates."""
+    return get_client().post("/artifacts/gc", {"dry_run": dry_run})
+
+
+@mcp.tool()
+def artifact_backup() -> dict[str, Any]:
+    """Take a manual sqlite backup of the artifacts catalog."""
+    return get_client().post("/artifacts/backup", {})
+
+
+@mcp.tool()
+def artifact_begin_restore(backup_path: str) -> dict[str, Any]:
+    """Restore the artifacts catalog from a backup copy; rotates instance identity and locks mutations until complete-restore."""
+    return get_client().post("/artifacts/begin-restore", {"backup_path": backup_path})
+
+
+@mcp.tool()
+def artifact_complete_restore() -> dict[str, Any]:
+    """Clear the recovery_required marker after a restore so mutations are allowed again."""
+    return get_client().post("/artifacts/complete-restore", {})
+
+
 def _build_wake_target(
     target: dict[str, Any] | None,
     events: list[str] | None,

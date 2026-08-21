@@ -18,7 +18,7 @@ from pathlib import Path
 from ..migrations import configure_connection
 from .migrations import migrate_artifacts
 
-__all__ = ["Catalog", "open_catalog", "new_id"]
+__all__ = ["Catalog", "open_catalog", "new_id", "is_recovery_required", "set_recovery_required"]
 
 
 def now_iso() -> str:
@@ -28,6 +28,33 @@ def now_iso() -> str:
 def new_id(prefix: str) -> str:
     """A fresh ``<prefix>_<32 hex>`` identifier per repo convention."""
     return f"{prefix}_{secrets.token_hex(16)}"
+
+
+RECOVERY_KEY = "recovery_required"
+
+
+def is_recovery_required(db: sqlite3.Connection) -> bool:
+    """True while the ``recovery_required`` marker is set in ``catalog_state``.
+
+    While set, every mutating artifact operation is refused (reads stay
+    allowed) until :meth:`Lifecycle.complete_restore` clears the marker.
+    """
+    try:
+        row = db.execute("SELECT value FROM catalog_state WHERE key=?", (RECOVERY_KEY,)).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return bool(row) and row["value"] == "1"
+
+
+def set_recovery_required(db: sqlite3.Connection, required: bool) -> None:
+    """Set or clear the marker. The caller owns transaction boundaries."""
+    if required:
+        db.execute(
+            "INSERT INTO catalog_state(key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value='1'",
+            (RECOVERY_KEY,),
+        )
+    else:
+        db.execute("DELETE FROM catalog_state WHERE key=?", (RECOVERY_KEY,))
 
 
 class Catalog:
