@@ -2831,6 +2831,17 @@ def artifact_put(path: str, name: str, idempotency_key: str | None = None) -> di
 
 
 @mcp.tool()
+def artifact_put_dir(source_path: str, name: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Publish a local directory tree into the managed artifact store as an immutable v1 version.
+
+    Capture refuses symlinks, reparse points, special files, and source
+    mutation; identical trees re-published to the same root deduplicate.
+    """
+    return get_client().post("/artifacts/put-dir",
+                             {"source_path": source_path, "name": name, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
 def artifact_resolve(name: str, alias: str | None = None, version_id: str | None = None) -> dict[str, Any]:
     """Resolve a root (latest), alias pin, or explicit version to one immutable version."""
     return get_client().get("/artifacts/resolve", {"name": name, "alias": alias, "version_id": version_id})

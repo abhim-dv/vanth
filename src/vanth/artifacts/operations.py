@@ -29,6 +29,9 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
+import stat
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -36,7 +39,7 @@ from typing import Any
 from ..remote.protocol import request_digest
 from .catalog import Catalog, new_id, now_iso
 from .local_store import LocalBlobStore
-from .manifest import build_manifest, manifest_digest
+from .manifest import build_manifest, build_manifest_from_tree, manifest_digest
 
 __all__ = ["ArtifactOperations", "DEFAULT_LEASE_SECONDS"]
 
@@ -385,6 +388,143 @@ class ArtifactOperations:
                 pass
             raise
 
+    def put_dir(
+        self,
+        source_dir: str | os.PathLike[str],
+        name: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Publish a directory tree as an immutable v1 (kind="dir") version.
+
+        Mirrors the ``put_file`` durable-operation pattern exactly: capture a
+        canonical manifest (secure capture refuses symlinks, reparse points,
+        special files, portability collisions, and source mutation), then
+        stage + publish every unique blob (each verified against its manifest
+        sha256 by ``publish_staged`` before it becomes visible), and finally
+        commit version + root pointer + op result in ONE catalog transaction.
+        A crash before that transaction leaves only staging state; the
+        committed digest therefore always describes the exact transferred
+        bytes. Identical content re-published to the same root deduplicates
+        onto the existing version.
+        """
+        if isinstance(name, bool) or not isinstance(name, str) or not name.strip():
+            raise ValueError("name must be a non-empty string")
+        source = Path(source_dir)
+        manifest = build_manifest_from_tree(source, name)
+        mdigest = manifest_digest(manifest)
+        key = idempotency_key or _mint_key("aput")
+        payload = {"name": name, "manifest_digest": mdigest}
+        op, replayed = self._begin("artifact.put_dir", payload, key)
+        if replayed and op["status"] == "completed":
+            return {**op["result"], "replayed": True}
+        claimed = self._claim(op["op_id"])
+        token = claimed["claim_token"]
+        try:
+            root = self._get_or_create_root(name)
+            existing = self.catalog.db.execute(
+                "SELECT * FROM versions WHERE root_id=? AND manifest_digest=?", (root["root_id"], mdigest)
+            ).fetchone()
+            if existing:
+                result = {
+                    "version_id": existing["version_id"],
+                    "root_id": root["root_id"],
+                    "name": name,
+                    "manifest_digest": mdigest,
+                    "size_bytes": int(existing["size_bytes"]),
+                    "file_count": sum(1 for e in manifest["entries"] if e["kind"] == "file"),
+                    "deduplicated": True,
+                }
+                self.complete(op["op_id"], token, result)
+                return result
+            # Stage every unique blob first (dedup by construction via the
+            # content-addressed set of sha256s), then publish each one —
+            # publish_staged re-hashes the staged bytes against the manifest
+            # digest before the blob path exists.
+            unique_shas: dict[str, str] = {}
+            for entry in manifest["entries"]:
+                if entry["kind"] != "file":
+                    continue
+                unique_shas.setdefault(entry["sha256"], str(source / str(entry["path"]).replace("/", os.sep)))
+            staged_paths: list[tuple[Path, str]] = []
+            for sha256, file_path in unique_shas.items():
+                staged_paths.append((self.blobs.stage(file_path), sha256))
+            if self.crash_hook is not None:
+                self.crash_hook(op["op_id"])
+            for staged, sha256 in staged_paths:
+                self.blobs.publish_staged(staged, sha256)
+            # Publication transaction boundary (same as put_file): blobs are
+            # durable above; this single transaction commits version + root
+            # pointer + fenced op completion.
+            db = self.catalog.db
+            total_size = sum(int(e["size_bytes"]) for e in manifest["entries"] if e["kind"] == "file")
+            with self.catalog.lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    row = db.execute(
+                        "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
+                        (root["root_id"], mdigest),
+                    ).fetchone()
+                    deduplicated = bool(row)
+                    version_id = row["version_id"] if row else self.catalog.new_version_id()
+                    if not row:
+                        db.execute(
+                            "INSERT INTO versions(version_id, root_id, manifest_digest, manifest_json, size_bytes, created_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                version_id,
+                                root["root_id"],
+                                mdigest,
+                                json.dumps(manifest, separators=(",", ":")),
+                                total_size,
+                                now_iso(),
+                            ),
+                        )
+                    db.execute(
+                        "UPDATE roots SET latest_version_id=?, updated_at=? WHERE root_id=?",
+                        (version_id, now_iso(), root["root_id"]),
+                    )
+                    result = {
+                        "version_id": version_id,
+                        "root_id": root["root_id"],
+                        "name": name,
+                        "manifest_digest": mdigest,
+                        "size_bytes": total_size,
+                        "file_count": sum(1 for e in manifest["entries"] if e["kind"] == "file"),
+                        "deduplicated": deduplicated,
+                    }
+                    changed = db.execute(
+                        """
+                        UPDATE operations SET status='completed', result_json=?, updated_at=?,
+                          claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                        WHERE op_id=? AND claim_token=? AND status='running'
+                          AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                        """,
+                        (
+                            json.dumps(result, separators=(",", ":")),
+                            now_iso(),
+                            op["op_id"],
+                            token,
+                            now_iso(),
+                        ),
+                    ).rowcount
+                    if not changed:
+                        raise ValueError(
+                            f"stale worker: operation {op['op_id']} cannot be completed with this claim "
+                            "(expired lease or reclaimed generation)"
+                        )
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+            return result
+        except BaseException as exc:
+            try:
+                self.fail(op["op_id"], token, str(exc))
+            except ValueError:
+                pass
+            raise
+
     def resolve(
         self,
         name_or_root_id: str,
@@ -463,15 +603,22 @@ class ArtifactOperations:
             if not row:
                 raise ValueError(f"Unknown version_id: {version_id}")
             manifest = json.loads(row["manifest_json"])
-            sha256 = manifest["sha256"]
+            sha256 = manifest.get("sha256")
+            if manifest.get("kind") == "dir":
+                shas = {e["sha256"] for e in manifest["entries"] if e["kind"] == "file"}
+                blob_exists = all(self.blobs.has_blob(s) for s in shas)
+                verified = all(self.blobs.verify_blob(s) for s in shas)
+            else:
+                blob_exists = self.blobs.has_blob(sha256)
+                verified = self.blobs.verify_blob(sha256)
             result = {
                 "version_id": version_id,
                 "root_id": row["root_id"],
                 "manifest_digest": row["manifest_digest"],
                 "manifest": manifest,
                 "size_bytes": int(row["size_bytes"]),
-                "blob_exists": self.blobs.has_blob(sha256),
-                "verified": self.blobs.verify_blob(sha256),
+                "blob_exists": blob_exists,
+                "verified": verified,
             }
             self.complete(op["op_id"], token, result)
             return result
@@ -504,6 +651,10 @@ class ArtifactOperations:
             if not row:
                 raise ValueError(f"Unknown version_id: {version_id}")
             manifest = json.loads(row["manifest_json"])
+            if manifest.get("kind") == "dir":
+                result = self._materialize_dir(manifest, dest, version_id, int(row["size_bytes"]))
+                self.complete(op["op_id"], token, result)
+                return result
             sha256 = manifest["sha256"]
             if not self.blobs.has_blob(sha256):
                 raise ValueError(f"blob missing for version {version_id}: {sha256}")
@@ -529,8 +680,163 @@ class ArtifactOperations:
                 pass
             raise
 
+    # -- directory materialization ------------------------------------------
+
+    @staticmethod
+    def _is_reparse(info: os.stat_result) -> bool:
+        """True for symlinks and Windows reparse points (junctions, mounts).
+
+        On Windows CPython ``st_reparse_tag`` is exposed by lstat; a junction
+        is NOT reported by ``os.path.islink``, so the tag check is what
+        catches them. On POSIX the attribute is absent and plain symlinks are
+        caught via mode bits.
+        """
+        if stat.S_ISLNK(info.st_mode):
+            return True
+        return bool(getattr(info, "st_reparse_tag", 0))
+
+    def _check_component_chain(self, path: Path) -> None:
+        """Refuse any existing component of ``path`` that is a symlink or
+        reparse point (symlink-swap defense). Components that do not exist
+        yet pass; each one is still checked again immediately before use."""
+        absolute = Path(os.path.abspath(path))
+        parts = absolute.parts
+        if len(parts) < 2:
+            return
+        probe = Path(parts[0])
+        for part in parts[1:]:
+            probe = probe / part
+            try:
+                info = os.lstat(probe)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            if self._is_reparse(info):
+                raise ValueError(
+                    f"refusing to materialize through a symlink/reparse-point path component: {probe}"
+                )
+
+    def _build_tree_into_staging(self, staging: Path, entries: list[dict[str, Any]]) -> None:
+        """Create every manifest entry under the fresh staging directory.
+
+        Each path component is lstat-checked immediately before use and
+        refused when it is a symlink/reparse point; each file blob is
+        re-verified against its manifest sha256 while copying. A final sweep
+        re-verifies every created component right before the caller renames
+        the staging tree into place.
+        """
+        created_dirs: set[Path] = set()
+        for entry in entries:
+            target = staging / str(entry["path"])
+            current = staging
+            for component in target.parent.relative_to(staging).parts:
+                nxt = current / component
+                # lstat EVERY time, even components we created ourselves:
+                # refuse anything that became a symlink/reparse point between
+                # use and use (TOCTOU mitigation on all platforms; junctions
+                # are caught via st_reparse_tag on Windows).
+                try:
+                    info = os.lstat(nxt)
+                    if self._is_reparse(info):
+                        raise ValueError(
+                            f"refusing to create under symlink/reparse-point component: {nxt}"
+                        )
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise ValueError(f"path component exists and is not a directory: {nxt}")
+                except FileNotFoundError:
+                    nxt.mkdir(exist_ok=False)
+                    created_dirs.add(nxt)
+                current = nxt
+            if entry["kind"] == "dir":
+                if os.path.lexists(target):
+                    raise ValueError(f"unexpected existing entry while creating tree: {target}")
+                target.mkdir()
+                continue
+            digest = hashlib.sha256()
+            blob = self.blobs.blob_path(str(entry["sha256"]))
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            fd = os.open(target, flags, 0o600)
+            try:
+                with blob.open("rb") as src, os.fdopen(fd, "wb", closefd=True) as out:
+                    for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        out.write(chunk)
+            except BaseException:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                raise
+            if digest.hexdigest() != entry["sha256"]:
+                raise ValueError(
+                    f"blob content does not match manifest entry during materialization: "
+                    f"{entry['path']} ({entry['sha256']})"
+                )
+            if entry["executable"] and os.name != "nt":
+                os.chmod(target, 0o755)
+        # Final anti-swap sweep: every component we created must still be a
+        # real directory immediately before the atomic rename into place.
+        for dir_path in sorted(created_dirs):
+            info = os.lstat(dir_path)
+            if self._is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+                raise ValueError(
+                    f"path component changed during materialization; refusing: {dir_path}"
+                )
+
+    def _materialize_dir(
+        self,
+        manifest: dict[str, Any],
+        dest: Path,
+        version_id: str,
+        size_bytes: int,
+    ) -> dict[str, Any]:
+        from .manifest import validate_manifest_v1
+
+        validate_manifest_v1(manifest)
+        # Never merge directories: an existing destination is refused even
+        # with overwrite=True (overwrite applies to file roots only).
+        if os.path.lexists(dest):
+            raise ValueError(
+                f"destination already exists: {dest}; directory materialization never merges "
+                "(overwrite does not apply to directories)"
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Refuse a planted symlink/junction anywhere along the parent chain.
+        self._check_component_chain(dest.parent)
+
+        entries = sorted(manifest["entries"], key=lambda e: str(e["path"]).encode("utf-8"))
+        file_entries = [e for e in entries if e["kind"] == "file"]
+        missing = sorted({str(e["sha256"]) for e in file_entries if not self.blobs.has_blob(e["sha256"])})
+        if missing:
+            raise ValueError(f"blobs missing for dir version {version_id}: {', '.join(missing)}")
+
+        staging = dest.parent / f".{dest.name}.materializing-{uuid.uuid4().hex}"
+        staging.mkdir()
+        try:
+            try:
+                self._build_tree_into_staging(staging, entries)
+                # Atomic swap into place: rename fails rather than merges if
+                # a destination raced into existence.
+                os.rename(staging, dest)
+            except OSError as exc:
+                raise ValueError(
+                    f"destination already exists or became unusable: {dest} ({exc})"
+                ) from None
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return {
+            "version_id": version_id,
+            "dest_path": str(dest),
+            "size_bytes": size_bytes,
+            "file_count": len(file_entries),
+            "overwritten": False,
+        }
+
     def verify(self, version_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
-        """Re-hash the referenced blob. Verification failure is a RESULT (ok=False), not an exception."""
         key = idempotency_key or _mint_key("aver")
         payload = {"version_id": version_id}
         op, replayed = self._begin("artifact.verify", payload, key)
@@ -543,6 +849,46 @@ class ArtifactOperations:
             if not row:
                 raise ValueError(f"Unknown version_id: {version_id}")
             manifest = json.loads(row["manifest_json"])
+            if manifest.get("kind") == "dir":
+                # Verify EVERY referenced blob; empty-dir entries carry the
+                # well-known empty-content digest and no blob of their own.
+                entry_reports = []
+                offending = []
+                for entry in manifest["entries"]:
+                    if entry["kind"] == "dir":
+                        # Empty dirs carry the empty-content digest by
+                        # definition and have no blob of their own.
+                        continue
+                    expected = str(entry["sha256"])
+                    actual = None
+                    if self.blobs.has_blob(expected):
+                        digest = hashlib.sha256()
+                        with self.blobs.blob_path(expected).open("rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        actual = digest.hexdigest()
+                    entry_ok = actual == expected
+                    report = {
+                        "path": entry["path"],
+                        "kind": entry["kind"],
+                        "expected_sha256": expected,
+                        "actual_sha256": actual,
+                        "ok": entry_ok,
+                    }
+                    if not entry_ok:
+                        offending.append(entry["path"])
+                    entry_reports.append(report)
+                ok = not offending
+                result = {
+                    "ok": ok,
+                    "ok_bool": ok,
+                    "expected_sha256": None,
+                    "actual_sha256": None,
+                    "entries": entry_reports,
+                    "offending_paths": offending,
+                }
+                self.complete(op["op_id"], token, result)
+                return result
             expected = manifest["sha256"]
             actual = None
             if self.blobs.has_blob(expected):

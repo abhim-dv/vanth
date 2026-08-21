@@ -611,6 +611,12 @@ class Handler(BaseHTTPRequestHandler):
                     source_path=payload.get("path"),
                     idempotency_key=payload.get("idempotency_key"),
                 ))
+            elif parsed.path == "/artifacts/put-dir":
+                ok(self, get_artifacts().put_dir(
+                    payload.get("source_path"),
+                    payload.get("name"),
+                    idempotency_key=payload.get("idempotency_key"),
+                ))
             elif parsed.path == "/artifacts/materialize":
                 ok(self, get_artifacts().materialize(
                     payload["version_id"],

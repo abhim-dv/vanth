@@ -1,0 +1,201 @@
+{
+  "version": "1",
+  "description": "Golden conformance vectors for artifact manifest v1 (directory trees). digest_sha256 = lowercase hex SHA-256 of the UTF-8 bytes of `canonical`. Produced by the reference implementation (src/vanth/artifacts/manifest.py); tests assert these byte-exactly.",
+  "canonicalization": {
+    "notes": [
+      "Reuses vanth.remote.protocol.canonical_json (RFC 8785): keys sort by UTF-16 code-unit order, minimal escapes, no whitespace.",
+      "Entries sort by UTF-8 bytes of their `path` before canonicalization.",
+      "manifest_digest = SHA256(UTF8(canonical))."
+    ]
+  },
+  "vectors": [
+    {
+      "id": "nested-tree-empty-dir",
+      "input_tree": {
+        "description": "source tree captured by build_manifest_from_tree: files a/b/hello.txt ('hello world\\n', 12 bytes) and an empty directory 'empty'. Parent dirs of files stay implicit; only the genuinely empty directory gets an explicit entry.",
+        "files": {
+          "a/b/hello.txt": "hello world\\n"
+        },
+        "empty_dirs": [
+          "empty"
+        ]
+      },
+      "manifest": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "tree-one",
+        "entries": [
+          {
+            "path": "a/b/hello.txt",
+            "kind": "file",
+            "size_bytes": 12,
+            "sha256": "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447",
+            "executable": false
+          },
+          {
+            "path": "empty",
+            "kind": "dir",
+            "size_bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "executable": false
+          }
+        ]
+      },
+      "canonical": "{\"entries\":[{\"executable\":false,\"kind\":\"file\",\"path\":\"a/b/hello.txt\",\"sha256\":\"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447\",\"size_bytes\":12},{\"executable\":false,\"kind\":\"dir\",\"path\":\"empty\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"size_bytes\":0}],\"kind\":\"dir\",\"manifest_version\":1,\"name\":\"tree-one\"}",
+      "digest_sha256": "c9d4ef335b7f2dbd148222f391e7a69924f0dae723de3747241ff5bdfa373447"
+    },
+    {
+      "id": "repeated-blob-reference",
+      "input_tree": {
+        "description": "two distinct paths with identical content ('same', 4 bytes): the same blob sha256 appears on two entries, which v1 allows.",
+        "files": {
+          "copy1.bin": "same",
+          "copy2.bin": "same"
+        }
+      },
+      "manifest": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "dup-tree",
+        "entries": [
+          {
+            "path": "copy1.bin",
+            "kind": "file",
+            "size_bytes": 4,
+            "sha256": "0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5",
+            "executable": false
+          },
+          {
+            "path": "copy2.bin",
+            "kind": "file",
+            "size_bytes": 4,
+            "sha256": "0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5",
+            "executable": false
+          }
+        ]
+      },
+      "canonical": "{\"entries\":[{\"executable\":false,\"kind\":\"file\",\"path\":\"copy1.bin\",\"sha256\":\"0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5\",\"size_bytes\":4},{\"executable\":false,\"kind\":\"file\",\"path\":\"copy2.bin\",\"sha256\":\"0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5\",\"size_bytes\":4}],\"kind\":\"dir\",\"manifest_version\":1,\"name\":\"dup-tree\"}",
+      "digest_sha256": "57ba6d62814725f3d3f4949d1ccde366967af1ffb8321aacdf946a5b3a664d16"
+    },
+    {
+      "id": "executable-bit",
+      "input_tree": {
+        "description": "a POSIX-executable script '#!/bin/sh\\necho hi\\n' (18 bytes); capture records executable=true. On Windows the pinned default for capture is executable=false.",
+        "files": {
+          "scripts/run.sh": "#!/bin/sh\\necho hi\\n"
+        },
+        "executable_files": [
+          "scripts/run.sh"
+        ]
+      },
+      "manifest": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "exec-tree",
+        "entries": [
+          {
+            "path": "scripts/run.sh",
+            "kind": "file",
+            "size_bytes": 18,
+            "sha256": "299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba",
+            "executable": true
+          }
+        ]
+      },
+      "canonical": "{\"entries\":[{\"executable\":true,\"kind\":\"file\",\"path\":\"scripts/run.sh\",\"sha256\":\"299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba\",\"size_bytes\":18}],\"kind\":\"dir\",\"manifest_version\":1,\"name\":\"exec-tree\"}",
+      "digest_sha256": "4872450633b6fefa221c00fffc4619ce54a3fee1cb4a211bf4120a417c6a0e92"
+    }
+  ],
+  "rejected_cases": [
+    {
+      "id": "case-insensitive-collision",
+      "description": "Two distinct paths that collide under str.lower() are rejected by the portability pin (both at build time and validation time): such a manifest could never be materialized faithfully onto a case-insensitive filesystem.",
+      "input": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "bad-case",
+        "entries": [
+          {
+            "path": "A.txt",
+            "kind": "file",
+            "size_bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "executable": false
+          },
+          {
+            "path": "a.txt",
+            "kind": "file",
+            "size_bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "executable": false
+          }
+        ]
+      },
+      "error_contains": "portability"
+    },
+    {
+      "id": "nfc-nfd-collision",
+      "description": "'cafe\\u0301.txt' (e + combining acute, NFD) collides with 'caf\\u00e9.txt' (precomposed, NFC) under the pinned key NFC(path).lower(); rejected by the portability pin.",
+      "input": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "bad-nfc",
+        "entries": [
+          {
+            "path": "café.txt",
+            "kind": "file",
+            "size_bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "executable": false
+          },
+          {
+            "path": "café.txt",
+            "kind": "file",
+            "size_bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "executable": false
+          }
+        ]
+      },
+      "error_contains": "portability"
+    },
+    {
+      "id": "dotdot-component",
+      "description": "'..' path components enable traversal out of the materialization root; always rejected.",
+      "input": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "bad-dotdot",
+        "entries": [
+          {
+            "path": "a/../b.txt",
+            "kind": "file",
+            "size_bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "executable": false
+          }
+        ]
+      },
+      "error_contains": "'.' or '..'"
+    },
+    {
+      "id": "backslash-path",
+      "description": "Paths are POSIX-style forward slashes only; backslashes are rejected so manifests are interpreted identically on Windows and POSIX.",
+      "input": {
+        "manifest_version": 1,
+        "kind": "dir",
+        "name": "backslash-tree",
+        "entries": [
+          {
+            "path": "a\\b.txt",
+            "kind": "file",
+            "size_bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "executable": false
+          }
+        ]
+      },
+      "error_contains": "forward slashes"
+    }
+  ]
+}

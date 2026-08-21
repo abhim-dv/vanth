@@ -4,6 +4,10 @@ Status: **preview**. This format deliberately does **not** claim v1; version 1
 requires canonical directory manifests and pinned Unicode
 normalization/case-fold portability vectors (Phase 6) before it may be named.
 
+See also `artifact-manifest-v1.md`: the pinned directory-tree format that
+fulfills those requirements. Manifest digests for both versions share one
+canonicalizer (`vanth.remote.protocol.canonical_json`).
+
 ## Schema
 
 A manifest is a JSON object with exactly these fields:
