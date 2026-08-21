@@ -17,6 +17,16 @@ Schema v2 (Phase 7) adds:
 - ``catalog_state``: small key/value table holding the
   ``recovery_required`` marker that locks a restored catalog out of
   mutations until recovery completes.
+
+Schema v3 (Phase 8) adds:
+
+- ``storage_profiles``: immutable storage-profile revisions (a profile is
+  never updated in place; changing config inserts a new row with
+  ``revision+1``, keyed ``UNIQUE(profile_id, revision)``).
+- ``writer_leases``: catalog and root writer leases (keys like ``catalog``
+  and ``root:<root_id>``) acquired via conditional upserts, fencing remote
+  writers the way local ops are fenced by claim tokens.
+- ``roots.profile_id``: optional pin of a root to a storage profile.
 """
 
 from __future__ import annotations
@@ -34,7 +44,7 @@ __all__ = [
     "migrate_artifacts",
 ]
 
-ARTIFACTS_LATEST_SCHEMA_VERSION = 2
+ARTIFACTS_LATEST_SCHEMA_VERSION = 3
 
 
 def _backup_before_migration(db: sqlite3.Connection, home: Path) -> Path:
@@ -88,6 +98,31 @@ V2_ALIAS_COLUMNS = {
     "updated_by": "TEXT",
 }
 
+V3_STATEMENTS = (
+    # NOTE: the natural key here is (profile_id, revision), not profile_id
+    # alone — a profile is never updated in place, so every revision of one
+    # profile_id is its own row.
+    """CREATE TABLE IF NOT EXISTS storage_profiles (
+         profile_id TEXT NOT NULL,
+         revision INTEGER NOT NULL,
+         kind TEXT NOT NULL,
+         config_json TEXT NOT NULL,
+         capabilities_json TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         PRIMARY KEY(profile_id, revision))""",
+    """CREATE TABLE IF NOT EXISTS writer_leases (
+         lease_key TEXT PRIMARY KEY,
+         owner_instance_id TEXT NOT NULL,
+         claim_token TEXT NOT NULL,
+         lease_expires_at TEXT NOT NULL,
+         generation INTEGER NOT NULL DEFAULT 0,
+         updated_at TEXT NOT NULL)""",
+)
+
+V3_ROOT_COLUMNS = {
+    "profile_id": "TEXT",
+}
+
 
 def _create_latest_schema(db: sqlite3.Connection) -> None:
     db.executescript(
@@ -133,10 +168,13 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
     )
     for statement in V2_STATEMENTS:
         db.execute(statement)
+    for statement in V3_STATEMENTS:
+        db.execute(statement)
     # Fresh layouts already carry the v2 columns; ensure-columns keeps this
     # idempotent for partial/older layouts that reach this path.
     _ensure_columns(db, "aliases", V2_ALIAS_COLUMNS)
     _ensure_columns(db, "versions", V2_VERSION_COLUMNS)
+    _ensure_columns(db, "roots", V3_ROOT_COLUMNS)
     db.execute(f"PRAGMA user_version={ARTIFACTS_LATEST_SCHEMA_VERSION}")
 
 
@@ -205,6 +243,12 @@ def migrate_artifacts(db: sqlite3.Connection, home: str | Path) -> Path | None:
                     db.execute(statement)
                 _ensure_columns(db, "aliases", V2_ALIAS_COLUMNS)
                 _ensure_columns(db, "versions", V2_VERSION_COLUMNS)
+            if version < 3:
+                # v2 -> v3: storage-profile revisions, writer leases, and the
+                # roots.profile_id pin column (Phase 8 S3 storage).
+                for statement in V3_STATEMENTS:
+                    db.execute(statement)
+                _ensure_columns(db, "roots", V3_ROOT_COLUMNS)
             db.execute(f"PRAGMA user_version={ARTIFACTS_LATEST_SCHEMA_VERSION}")
             db.commit()
         except BaseException:

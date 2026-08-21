@@ -105,6 +105,20 @@ def get_artifact_lifecycle():
     return _artifact_lifecycle
 
 
+_artifact_storage_profiles = None
+
+
+def get_artifact_storage_profiles():
+    """Open (once) the Phase 8 storage-profile registry."""
+    global _artifact_storage_profiles
+    with manager_lock:
+        if _artifact_storage_profiles is None:
+            from .artifacts.s3 import StorageProfiles
+
+            _artifact_storage_profiles = StorageProfiles(get_artifacts().catalog)
+    return _artifact_storage_profiles
+
+
 def _remote_epoch(remote_id: str):
     """Best-effort expected state epoch for a remote (None when not yet seen)."""
     from .remote.ssh import VanthRemoteError
@@ -506,6 +520,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_artifact_collections().get_collection(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/artifacts/lineage/"):
                 ok(self, {"version_id": parsed.path.split("/")[2], "lineage": get_artifact_collections().lineage_for(parsed.path.split("/")[2])})
+            elif parsed.path.startswith("/artifacts/storage-profiles/"):
+                ok(self, get_artifact_storage_profiles().get(parsed.path.split("/")[2]))
             elif parsed.path == "/cleanup/preview":
                 ok(self, get_manager().cleanup_preview(int(query.get("older_than_seconds", ["0"])[0])))
             elif parsed.path == "/metrics/compare":
@@ -709,6 +725,11 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_artifact_lifecycle().begin_restore(payload.get("backup_path")))
             elif parsed.path == "/artifacts/complete-restore":
                 ok(self, get_artifact_lifecycle().complete_restore())
+            elif parsed.path == "/artifacts/storage-profiles":
+                ok(self, get_artifact_storage_profiles().create(
+                    payload.get("kind", "s3"), payload.get("config")))
+            elif parsed.path.startswith("/artifacts/storage-profiles/") and parsed.path.endswith("/probe"):
+                ok(self, get_artifact_storage_profiles().probe(parsed.path.split("/")[2]))
             elif parsed.path == "/shutdown":
                 _stop_httpd()
                 ok(self, {"result": "shutting_down"})

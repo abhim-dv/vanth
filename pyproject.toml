@@ -38,6 +38,9 @@ dependencies = [
     "loguru>=0.7,<1.0",
 ]
 
+[project.optional-dependencies]
+artifact-s3 = ["boto3>=1.28"]
+
 [project.urls]
 Homepage = "https://github.com/abhim-dv/vanth"
 Repository = "https://github.com/abhim-dv/vanth"

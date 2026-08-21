@@ -2962,6 +2962,24 @@ def artifact_complete_restore() -> dict[str, Any]:
     return get_client().post("/artifacts/complete-restore", {})
 
 
+@mcp.tool()
+def artifact_storage_profile_create(kind: str = "s3", config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Register a storage profile (immutable revisions; creates revision 1)."""
+    return get_client().post("/artifacts/storage-profiles", {"kind": kind, "config": config})
+
+
+@mcp.tool()
+def artifact_storage_profile_get(profile_id: str) -> dict[str, Any]:
+    """Get the latest revision of a storage profile (config + capabilities)."""
+    return get_client().get(f"/artifacts/storage-profiles/{profile_id}")
+
+
+@mcp.tool()
+def artifact_storage_profile_probe(profile_id: str) -> dict[str, Any]:
+    """Probe a storage profile's endpoint capabilities and store them on the latest revision."""
+    return get_client().post(f"/artifacts/storage-profiles/{profile_id}/probe", {})
+
+
 def _build_wake_target(
     target: dict[str, Any] | None,
     events: list[str] | None,

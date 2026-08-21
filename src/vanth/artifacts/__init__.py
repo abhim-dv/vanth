@@ -11,14 +11,32 @@ from .manifest import (
     validate_manifest,
 )
 from .operations import ArtifactOperations
+from .s3 import (
+    Boto3Provider,
+    ConditionFailed,
+    InMemoryProvider,
+    NoSuchKey,
+    ProviderError,
+    S3Provider,
+    StorageProfiles,
+    WriterLeases,
+)
 
 __all__ = [
     "ArtifactOperations",
+    "Boto3Provider",
     "Catalog",
     "Collections",
+    "ConditionFailed",
+    "InMemoryProvider",
     "Lifecycle",
     "LocalBlobStore",
+    "NoSuchKey",
     "OwnershipError",
+    "ProviderError",
+    "S3Provider",
+    "StorageProfiles",
+    "WriterLeases",
     "open_catalog",
     "default_store_root",
     "build_manifest",
