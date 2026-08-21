@@ -34,7 +34,7 @@
     },
     "method": {
       "type": "string",
-      "enum": ["job.start", "job.stop", "job.rerun", "job.status"]
+      "enum": ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range"]
     },
     "payload": {
       "type": "object",
@@ -113,6 +113,14 @@
           {
             "if": { "properties": { "method": { "const": "job.status" } }, "required": ["method"] },
             "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.status" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "job.snapshot" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.snapshot" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "job.log_range" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.log_range" } } }
           }
         ]
       }
@@ -177,6 +185,24 @@
       "required": ["job_id"],
       "properties": {
         "job_id": { "type": "string" }
+      }
+    },
+    "payload_job.snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": { "type": "object" }
+      }
+    },
+    "payload_job.log_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["remote_job_id"],
+      "properties": {
+        "remote_job_id": { "type": "string" },
+        "stream": { "type": "string", "enum": ["stdout", "stderr"] },
+        "offset": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 1 }
       }
     },
     "payload_job.start": {

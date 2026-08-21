@@ -204,6 +204,118 @@ class RemoteControl:
             raise ValueError(f"no durable request for key {idempotency_key!r} on remote {remote_id!r}") from None
 
     # ------------------------------------------------------------------
+    # Snapshot recovery + log reads (Phase 3)
+    # ------------------------------------------------------------------
+
+    def snapshot(self, remote_id: str, *, cursor: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Fetch one paginated snapshot frame from the remote."""
+        payload: dict[str, Any] = {}
+        if cursor is not None:
+            payload["cursor"] = cursor
+        request = self.submit(
+            remote_id, "job.snapshot", payload,
+            idempotency_key="snap-" + secrets.token_hex(8),
+        )
+        if request["status"] == "creating":
+            request = self.run_request(remote_id, request)
+        response = request.get("response") or {}
+        return response
+
+    def apply_snapshot(self, remote_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Apply a snapshot locally in ONE transaction.
+
+        Upserts shadows pinned to the snapshot's state epoch, suppresses
+        shadows for jobs the snapshot no longer contains at that epoch
+        (repairing remote deletions), supersedes old-epoch rows (audit only),
+        and advances the stored cursor. Suppressed (forgotten) shadows are
+        never resurrected. Snapshot application never creates wake deliveries.
+        """
+        epoch = int(snapshot.get("state_epoch") or 1)
+        jobs = snapshot.get("jobs") or []
+        cursor = snapshot.get("cursor") or {}
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            applied = 0
+            seen_ids = set()
+            for job in jobs:
+                remote_job_id = str(job.get("job_id"))
+                seen_ids.add(remote_job_id)
+                result = self.store.upsert_shadow(
+                    remote_id=remote_id,
+                    remote_job_id=remote_job_id,
+                    status=str(job.get("status") or "unknown"),
+                    payload=job,
+                    state_epoch=epoch,
+                    commit=False,
+                )
+                if result is not None:
+                    applied += 1
+            # Repair remote deletions: same-epoch live shadows absent from the
+            # snapshot were deleted on the remote — suppress them.
+            deleted = 0
+            for shadow in self.store.current_shadows(remote_id):
+                if shadow["remote_job_id"] not in seen_ids:
+                    self.store.suppress_shadow(remote_id, shadow["remote_job_id"], commit=False)
+                    deleted += 1
+            superseded = self.store.supersede_old_epochs(remote_id, epoch, commit=False)
+            self.store.set_snapshot_cursor(remote_id, {"epoch": epoch, **cursor}, commit=False)
+            # Adopt the snapshot's epoch: the controller learns the remote's
+            # timeline version (e.g. after a remote restore) in the same tx.
+            self.store.db.execute(
+                "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                (epoch, now_iso(), remote_id, epoch),
+            )
+            self.store.db.commit()
+        except BaseException:
+            self.store.db.rollback()
+            raise
+        return {
+            "applied": applied,
+            "deleted": deleted,
+            "superseded": superseded,
+            "cursor": cursor,
+            "state_epoch": epoch,
+        }
+
+    def sync_snapshot(self, remote_id: str) -> dict[str, Any]:
+        """Fetch + apply snapshots until has_more is false; returns totals."""
+        totals = {"applied": 0, "deleted": 0, "superseded": 0, "pages": 0}
+        cursor = self.store.get_snapshot_cursor(remote_id)
+        while True:
+            snapshot = self.snapshot(remote_id, cursor=cursor)
+            result = self.apply_snapshot(remote_id, snapshot)
+            totals["applied"] += result["applied"]
+            totals["deleted"] += result["deleted"]
+            totals["superseded"] += result["superseded"]
+            totals["pages"] += 1
+            cursor = snapshot.get("cursor")
+            if not snapshot.get("has_more"):
+                break
+        return totals
+
+    def log_range(self, remote_id: str, remote_job_id: str, *, stream: str = "stdout",
+                  offset: int = 0, size: int = 65536) -> dict[str, Any]:
+        """Read an exact byte range of a remote job log (base64 round-trip)."""
+        payload = {"remote_job_id": remote_job_id, "stream": stream, "offset": offset, "size": size}
+        request = self.submit(
+            remote_id, "job.log_range", payload,
+            idempotency_key="logr-" + secrets.token_hex(8),
+        )
+        if request["status"] == "creating":
+            request = self.run_request(remote_id, request)
+        if request.get("error"):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", str(request["error"]))
+        return request.get("response") or {}
+
+    def forget_shadow(self, remote_id: str, remote_job_id: str) -> dict[str, Any]:
+        """Durably suppress a forgotten shadow; later snapshots cannot resurrect it."""
+        return self.store.suppress_shadow(remote_id, remote_job_id)
+
+    def shadows(self, remote_id: str) -> list[dict[str, Any]]:
+        """Current read-path shadows for a remote (live epoch, not suppressed)."""
+        return self.store.current_shadows(remote_id)
+
+    # ------------------------------------------------------------------
     # status / stop / rerun helpers
     # ------------------------------------------------------------------
 
@@ -288,11 +400,16 @@ class RemoteControl:
         )
         remote_job_id = result.get("job_id")
         if remote_job_id:
+            row = self.store.db.execute(
+                "SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)
+            ).fetchone()
+            epoch = int(row["state_epoch"]) if row else 1
             self.store.upsert_shadow(
                 remote_id=remote_id,
                 remote_job_id=str(remote_job_id),
                 status=(result.get("status") or "running"),
                 payload=result,
+                state_epoch=epoch,
             )
         return completed
 

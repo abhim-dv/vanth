@@ -34,6 +34,7 @@ import json
 import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from .protocol import (
@@ -123,6 +124,10 @@ class RemoteJobManager:
         validate_request(method, payload)
         if method == "job.status":
             return self._handle_status(frame, payload, idempotency_key)
+        if method == "job.snapshot":
+            return self.handle_snapshot_request(frame, payload)
+        if method == "job.log_range":
+            return self.handle_log_range_request(frame, payload)
         return self._handle_mutation(frame, method, payload, idempotency_key, digest)
 
     def _handle_status(self, frame: dict[str, Any], payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
@@ -329,11 +334,106 @@ class RemoteJobManager:
     # Unsupported (Phase 3/4) frames
     # ------------------------------------------------------------------
 
-    def handle_snapshot_request(self, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._error_frame(frame, code="UNSUPPORTED_FEATURE", message="snapshot is not implemented yet")
+    # ------------------------------------------------------------------
+    # Snapshot + log-range reads (Phase 3)
+    # ------------------------------------------------------------------
 
-    def handle_log_range_request(self, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._error_frame(frame, code="UNSUPPORTED_FEATURE", message="log_range is not implemented yet")
+    SNAPSHOT_PAGE_SIZE = 50
+    SNAPSHOT_EVENT_LIMIT = 500
+
+    def _remote_state_epoch(self) -> int:
+        """The remote's own state epoch, from its remote_state singleton."""
+        try:
+            return self.store.get_state_epoch()
+        except Exception:
+            return 1
+
+    def handle_snapshot_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build one paginated snapshot frame fixed to the remote state epoch.
+
+        The cursor carries the page offset and the high-water event seq. Jobs
+        come from the remote daemon's local ``jobs`` table; events are the
+        bounded tail for the jobs on this page. ``has_more`` is true when more
+        pages follow.
+        """
+        payload = payload if payload is not None else (frame.get("payload") or {})
+        cursor = payload.get("cursor") or {}
+        offset = int(cursor.get("offset", 0)) if isinstance(cursor, dict) else 0
+        manager = self.manager
+        rows = manager.db.execute(
+            """
+            SELECT job_id, name, command, status, created_at, updated_at, exit_code
+            FROM jobs ORDER BY created_at ASC LIMIT ? OFFSET ?
+            """,
+            (self.SNAPSHOT_PAGE_SIZE + 1, offset),
+        ).fetchall()
+        has_more = len(rows) > self.SNAPSHOT_PAGE_SIZE
+        rows = rows[: self.SNAPSHOT_PAGE_SIZE]
+        jobs = [dict(row) for row in rows]
+        events = []
+        high_water = int(cursor.get("high_water", 0)) if isinstance(cursor, dict) else 0
+        for job in jobs:
+            for event_row in manager.db.execute(
+                "SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at "
+                "FROM events WHERE job_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
+                (job["job_id"], high_water, self.SNAPSHOT_EVENT_LIMIT),
+            ).fetchall():
+                events.append(dict(event_row))
+                high_water = max(high_water, int(event_row["seq"]))
+        next_cursor = {
+            "offset": offset + len(jobs),
+            "high_water": high_water,
+        }
+        # Reads travel in a standard response frame's result so the controller
+        # run_request path handles them uniformly; the inner kind identifies
+        # the payload shape.
+        return self._response_frame(frame, {
+            "kind": "snapshot",
+            "state_epoch": self._remote_state_epoch(),
+            "cursor": next_cursor,
+            "jobs": jobs,
+            "events": events,
+            "has_more": has_more,
+        })
+
+    def handle_log_range_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Read a byte range of a remote job's stdout/stderr log.
+
+        Returns a ``log_range`` frame with base64 content; ``truncated`` is set
+        when the requested window was clipped to the file size. Arbitrary bytes
+        round-trip exactly through base64.
+        """
+        import base64
+        import os as _os
+
+        from .protocol import VanthRemoteProtocolError as _VPE
+
+        payload = payload if payload is not None else (frame.get("payload") or {})
+        remote_job_id = payload["remote_job_id"]
+        stream = payload.get("stream") or "stdout"
+        if stream not in ("stdout", "stderr"):
+            return self._error_frame(frame, code="INVALID_REQUEST", message="stream must be 'stdout' or 'stderr'")
+        offset = int(payload.get("offset", 0))
+        size = int(payload.get("size", 65536))
+        if offset < 0 or size <= 0:
+            return self._error_frame(frame, code="INVALID_REQUEST", message="offset must be >= 0 and size must be > 0")
+        path = Path(str(self.manager.logs / f"{remote_job_id}.{stream}.log"))
+        if not path.exists():
+            return self._error_frame(frame, code="INVALID_REQUEST", message=f"unknown remote job log: {remote_job_id}")
+        file_size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            content = handle.read(size)
+        truncated = (offset + len(content)) < file_size
+        return self._response_frame(frame, {
+            "kind": "log_range",
+            "remote_job_id": remote_job_id,
+            "stream": stream,
+            "offset": offset,
+            "size": file_size,
+            "content": base64.b64encode(content).decode("ascii"),
+            "truncated": truncated,
+        })
 
     # ------------------------------------------------------------------
     # Frame builders

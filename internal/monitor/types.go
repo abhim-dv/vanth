@@ -56,6 +56,22 @@ type JobSummary struct {
 	EventCount int64
 	Notes      string
 	RunJSON    string
+	// Remote shadow projection (Phase 3): set when the row comes from a
+	// remote_shadows table rather than the local jobs table. A shadow has no
+	// local PID/heartbeat; the view renders its remote location + status.
+	RemoteID   string
+	Shadow     bool
+}
+
+// IsRemote reports whether this summary is a projected remote shadow.
+func (j JobSummary) IsRemote() bool { return j.Shadow }
+
+// Location returns "local" or the remote id for display.
+func (j JobSummary) Location() string {
+	if j.RemoteID != "" {
+		return j.RemoteID
+	}
+	return "local"
 }
 
 // DisplayName returns the human-friendly job label.

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS remotes (
   key_path TEXT,
   known_hosts_path TEXT,
   installed_at TEXT,
+  snapshot_cursor_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -70,6 +71,9 @@ CREATE TABLE IF NOT EXISTS remote_shadows (
   remote_job_id TEXT NOT NULL,
   status TEXT NOT NULL,
   payload_json TEXT,
+  state_epoch INTEGER NOT NULL DEFAULT 1,
+  suppressed_at TEXT,
+  superseded_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -96,6 +100,11 @@ CREATE TABLE IF NOT EXISTS remote_replay_tombstones (
   created_at TEXT NOT NULL,
   UNIQUE(idempotency_key)
 );
+CREATE TABLE IF NOT EXISTS remote_state (
+  id INTEGER PRIMARY KEY CHECK (id=1),
+  state_epoch INTEGER NOT NULL DEFAULT 1
+);
+INSERT OR IGNORE INTO remote_state(id, state_epoch) VALUES (1, 1);
 """
 
 
@@ -105,7 +114,20 @@ class RemoteStore:
     def __init__(self, db) -> None:
         self.db = db
         self.db.executescript(CONTROLLER_DDL)
+        self._ensure_columns()
         self.db.commit()
+
+    def _ensure_columns(self) -> None:
+        """Add columns introduced after the initial DDL to existing databases."""
+        for table, column, definition in (
+            ("remotes", "snapshot_cursor_json", "TEXT"),
+            ("remote_shadows", "state_epoch", "INTEGER NOT NULL DEFAULT 1"),
+            ("remote_shadows", "suppressed_at", "TEXT"),
+            ("remote_shadows", "superseded_at", "TEXT"),
+        ):
+            existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in existing:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     # ------------------------------------------------------------------
     # Remotes
@@ -406,34 +428,43 @@ class RemoteStore:
         remote_job_id: str,
         status: str,
         payload: dict[str, Any] | None = None,
+        state_epoch: int = 1,
         commit: bool = True,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """Upsert one shadow. Returns None when the shadow is suppressed — a
+        forgotten shadow is never resurrected by a later snapshot."""
         if commit:
             self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
-                "SELECT shadow_id FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
+                "SELECT shadow_id, suppressed_at FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
                 (remote_id, remote_job_id),
             ).fetchone()
             stamp = now_iso()
             payload_json = json.dumps(payload, separators=(",", ":")) if payload is not None else None
-            if existing:
+            if existing and existing["suppressed_at"]:
+                result = None
+            elif existing:
                 self.db.execute(
-                    "UPDATE remote_shadows SET status=?, payload_json=?, updated_at=? WHERE shadow_id=?",
-                    (status, payload_json, stamp, existing[0]),
+                    "UPDATE remote_shadows SET status=?, payload_json=?, state_epoch=?, updated_at=? WHERE shadow_id=?",
+                    (status, payload_json, state_epoch, stamp, existing[0]),
                 )
+                result = self._shadow_dict(self.db.execute(
+                    "SELECT * FROM remote_shadows WHERE shadow_id=?", (existing[0],)
+                ).fetchone())
             else:
                 self.db.execute(
                     """
-                    INSERT INTO remote_shadows(shadow_id, remote_id, remote_job_id, status, payload_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO remote_shadows(shadow_id, remote_id, remote_job_id, status, payload_json,
+                      state_epoch, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("shd_" + secrets.token_hex(16), remote_id, remote_job_id, status, payload_json, stamp, stamp),
+                    ("shd_" + secrets.token_hex(16), remote_id, remote_job_id, status, payload_json, state_epoch, stamp, stamp),
                 )
-            result = self._shadow_dict(self.db.execute(
-                "SELECT * FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
-                (remote_id, remote_job_id),
-            ).fetchone())
+                result = self._shadow_dict(self.db.execute(
+                    "SELECT * FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
+                    (remote_id, remote_job_id),
+                ).fetchone())
             if commit:
                 self.db.commit()
             return result
@@ -441,6 +472,93 @@ class RemoteStore:
             if commit:
                 self.db.rollback()
             raise
+
+    def current_shadows(self, remote_id: str) -> list[dict[str, Any]]:
+        """Live read-path shadows for a remote: not suppressed, not superseded,
+        and pinned to the remote's current snapshot epoch (old epochs are
+        retained only for audit)."""
+        row = self.db.execute("SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown remote_id: {remote_id}")
+        epoch = int(row["state_epoch"])
+        return [
+            self._shadow_dict(row_)
+            for row_ in self.db.execute(
+                "SELECT * FROM remote_shadows WHERE remote_id=? AND suppressed_at IS NULL "
+                "AND superseded_at IS NULL AND state_epoch=? ORDER BY created_at ASC",
+                (remote_id, epoch),
+            ).fetchall()
+        ]
+
+    def get_shadow(self, remote_id: str, remote_job_id: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM remote_shadows WHERE remote_id=? AND remote_job_id=? AND suppressed_at IS NULL",
+            (remote_id, remote_job_id),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"no shadow for remote job {remote_job_id!r} on remote {remote_id!r}")
+        return self._shadow_dict(row)
+
+    def suppress_shadow(self, remote_id: str, remote_job_id: str, *, commit: bool = True) -> dict[str, Any]:
+        """Durably suppress (forget) a shadow so no later snapshot resurrects it."""
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            stamp = now_iso()
+            self.db.execute(
+                "UPDATE remote_shadows SET suppressed_at=?, updated_at=? WHERE remote_id=? AND remote_job_id=?",
+                (stamp, stamp, remote_id, remote_job_id),
+            )
+            if commit:
+                self.db.commit()
+        except BaseException:
+            if commit:
+                self.db.rollback()
+            raise
+        return {"remote_id": remote_id, "remote_job_id": remote_job_id, "suppressed": True}
+
+    def supersede_old_epochs(self, remote_id: str, current_epoch: int, *, commit: bool = True) -> int:
+        """Mark shadows from older snapshot epochs as superseded (audit-only)."""
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            stamp = now_iso()
+            cursor = self.db.execute(
+                "UPDATE remote_shadows SET superseded_at=?, updated_at=? "
+                "WHERE remote_id=? AND state_epoch<? AND superseded_at IS NULL",
+                (stamp, stamp, remote_id, current_epoch),
+            )
+            count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            if commit:
+                self.db.commit()
+            return count
+        except BaseException:
+            if commit:
+                self.db.rollback()
+            raise
+
+    def set_snapshot_cursor(self, remote_id: str, cursor: dict[str, Any], *, commit: bool = True) -> None:
+        if commit:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "UPDATE remotes SET snapshot_cursor_json=?, updated_at=? WHERE remote_id=?",
+                (json.dumps(cursor, separators=(",", ":")), now_iso(), remote_id),
+            )
+            if commit:
+                self.db.commit()
+        except BaseException:
+            if commit:
+                self.db.rollback()
+            raise
+
+    def get_snapshot_cursor(self, remote_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT snapshot_cursor_json FROM remotes WHERE remote_id=?", (remote_id,)
+        ).fetchone()
+        if not row or not row["snapshot_cursor_json"]:
+            return None
+        return json.loads(row["snapshot_cursor_json"])
 
     @staticmethod
     def _shadow_dict(row) -> dict[str, Any]:
@@ -600,6 +718,20 @@ class RemoteOperationStore:
         if not row:
             raise ValueError(f"no replay tombstone for key {idempotency_key!r}")
         return self._tombstone_dict(row)
+
+    def get_state_epoch(self) -> int:
+        """The remote's own state epoch (bumped when its database is restored)."""
+        row = self.db.execute("SELECT state_epoch FROM remote_state WHERE id=1").fetchone()
+        return int(row["state_epoch"]) if row else 1
+
+    def set_state_epoch(self, epoch: int) -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute("UPDATE remote_state SET state_epoch=? WHERE id=1", (int(epoch),))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def get_remote_job_origin(self, remote_job_id: str) -> dict[str, Any] | None:
         row = self.db.execute(

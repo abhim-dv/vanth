@@ -41,13 +41,14 @@ def request_frame(method="job.start", payload=None, key="key-ops-0001"):
 class FakeManager:
     """Stand-in for JobManager: records prepare/launch calls."""
 
-    def __init__(self, logs_dir=None, events_dir=None, launch_status="running", prepare_fails=False):
+    def __init__(self, logs_dir=None, events_dir=None, launch_status="running", prepare_fails=False, db=None):
         self.logs = Path(logs_dir or ".")
         self.events_dir = Path(events_dir or ".")
         self.launch_status = launch_status
         self.prepare_fails = prepare_fails
         self.prepared = []
         self.launched = []
+        self.db = db
 
     def prepare_launch(self, job_id):
         self.prepared.append(job_id)
@@ -64,6 +65,53 @@ class FakeManager:
     def _launch_prepared(self, launch):
         self.launched.append(launch["job_id"])
         return {"job_id": launch["job_id"], "status": self.launch_status}
+
+
+def make_jobs_db():
+    """In-memory jobs/events tables mirroring the remote daemon's schema."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.executescript(
+        """
+        CREATE TABLE jobs (
+          job_id TEXT PRIMARY KEY, name TEXT, command TEXT NOT NULL, cwd TEXT,
+          status TEXT NOT NULL, pid INTEGER, worker_pid INTEGER,
+          runner_heartbeat_at TEXT, stop_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
+          notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
+          env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
+          trigger_json TEXT
+        );
+        CREATE TABLE events (
+          event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
+          type TEXT NOT NULL, level TEXT, message TEXT, data_json TEXT,
+          source TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE deliveries (
+          delivery_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, target_id TEXT NOT NULL,
+          job_id TEXT NOT NULL, target_type TEXT NOT NULL, status TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        """
+    )
+    return db
+
+
+def seed_job(db, job_id="job_snap1", status="running", seq=1):
+    stamp = "2026-01-01T00:00:00Z"
+    db.execute(
+        "INSERT INTO jobs(job_id, name, command, status, exit_code, created_at, updated_at, stdout_path, stderr_path, events_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'o', 'e', 'ev')",
+        (job_id, "n-" + job_id, "echo hi", status, 0 if status == "completed" else None, stamp, stamp),
+    )
+    db.execute(
+        "INSERT INTO events(event_id, job_id, seq, type, source, created_at) VALUES (?, ?, ?, 'progress', 'stdout', ?)",
+        ("evt_" + job_id, job_id, seq, stamp),
+    )
+    db.commit()
 
 
 def make_remote(tmp_path, **kwargs):
@@ -246,12 +294,21 @@ def test_job_status_method_validated_and_routed(tmp_path):
     assert response["result"]["status"] == "queued"
 
 
-def test_snapshot_and_log_range_return_unsupported(tmp_path):
-    remote, store, fake = make_remote(tmp_path)
-    snap = remote.handle_snapshot_request(request_frame())
-    assert snap["kind"] == "error" and snap["code"] == "UNSUPPORTED_FEATURE"
-    logr = remote.handle_log_range_request(request_frame())
-    assert logr["kind"] == "error" and logr["code"] == "UNSUPPORTED_FEATURE"
+def test_snapshot_and_log_range_serve_reads(tmp_path):
+    """Phase 3: snapshot + log_range are implemented reads (no longer stubs)."""
+    db = make_jobs_db()
+    seed_job(db, "job_snap1")
+    (tmp_path / "job_snap1.stdout.log").write_bytes(b"hello remote log\n")
+    remote, store, fake = make_remote(tmp_path, db=db)
+    snap = remote.handle_snapshot_request(request_frame(method="job.snapshot", payload={}))
+    assert snap["kind"] == "response"
+    assert snap["result"]["kind"] == "snapshot"
+    assert snap["result"]["jobs"][0]["job_id"] == "job_snap1"
+    logr = remote.handle_log_range_request(
+        request_frame(method="job.log_range", payload={"remote_job_id": "job_snap1"})
+    )
+    assert logr["kind"] == "response"
+    assert logr["result"]["kind"] == "log_range"
 
 
 # ---------------------------------------------------------------------------

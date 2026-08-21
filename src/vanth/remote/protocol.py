@@ -18,7 +18,7 @@ FRAME_KINDS = ("hello", "request", "response", "error", "snapshot", "log_range")
 
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
-VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun", "job.status")
+VALID_REQUEST_METHODS = ("job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range")
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
@@ -254,6 +254,11 @@ START_OPTIONAL_FIELDS = {
 STOP_OPTIONAL_FIELDS = {"signal", "kill_after_seconds"}
 RERUN_OPTIONAL_FIELDS = {"command", "env", "timeout_seconds", "name", "tags", "notes", "cwd", "interactive"}
 STATUS_ALLOWED = {"job_id"}
+SNAPSHOT_ALLOWED = {"cursor"}
+LOG_RANGE_REQUIRED = {"remote_job_id"}
+LOG_RANGE_ALLOWED = {"remote_job_id", "stream", "offset", "size"}
+
+VALID_LOG_STREAMS = {"stdout", "stderr"}
 
 START_ALLOWED = set(START_OPTIONAL_FIELDS)
 STOP_ALLOWED = {"job_id"} | STOP_OPTIONAL_FIELDS
@@ -387,6 +392,27 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
     elif method == "job.status":
         _check_required_and_unknown(payload, {"job_id"}, STATUS_ALLOWED, "payload")
         _check_string_field(payload, "job_id", required=True)
+    elif method == "job.snapshot":
+        _check_required_and_unknown(payload, set(), SNAPSHOT_ALLOWED, "payload")
+        cursor = payload.get("cursor")
+        if cursor is not None and not isinstance(cursor, dict):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "cursor must be an object")
+    elif method == "job.log_range":
+        _check_required_and_unknown(payload, LOG_RANGE_REQUIRED, LOG_RANGE_ALLOWED, "payload")
+        _check_string_field(payload, "remote_job_id", required=True)
+        stream = payload.get("stream")
+        if stream is not None:
+            if not isinstance(stream, str) or stream not in VALID_LOG_STREAMS:
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "stream must be 'stdout' or 'stderr'")
+        for key in ("offset", "size"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise VanthRemoteProtocolError("INVALID_REQUEST", f"{key} must be a non-negative integer")
+        size = payload.get("size")
+        if size is not None and size > DEFAULT_MAX_FRAME_BYTES // 2:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", f"size must be <= {DEFAULT_MAX_FRAME_BYTES // 2}")
 
 
 def validate_frame(frame: dict[str, Any]) -> dict[str, Any]:

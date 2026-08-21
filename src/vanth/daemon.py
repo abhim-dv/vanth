@@ -375,6 +375,21 @@ class Handler(BaseHTTPRequestHandler):
                 from .remote.pairing import doctor_remote
 
                 ok(self, doctor_remote(remote_id=query.get("remote_id", [None])[0], store=get_remote_store()))
+            elif parsed.path.startswith("/remotes/") and parsed.path.endswith("/jobs"):
+                from .remote.readapi import projected_jobs
+
+                ok(self, projected_jobs(get_manager(), get_remote_store(), parsed.path.split("/")[2],
+                                        limit=int(query.get("limit", ["50"])[0])))
+            elif parsed.path.startswith("/remotes/") and "/status/" in parsed.path:
+                from .remote.readapi import projected_status
+
+                parts = parsed.path.split("/")
+                ok(self, projected_status(get_manager(), get_remote_store(), parts[2], parts[4]))
+            elif parsed.path.startswith("/remotes/") and parsed.path.endswith("/dashboard"):
+                from .remote.readapi import projected_dashboard
+
+                ok(self, projected_dashboard(get_manager(), get_remote_store(), parsed.path.split("/")[2],
+                                             limit=int(query.get("limit", ["5000"])[0])))
             elif parsed.path == "/view":
                 ok(self, get_manager().agent_view(query.get("thread_id", [None])[0], int(query.get("limit", ["50"])[0])))
             elif parsed.path == "/jobs":

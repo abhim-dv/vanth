@@ -4,6 +4,19 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Remote execution (in progress)
+
+- **Phase 0-3 of the remote execution plan are implemented** (see
+  `remote-execution-managed-artifacts-plan.md`): protocol contract with RFC
+  8785 canonicalization and golden digest vectors; secure SSH pairing
+  (`vanth remote pair/list/doctor/remove`, forced-command helper, Ed25519
+  identities, ambient-config neutralization); durable remote
+  start/status/stop/rerun with idempotency keys, state-epoch fencing, and a
+  crash-safe remote dispatcher; paginated snapshot recovery with deletion
+  repair and epoch supersession; exact byte-range remote log reads; and read
+  API projection across local jobs and current remote shadows (Go monitor
+  included). Spec: `docs/spec/remote-protocol-v1.md`.
+
 ### Robustness
 
 - **NEW - MCP process watchdog**: the `vanth` MCP stdio server now self-terminates

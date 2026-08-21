@@ -219,6 +219,44 @@ A read of a remote job's current status.
 
 No field other than `job_id` is allowed.
 
+### 4.5 `job.snapshot`
+
+A paginated snapshot of the remote's jobs and events, fixed to one remote
+state epoch and a high-water event point. Reads travel in a standard
+`response` frame's `result`; the result carries `"kind": "snapshot"` plus:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| kind | string | `"snapshot"` |
+| state_epoch | integer | the remote's state epoch for this page |
+| cursor | object | `{offset, high_water}` — pass back for the next page |
+| jobs | array | minimal job rows (job_id, status, name, command, created_at, updated_at, exit_code) |
+| events | array | bounded event tail for this page's jobs above `high_water` |
+| has_more | boolean | true when another page follows |
+
+Request payload: `cursor` (optional object) selects the page. A complete
+snapshot application repairs missed updates and remote deletions without
+merging epochs; old-epoch shadows are retained only for audit, and suppressed
+(forgotten) shadows are never resurrected.
+
+### 4.6 `job.log_range`
+
+An exact byte-range read of a remote job's stdout/stderr log. The response
+result carries `"kind": "log_range"` plus:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| kind | string | `"log_range"` |
+| remote_job_id | string | job whose log to read |
+| stream | string | `"stdout"` (default) or `"stderr"` |
+| offset | integer | byte offset to start from (`>= 0`) |
+| size | integer | full log file size in bytes |
+| content | string | base64 of exactly the requested bytes; arbitrary bytes round-trip |
+| truncated | boolean | true when the window was clipped to the file size |
+
+Request payload: `remote_job_id` (required), `stream`, `offset`, `size`
+(`size` capped at half the maximum frame size).
+
 ## 5. Error codes
 
 The full registry is `remote-errors-v1.json`. Codes used by this document:
