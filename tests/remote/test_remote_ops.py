@@ -66,6 +66,11 @@ class FakeManager:
         self.launched.append(launch["job_id"])
         return {"job_id": launch["job_id"], "status": self.launch_status}
 
+    def stop_sync(self, job_id, signal="terminate", kill_after_seconds=10):
+        self.stopped = getattr(self, "stopped", [])
+        self.stopped.append(job_id)
+        return {"job_id": job_id, "status": "cancelled"}
+
 
 def make_jobs_db():
     """In-memory jobs/events tables mirroring the remote daemon's schema."""
@@ -278,8 +283,81 @@ def test_dispatcher_converges_running_op_to_terminal(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# job.status method
+# job.stop / job.rerun dispatch (review P0-3: no phantom jobs)
 # ---------------------------------------------------------------------------
+
+
+def seed_running_job(store, job_id="job_target00001"):
+    stamp = "2026-01-01T00:00:00Z"
+    store.db.execute(
+        "INSERT INTO jobs(job_id, name, command, status, created_at, updated_at, env_json, tags_json,"
+        " stdout_path, stderr_path, events_path) "
+        "VALUES (?, 'target', 'sleep 30', 'running', ?, ?, '{}', '[]', 'o', 'e', 'ev')",
+        (job_id, stamp, stamp),
+    )
+    store.db.commit()
+    return job_id
+
+
+def test_stop_targets_existing_job_and_creates_no_new_job(tmp_path):
+    remote, store, fake = make_remote(tmp_path)
+    job_id = seed_running_job(store)
+    response = remote.handle_request(request_frame(method="job.stop", payload={"job_id": job_id}))
+    assert response["kind"] == "response"
+    result = response["result"]
+    assert result["status"] == "cancelled"
+    assert fake.stopped == [job_id]
+    # Exactly ONE job exists — the target — stop never spawns work.
+    jobs = store.db.execute("SELECT job_id FROM jobs").fetchall()
+    assert len(jobs) == 1 and jobs[0]["job_id"] == job_id
+
+
+def test_stop_replay_is_idempotent(tmp_path):
+    remote, store, fake = make_remote(tmp_path)
+    job_id = seed_running_job(store)
+    first = remote.handle_request(request_frame(method="job.stop", payload={"job_id": job_id}))
+    second = remote.handle_request(request_frame(method="job.stop", payload={"job_id": job_id}))
+    assert second["result"]["replayed"] is True
+    assert second["result"]["op_id"] == first["result"]["op_id"]
+    assert fake.stopped.count(job_id) == 1
+    assert len(store.db.execute("SELECT 1 FROM jobs").fetchall()) == 1
+
+
+def test_stop_unknown_job_reports_error_without_creating_work(tmp_path):
+    remote, store, fake = make_remote(tmp_path)
+    response = remote.handle_request(request_frame(method="job.stop", payload={"job_id": "job_missing"}))
+    assert response["kind"] == "response"
+    assert "unknown" in (response["result"].get("error") or "")
+    assert store.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_rerun_resolves_spec_and_queues_exactly_one_rerun(tmp_path):
+    remote, store, fake = make_remote(tmp_path)
+    source = seed_running_job(store, "job_source000001")
+    response = remote.handle_request(request_frame(
+        method="job.rerun", key="key-rerun-0001", payload={"job_id": source},
+    ))
+    result = response["result"]
+    assert result["status"] == "queued"
+    new_id = result["job_id"]
+    assert new_id != source
+    row = store.db.execute("SELECT command, status FROM jobs WHERE job_id=?", (new_id,)).fetchone()
+    assert row["command"] == "sleep 30" and row["status"] == "queued"
+    assert store.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
+
+
+def test_rerun_replay_returns_same_new_job(tmp_path):
+    remote, store, fake = make_remote(tmp_path)
+    source = seed_running_job(store, "job_source000001")
+    first = remote.handle_request(request_frame(
+        method="job.rerun", key="key-rerun-0002", payload={"job_id": source},
+    ))
+    second = remote.handle_request(request_frame(
+        method="job.rerun", key="key-rerun-0002", payload={"job_id": source},
+    ))
+    assert second["result"]["replayed"] is True
+    assert second["result"]["job_id"] == first["result"]["job_id"]
+    assert store.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
 
 
 def test_job_status_method_validated_and_routed(tmp_path):

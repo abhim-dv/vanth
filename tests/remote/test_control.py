@@ -48,7 +48,24 @@ class _FakeSession:
         self._t = transport
 
     def exchange(self, frame_bytes):
-        return self._t.exchange(frame_bytes)
+        import json
+
+        self._t.sent.append(frame_bytes)
+        if self._t.fail:
+            return None
+        body = self._t.error if self._t.error is not None else self._t.response
+        # Model a real responder: echo the request's id/method so the
+        # controller's response binding (review P1-5) accepts it.
+        try:
+            req = json.loads(frame_bytes.decode("utf-8").rstrip("\n"))
+            if isinstance(body, str):
+                body = json.loads(body)
+            if isinstance(body, dict):
+                body = json.dumps({**body, "request_id": req.get("request_id"),
+                                   "method": req.get("method")}, separators=(",", ":"))
+        except (ValueError, AttributeError):
+            pass
+        return body
 
 
 def make_store(tmp_path):

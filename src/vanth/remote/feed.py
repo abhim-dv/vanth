@@ -46,9 +46,15 @@ class FeedStore:
     """Append-only outbox over the same sqlite connection as the remote store."""
 
     def __init__(self, db) -> None:
+        import threading
+
+        from .store import serialize_public_methods
+
+        self.db_lock = threading.RLock()
         self.db = db
         self.db.executescript(FEED_DDL)
         self.db.commit()
+        serialize_public_methods(self)
 
     # ------------------------------------------------------------------
     # Epochs (stored alongside state_epoch in remote_state)

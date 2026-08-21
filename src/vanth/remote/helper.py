@@ -71,6 +71,17 @@ def _forward_to_remote_daemon(frame: dict[str, Any]) -> dict[str, Any]:
             payload = {"result": "error", "error": f"daemon error {exc.code}"}
     except Exception as exc:
         return error_frame(frame, code="AUTH_FAILED", message=f"daemon unreachable: {exc}")
+    # Boundary contract: the daemon returns a VALIDATED protocol frame
+    # (kind response|error) as the HTTP body. Forward it UNCHANGED after
+    # checking it answers THIS request — never re-wrap, or the controller
+    # sees {"kind":"response","result":{"kind":"response",...}} and flat
+    # result fields (state_epoch, acked_offset, ...) become unreachable.
+    if isinstance(payload, dict) and payload.get("version") == "1" and payload.get("kind") in ("response", "error"):
+        if payload.get("request_id") is not None and payload.get("request_id") != frame.get("request_id"):
+            return error_frame(frame, code="INVALID_REQUEST", message="daemon replied to a different request_id")
+        return payload
+    # Legacy / non-frame daemon bodies: map HTTP-level errors to error frames,
+    # otherwise wrap plain JSON results.
     if isinstance(payload, dict) and payload.get("result") == "error":
         return error_frame(frame, code="INVALID_REQUEST", message=payload.get("error", "remote rejected request"))
     return {

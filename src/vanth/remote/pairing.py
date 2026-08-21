@@ -1,81 +1,159 @@
-"""Pairing orchestration for remote execution (Phase 1).
+"""Pairing orchestration for remote execution (Phase 1, hardened per review P0-1).
 
-Coordinates the controller-side steps of pairing a remote:
+The controller-side steps of pairing a remote:
 
-1. Create the remote row in ``unpaired`` state.
-2. Resolve the target with ``ssh -G`` against a generated allowlist config.
-3. Generate one Ed25519 identity and a dedicated known-hosts file.
-4. Build the forced-command authorized_keys entry and install it on the
-   remote (detecting/rejecting an existing unrestricted authorization for the
-   same key).
-5. Prove the forced command with the fixed sentinel handshake (run the helper
-   with empty stdin over SSH; exit 0 = installed).
-6. On success mark ``paired``; on any failure compensate (clean up local key /
-   config / known-hosts and mark ``error``), never leaving an unrelated
-   authorization touched.
+1. Parse and strictly validate the ``[user@]host[:port]`` target.
+2. Pin the host key BEFORE dedicated-key authentication: fetch via
+   ``ssh-keyscan`` and either verify a caller-supplied SHA256 fingerprint or
+   require explicit ``accept_host_key`` consent (TOFU with human approval).
+3. Generate one Ed25519 identity and build a DEDICATED allowlist config
+   (``Host *`` in a per-remote file always passed via ``-F``) so only the
+   Vanth identity can ever authenticate.
+4. Install the exact forced-command authorization using a BOOTSTRAP config
+   (no IdentityFile — the installer's ambient key performs the one-time
+   install). The remote script refuses unrestricted duplicates of our key,
+   is idempotent, and replaces only marker-comment lines.
+5. Prove the helper with a canonical hello frame and REQUIRE a validated
+   hello response — an exit-0 from any command is not proof.
+6. On success mark ``paired``; on any failure compensate: remove ONLY the
+   exact installed marker line remotely (never unrelated authorizations),
+   clean up local state, mark the remote ``error``.
 
-The actual SSH steps are injectable (``transport``) so tests exercise the full
-flow without a network. ``remove_remote`` deletes only the local key, config,
-and known-hosts entry for the remote — it never rewrites the remote's
-authorized_keys file.
+All SSH steps are injectable (``transport``) so tests run without a network.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
-import subprocess
+import sqlite3
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import ssh
+from .protocol import decode_frame, encode_frame
 from .store import RemoteStore
+from ..migrations import configure_connection
 from ..paths import canonical_home
+from ..server import now_iso
+
+# Marker comment embedded in the authorized_keys line; compensation removes
+# ONLY lines carrying this marker for this remote id.
+MARKER_PREFIX = "vanth-remote"
+
+
+def marker_comment(remote_id: str) -> str:
+    return f"{MARKER_PREFIX}:{remote_id}"
+
+
+def _sentinel_hello_frame() -> dict[str, Any]:
+    return {
+        "version": "1",
+        "kind": "hello",
+        "protocol": "vanth.remote",
+        "agent": "vanth-controller-pair",
+        "sent_at": now_iso(),
+    }
+
+
+def validate_hello_response(line: str | bytes | None) -> dict[str, Any]:
+    """Require an exact, validated Vanth hello response (review P0-1).
+
+    An empty line / exit 0 from an arbitrary command proves nothing; only a
+    well-formed ``hello`` frame announcing ``vanth.remote`` counts.
+    """
+    if line is None:
+        raise ssh.VanthRemoteError("sentinel handshake failed: no response from remote helper")
+    text = line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+    try:
+        frame = decode_frame(text.strip())
+    except Exception as exc:
+        raise ssh.VanthRemoteError(f"sentinel handshake failed: unparseable response ({exc})") from None
+    if frame.get("kind") != "hello" or frame.get("protocol") != "vanth.remote":
+        raise ssh.VanthRemoteError(
+            f"sentinel handshake failed: not a vanth.remote hello response (kind={frame.get('kind')!r})"
+        )
+    return frame
 
 
 class DefaultTransport:
     """Real transport bound to OpenSSH binaries. Injectable for tests."""
 
+    def fetch_host_keys(self, hostname: str, port: int | None) -> list[str]:
+        return ssh.fetch_host_keys(hostname, port)
+
+    def host_key_fingerprints(self, known_hosts_lines: list[str]) -> list[str]:
+        return ssh.host_key_fingerprints(known_hosts_lines)
+
     def generate_identity(self, directory: Path, *, comment: str | None = None) -> dict[str, str]:
         return ssh.generate_identity(directory, comment=comment)
 
-    def resolve_target(self, target: str, *, config_dir: Path, known_hosts: str, identity_file: str) -> dict[str, Any]:
-        return ssh.resolve_target(target, config_dir=config_dir, known_hosts=known_hosts, identity_file=identity_file)
-
-    def install_authorized_key(
-        self, *, public_key: str, target: str, helper_command: str, resolved: dict[str, Any]
-    ) -> None:
-        # Real install targets a POSIX OpenSSH host; not exercised here (no
-        # network in tests). The contract: append the forced-command line to
-        # the remote's ~/.ssh/authorized_keys, refusing if an unrestricted
-        # line for the same key already exists. Implemented in ssh.py as a
-        # pure function; a future concrete transport performs the scp/ssh step.
-        from .ssh import authorized_keys_line
-
-        line = authorized_keys_line(public_key, helper_command)
-        # Simulated install: write to a staging file so callers can inspect.
-        staging = Path(resolved.get("_staging", ".")) / "authorized_keys.staged"
-        staging.write_text(line, encoding="utf-8")
-
-    def sentinel_probe(self, *, target: str, config: str, config_dir: Path, timeout: float = 30.0) -> bool:
+    def install_authorized_key(self, *, install_script: str, bootstrap_config: str, config_dir: Path,
+                               target_argv: list[str], timeout: float = 60.0) -> str:
+        """Run the install script on the remote over the BOOTSTRAP config."""
         result = ssh.run_ssh(
-            [target],
+            [*target_argv, "sh", "-s"],
+            config_dir=config_dir,
+            config=bootstrap_config,
+            timeout=timeout,
+            stdin=install_script.encode("utf-8"),
+        )
+        out = result.stdout.decode("utf-8", errors="replace").strip()
+        if result.returncode == 42 or "UNRESTRICTED_KEY_PRESENT" in out:
+            raise ssh.VanthRemoteError(
+                "an unrestricted authorization already exists for this key; "
+                "remove it on the remote before pairing"
+            )
+        if result.returncode != 0:
+            raise ssh.VanthRemoteError(
+                f"authorized-keys install failed (exit {result.returncode}): "
+                f"{result.stderr.decode('utf-8', errors='replace').strip() or out}"
+            )
+        return out
+
+    def remove_authorized_key(self, *, remove_script: str, bootstrap_config: str, config_dir: Path,
+                              target_argv: list[str], timeout: float = 60.0) -> None:
+        ssh.run_ssh(
+            [*target_argv, "sh", "-s"],
+            config_dir=config_dir,
+            config=bootstrap_config,
+            timeout=timeout,
+            stdin=remove_script.encode("utf-8"),
+        )
+
+    def sentinel_probe(self, *, config: str, config_dir: Path, target_argv: list[str],
+                       timeout: float = 30.0) -> dict[str, Any]:
+        """Send the canonical hello frame over the DEDICATED identity config."""
+        result = ssh.run_ssh(
+            target_argv,
             config_dir=config_dir,
             config=config,
             timeout=timeout,
-            stdin=b"",
+            stdin=encode_frame(_sentinel_hello_frame()),
         )
-        # The forced command with empty stdin exits 0 and produces no output.
-        return result.returncode == 0
-
-    def known_hosts_add(self, known_hosts_path: Path, host: str, key_type: str, key: str) -> None:
-        known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
-        with known_hosts_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{host} {key_type} {key}\n")
+        if result.returncode != 0:
+            raise ssh.VanthRemoteError(
+                f"sentinel handshake failed: ssh exit {result.returncode}: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()[:300]}"
+            )
+        return validate_hello_response(result.stdout)
 
 
 def _remote_dir(home: Path, remote_id: str) -> Path:
     return home / "remote" / remote_id
+
+
+def _target_argv(target_info: dict[str, Any]) -> list[str]:
+    argv: list[str] = []
+    if target_info["user"]:
+        argv.append(f"{target_info['user']}@{target_info['hostname']}")
+    else:
+        argv.append(target_info["hostname"])
+    if target_info["port"] and target_info["port"] != 22:
+        argv = ["-p", str(target_info["port"]), *argv]
+    # Port must also be encoded in known_hosts entries ([host]:port form).
+    return argv
 
 
 def pair_remote(
@@ -83,6 +161,8 @@ def pair_remote(
     target: str,
     name: str | None = None,
     allow_root: bool = False,
+    accept_host_key: bool = False,
+    host_fingerprint: str | None = None,
     home: str | os.PathLike[str] | None = None,
     store: RemoteStore | None = None,
     transport: Any | None = None,
@@ -94,81 +174,116 @@ def pair_remote(
     store = store or _default_store(home)
     transport = transport or DefaultTransport()
 
-    if "@" in target:
-        user = target.rsplit("@", 1)[0]
-        if user == "root" and not allow_root:
-            raise ssh.VanthRemoteError(
-                "refusing to pair as root; pass --allow-root to permit it"
-            )
+    target_info = ssh.parse_target(target)
+    if (target_info["user"] or "").lower() == "root" and not allow_root:
+        raise ssh.VanthRemoteError("refusing to pair as root; pass --allow-root to permit it")
 
     remote = store.create_remote(target=target, name=name, state="unpaired")
     remote_id = remote["remote_id"]
     remote_dir = _remote_dir(home, remote_id)
+    known_hosts_path = remote_dir / "known_hosts"
+    marker = marker_comment(remote_id)
+    installed_line: str | None = None
+    bootstrap_config: str | None = None
+    argv: list[str] | None = None
     try:
         store.update_remote_state(remote_id, "pairing")
-        transport.resolve_target(target, config_dir=remote_dir, known_hosts=str(remote_dir / "known_hosts"), identity_file=str(remote_dir / "id_ed25519"))
-        identity = transport.generate_identity(remote_dir, comment="vanth-remote")
-        helper = helper_command or "vanth-remote-helper"
 
-        # Detect an existing unrestricted authorization for the same key.
-        if not allow_root and _public_key_has_unrestricted(identity["public_key_path"]):
+        # --- 1. Host-key pinning BEFORE any authentication -----------------
+        host_keys = transport.fetch_host_keys(target_info["hostname"], target_info["port"])
+        fingerprints = transport.host_key_fingerprints(host_keys)
+        if host_fingerprint:
+            if host_fingerprint not in fingerprints:
+                raise ssh.VanthRemoteError(
+                    f"host key fingerprint mismatch: expected {host_fingerprint}, "
+                    f"remote offered {fingerprints}"
+                )
+        elif not accept_host_key:
             raise ssh.VanthRemoteError(
-                "an unrestricted authorization exists for this key; refusing to install a forced-command key"
+                "refusing to trust unknown host key; re-run with "
+                f"--host-fingerprint {' or '.join(fingerprints[:2])} after verifying, "
+                "or --accept-host-key to pin TOFU-style"
             )
+        known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+        known_hosts_path.write_text("\n".join(host_keys) + "\n", encoding="utf-8")
 
-        resolved = transport.resolve_target(target, config_dir=remote_dir, known_hosts=str(remote_dir / "known_hosts"), identity_file=identity["private_key_path"])
-        config = ssh.allowlist_config(
-            hostname=resolved.get("hostname", target),
-            user=resolved.get("user"),
-            port=resolved.get("port"),
-            identity_file=identity["private_key_path"],
-            known_hosts=str(remote_dir / "known_hosts"),
+        # --- 2. Dedicated identity + configs -------------------------------
+        identity = transport.generate_identity(remote_dir, comment=f"{marker}")
+        pub_path = Path(identity["public_key_path"])
+        pub_fields = pub_path.read_text(encoding="utf-8").strip().split()
+        public_key_blob = " ".join(pub_fields[:2])
+        helper = helper_command or "vanth-remote-helper"
+        installed_line = ssh.authorized_keys_line(public_key_blob, helper, marker_comment=marker)
+        bootstrap_config = ssh.allowlist_config(
+            hostname=target_info["hostname"], user=target_info["user"], port=target_info["port"],
+            identity_file=str(remote_dir / "id_ed25519"), known_hosts=str(known_hosts_path),
+            include_identity=False,
         )
+        dedicated_config = ssh.allowlist_config(
+            hostname=target_info["hostname"], user=target_info["user"], port=target_info["port"],
+            identity_file=str(remote_dir / "id_ed25519"), known_hosts=str(known_hosts_path),
+        )
+        argv = _target_argv(target_info)
+
+        # --- 3. Exact forced-command install over bootstrap credential -----
         transport.install_authorized_key(
-            public_key=identity["public_key_path"],
-            target=target,
-            helper_command=helper,
-            resolved={**resolved, "_staging": str(remote_dir)},
+            install_script=ssh.authorized_keys_install_script(installed_line, marker),
+            bootstrap_config=bootstrap_config,
+            config_dir=remote_dir,
+            target_argv=argv,
         )
-        ok = transport.sentinel_probe(target=target, config=config, config_dir=remote_dir, timeout=timeout)
-        if not ok:
-            raise ssh.VanthRemoteError("sentinel handshake failed: forced command did not return cleanly")
+        store.db.execute(
+            "UPDATE remotes SET installed_authorization=?, updated_at=? WHERE remote_id=?",
+            (installed_line, now_iso(), remote_id),
+        )
+        store.db.commit()
+
+        # --- 4. Sentinel hello over the DEDICATED identity ------------------
+        transport.sentinel_probe(config=dedicated_config, config_dir=remote_dir, target_argv=argv)
 
         store.update_remote_state(remote_id, "paired")
         row = store.get_remote(remote_id)
         return {
             **row,
             "identity": identity,
-            "config": config,
-            "known_hosts_path": str(remote_dir / "known_hosts"),
+            "config": dedicated_config,
+            "bootstrap_config": bootstrap_config,
+            "known_hosts_path": str(known_hosts_path),
+            "host_key_fingerprints": fingerprints,
+            "installed_authorization": installed_line,
         }
+    except ssh.VanthRemoteError:
+        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv)
+        raise
     except Exception as exc:
-        # Compensate: clean up local key/config/known-hosts, mark error.
-        try:
-            store.update_remote_state(remote_id, "error")
-        except Exception:
-            pass
-        shutil.rmtree(remote_dir, ignore_errors=True)
-        if isinstance(exc, ssh.VanthRemoteError):
-            raise
+        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv)
         raise ssh.VanthRemoteError(f"pairing failed: {exc}") from exc
 
 
-def _public_key_has_unrestricted(public_key_path: str) -> bool:
-    """Best-effort local check; the real check runs on the remote. Returns False
-    when it cannot inspect (no remote authorized_keys locally), so pairing can
-    proceed to the remote install step which performs the authoritative check.
-    """
-    return False
+def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: Path,
+                marker: str, installed_line: str | None,
+                bootstrap_config: str | None, argv: list[str] | None) -> None:
+    """Mark error + remove ONLY our exact authorization + local cleanup."""
+    try:
+        store.update_remote_state(remote_id, "error")
+    except Exception:
+        pass
+    if installed_line and bootstrap_config and argv:
+        try:
+            transport.remove_authorized_key(
+                remove_script=ssh.authorized_keys_remove_script(installed_line, marker),
+                bootstrap_config=bootstrap_config,
+                config_dir=remote_dir,
+                target_argv=argv,
+            )
+        except Exception:
+            pass
+    shutil.rmtree(remote_dir, ignore_errors=True)
 
 
 def _default_store(home: Path) -> RemoteStore:
-    import sqlite3
-
     db = sqlite3.connect(home / "remote.sqlite")
     db.row_factory = sqlite3.Row
-    from ..migrations import configure_connection
-
     configure_connection(db)
     return RemoteStore(db)
 
@@ -205,24 +320,42 @@ def remove_remote(
     home: str | os.PathLike[str] | None = None,
     remote_id: str | None = None,
     store: RemoteStore | None = None,
+    transport: Any | None = None,
 ) -> dict[str, Any]:
-    """Remove a remote: delete only its local key/config/known-hosts. The remote
-    host's authorized_keys is never rewritten, so no unrelated authorization can
-    be affected. (Local-only removal for Phase 1; revoking the remote key is a
-    later-phase concern.)
+    """Remove a remote: delete its local key/config/known-hosts and, when the
+    host is reachable, revoke ONLY the exact marker authorization we installed.
+    Unrelated authorizations are never touched (review P0-1).
     """
     home = canonical_home(home)
     store = store or _default_store(home)
+    transport = transport or DefaultTransport()
     if remote_id is None:
         return {"result": "error", "error": "remote_id is required"}
     row = store.get_remote(remote_id)
     remote_dir = home / "remote" / remote_id
+    revoked = False
+    installed = row.get("installed_authorization") if isinstance(row, dict) else None
+    if installed and remote_dir.exists():
+        try:
+            target_info = ssh.parse_target(row["target"])
+            marker = marker_comment(remote_id)
+            bootstrap = ssh.allowlist_config(
+                hostname=target_info["hostname"], user=target_info["user"], port=target_info["port"],
+                identity_file=str(remote_dir / "id_ed25519"),
+                known_hosts=str(remote_dir / "known_hosts"),
+                include_identity=False,
+            )
+            transport.remove_authorized_key(
+                remove_script=ssh.authorized_keys_remove_script(installed, marker),
+                bootstrap_config=bootstrap,
+                config_dir=remote_dir,
+                target_argv=_target_argv(target_info),
+            )
+            revoked = True
+        except Exception:
+            revoked = False
     if remote_dir.exists():
-        shutil.rmtree(remote_dir)
-    _delete_remote_row(store, remote_id)
-    return {"result": "ok", "remote_id": remote_id, "target": row["target"]}
-
-
-def _delete_remote_row(store: RemoteStore, remote_id: str) -> None:
+        shutil.rmtree(remote_dir, ignore_errors=True)
     store.db.execute("DELETE FROM remotes WHERE remote_id=?", (remote_id,))
     store.db.commit()
+    return {"result": "ok", "remote_id": remote_id, "target": row["target"], "revoked_remote_authorization": revoked}

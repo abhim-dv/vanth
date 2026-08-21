@@ -16,8 +16,10 @@ crash before commit leaves no trace and a crash after commit is replay-safe.
 
 from __future__ import annotations
 
+import functools
 import json
 import secrets
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,30 @@ from typing import Any
 from ..migrations import configure_connection
 from ..server import now_iso
 from .protocol import VanthRemoteProtocolError
+
+
+def serialize_public_methods(instance) -> None:
+    """Wrap every public method of ``instance`` in the instance's ``db_lock``.
+
+    ThreadingHTTPServer dispatches HTTP handler requests on different threads
+    while background dispatcher threads share the same sqlite connection;
+    sqlite3 connections are not thread-safe by default and even with
+    ``check_same_thread=False`` interleaved statements/transactions on one
+    connection corrupt transactions. Mirrors JobManager's db_lock pattern.
+    """
+    lock = instance.db_lock
+    for name, attr in list(vars(type(instance)).items()):
+        if name.startswith("_") or not callable(attr) or isinstance(attr, (staticmethod, classmethod)):
+            continue
+
+        @functools.wraps(attr)
+        def wrapper(*args, _attr=attr, _instance=instance, _lock=lock, **kwargs):
+            # Instance-attribute functions are not bound, so the receiver is
+            # closed over explicitly rather than injected as ``self``.
+            with _lock:
+                return _attr(_instance, *args, **kwargs)
+
+        setattr(instance, name, wrapper)
 
 CONTROLLER_DDL = """
 CREATE TABLE IF NOT EXISTS remotes (
@@ -39,6 +65,7 @@ CREATE TABLE IF NOT EXISTS remotes (
   key_path TEXT,
   known_hosts_path TEXT,
   installed_at TEXT,
+  installed_authorization TEXT,
   snapshot_cursor_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -89,6 +116,8 @@ CREATE TABLE IF NOT EXISTS remote_operations (
   payload_json TEXT NOT NULL,
   digest TEXT NOT NULL,
   status TEXT NOT NULL,
+  result_json TEXT,
+  error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(idempotency_key)
@@ -112,15 +141,18 @@ class RemoteStore:
     """Controller-side durable store for remotes and requests."""
 
     def __init__(self, db) -> None:
+        self.db_lock = threading.RLock()
         self.db = db
         self.db.executescript(CONTROLLER_DDL)
         self._ensure_columns()
         self.db.commit()
+        serialize_public_methods(self)
 
     def _ensure_columns(self) -> None:
         """Add columns introduced after the initial DDL to existing databases."""
         for table, column, definition in (
             ("remotes", "snapshot_cursor_json", "TEXT"),
+            ("remotes", "installed_authorization", "TEXT"),
             ("remotes", "feed_cursor_json", "TEXT"),
             ("remote_shadows", "state_epoch", "INTEGER NOT NULL DEFAULT 1"),
             ("remote_shadows", "suppressed_at", "TEXT"),
@@ -597,15 +629,19 @@ class RemoteOperationStore:
     """Remote-side durable store for accepted operations and tombstones."""
 
     def __init__(self, db) -> None:
+        self.db_lock = threading.RLock()
         self.db = db
         self.db.executescript(REMOTE_OPERATION_DDL)
         self._ensure_columns()
         self.db.commit()
+        serialize_public_methods(self)
 
     def _ensure_columns(self) -> None:
         """Add columns introduced after the initial DDL to existing databases."""
         for table, column, definition in (
             ("remote_state", "feed_epoch", "INTEGER NOT NULL DEFAULT 1"),
+            ("remote_operations", "result_json", "TEXT"),
+            ("remote_operations", "error", "TEXT"),
         ):
             existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in existing:
@@ -819,6 +855,8 @@ class RemoteOperationStore:
         result = dict(row)
         payload = result.pop("payload_json", None)
         result["payload"] = json.loads(payload) if payload is not None else None
+        result_json = result.pop("result_json", None)
+        result["result"] = json.loads(result_json) if result_json else None
         return result
 
     @staticmethod

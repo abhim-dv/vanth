@@ -47,6 +47,10 @@ from .protocol import (
 from .store import RemoteStore
 from ..server import now_iso
 
+# Methods that create or mutate remote jobs — the only requests that get a
+# placeholder ``submitting`` shadow (review P2-1).
+_MUTATION_METHODS = frozenset({"job.start", "job.stop", "job.rerun"})
+
 
 class _SSHSession:
     """One SSH process bound to a paired remote; exchange() runs the helper."""
@@ -62,8 +66,9 @@ class _SSHSession:
 
         Returns the decoded stdout line, or None on transport failure.
         """
+        argv = list(self.remote_row.get("_argv") or [self.remote_row.get("target", "")])
         result = ssh.run_ssh(
-            [self.remote_row.get("target", "")],
+            argv,
             config_dir=self.config_dir,
             config=self.config,
             timeout=self.timeout,
@@ -86,15 +91,24 @@ class DefaultSessionTransport:
         """
         remote_id = remote_row["remote_id"]
         remote_dir = home / "remote" / remote_id
+        # Re-parse the stored target so HostName/User/Port are exact — putting
+        # raw "user@host[:port]" in HostName silently drops the remote user
+        # and port (review P0-1).
+        target_info = ssh.parse_target(remote_row.get("target", ""))
         config = ssh.allowlist_config(
-            hostname=remote_row.get("target", ""),
-            user=None,
-            port=None,
+            hostname=target_info["hostname"],
+            user=target_info["user"],
+            port=target_info["port"],
             identity_file=str(remote_dir / "id_ed25519"),
             known_hosts=str(remote_dir / "known_hosts"),
         )
         timeout = float(os.environ.get("VANTH_REMOTE_REQUEST_TIMEOUT", "60"))
-        return _SSHSession(remote_row, config=config, config_dir=remote_dir, timeout=timeout)
+        return _SSHSession(
+            {**remote_row, "_argv": _target_argv(target_info)},
+            config=config,
+            config_dir=remote_dir,
+            timeout=timeout,
+        )
 
 
 class RemoteControl:
@@ -141,7 +155,11 @@ class RemoteControl:
                 digest=digest,
                 commit=False,
             )
-            if request["status"] == "creating":
+            # Placeholder ``submitting`` shadows exist only for mutations —
+            # read methods (status/snapshot/feed/log_range/transfer) never
+            # produce a job, and their per-request placeholders used to linger
+            # forever as phantom ``submitting`` jobs (review P2-1).
+            if request["status"] == "creating" and method in _MUTATION_METHODS:
                 self.store.record_submitting_shadow(remote_id, request)
             self.store.db.commit()
         except BaseException:
@@ -205,6 +223,14 @@ class RemoteControl:
             response = decode_frame(response_line)
         except Exception:
             return self._lost(remote_id, request)
+        # Bind the response to THIS request: a mismatched request_id/method
+        # must never be recorded as our answer (review P1-5).
+        if not isinstance(response, dict) or response.get("kind") not in ("response", "error"):
+            return self._lost(remote_id, request)
+        if response.get("request_id") is not None and response.get("request_id") != request["request_id"]:
+            return self._lost(remote_id, request)
+        if response.get("method") is not None and response.get("method") != request["method"]:
+            return self._lost(remote_id, request)
 
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
@@ -252,14 +278,17 @@ class RemoteControl:
         response = request.get("response") or {}
         return response
 
-    def apply_snapshot(self, remote_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
-        """Apply a snapshot locally in ONE transaction.
+    def apply_snapshot(self, remote_id: str, snapshot: dict[str, Any], *, final_page: bool = True) -> dict[str, Any]:
+        """Apply one snapshot page locally in ONE transaction.
 
-        Upserts shadows pinned to the snapshot's state epoch, suppresses
-        shadows for jobs the snapshot no longer contains at that epoch
-        (repairing remote deletions), supersedes old-epoch rows (audit only),
-        and advances the stored cursor. Suppressed (forgotten) shadows are
-        never resurrected. Snapshot application never creates wake deliveries.
+        Upserts shadows pinned to the snapshot's state epoch and supersedes
+        old-epoch rows. Deletion reconciliation is NOT done per page — a page
+        only contains a slice of the remote's jobs, so treating "absent from
+        this page" as "deleted on the remote" suppressed every job that lived
+        on a later page (review P0-4). Pass ``final_page=True`` (default, for
+        single-page snapshots) to also reconcile deletions and advance the
+        stored cursor; multi-page syncs call ``finalize_snapshot`` after the
+        last page instead.
         """
         epoch = int(snapshot.get("state_epoch") or 1)
         jobs = snapshot.get("jobs") or []
@@ -267,13 +296,10 @@ class RemoteControl:
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
             applied = 0
-            seen_ids = set()
             for job in jobs:
-                remote_job_id = str(job.get("job_id"))
-                seen_ids.add(remote_job_id)
                 result = self.store.upsert_shadow(
                     remote_id=remote_id,
-                    remote_job_id=remote_job_id,
+                    remote_job_id=str(job.get("job_id")),
                     status=str(job.get("status") or "unknown"),
                     payload=job,
                     state_epoch=epoch,
@@ -281,15 +307,13 @@ class RemoteControl:
                 )
                 if result is not None:
                     applied += 1
-            # Repair remote deletions: same-epoch live shadows absent from the
-            # snapshot were deleted on the remote — suppress them.
             deleted = 0
-            for shadow in self.store.current_shadows(remote_id):
-                if shadow["remote_job_id"] not in seen_ids:
-                    self.store.suppress_shadow(remote_id, shadow["remote_job_id"], commit=False)
-                    deleted += 1
             superseded = self.store.supersede_old_epochs(remote_id, epoch, commit=False)
-            self.store.set_snapshot_cursor(remote_id, {"epoch": epoch, **cursor}, commit=False)
+            if final_page:
+                finalize = self._finalize_snapshot_locked(remote_id, epoch, {str(j.get("job_id")) for j in jobs}, cursor)
+                deleted = finalize["deleted"]
+            else:
+                self.store.set_snapshot_cursor(remote_id, {"epoch": epoch, **cursor}, commit=False)
             # Adopt the snapshot's epoch: the controller learns the remote's
             # timeline version (e.g. after a remote restore) in the same tx.
             self.store.db.execute(
@@ -308,20 +332,64 @@ class RemoteControl:
             "state_epoch": epoch,
         }
 
+    def _finalize_snapshot_locked(self, remote_id: str, epoch: int, seen_ids: set[str], cursor: dict[str, Any]) -> dict[str, Any]:
+        """Deletion reconciliation + cursor advance. Caller holds the tx."""
+        deleted = 0
+        for shadow in self.store.current_shadows(remote_id):
+            if shadow["remote_job_id"] not in seen_ids:
+                self.store.suppress_shadow(remote_id, shadow["remote_job_id"], commit=False)
+                deleted += 1
+        self.store.set_snapshot_cursor(remote_id, {"epoch": epoch, **cursor}, commit=False)
+        return {"deleted": deleted}
+
+    def finalize_snapshot(self, remote_id: str, *, epoch: int, seen_ids: set[str], cursor: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Reconcile deletions after the FINAL page of a multi-page sync.
+
+        Only after the complete authoritative identity set has been applied is
+        absence meaningful; per-page suppression used to delete valid shadows
+        that simply lived on a later page (review P0-4).
+        """
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            result = self._finalize_snapshot_locked(
+                remote_id, epoch, seen_ids, cursor or {}
+            )
+            self.store.db.execute(
+                "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                (epoch, now_iso(), remote_id, epoch),
+            )
+            self.store.db.commit()
+        except BaseException:
+            self.store.db.rollback()
+            raise
+        return result
+
     def sync_snapshot(self, remote_id: str) -> dict[str, Any]:
-        """Fetch + apply snapshots until has_more is false; returns totals."""
+        """Fetch + apply snapshots until has_more is false; returns totals.
+
+        Every full sync starts from a FRESH keyset cursor (offset 0): resuming
+        from the previously persisted terminal position omitted earlier jobs,
+        which then failed deletion reconciliation and were suppressed (review
+        P0-4). Deletion reconciliation runs ONCE, over the accumulated
+        identity set of ALL pages, after the final page commits.
+        """
         totals = {"applied": 0, "deleted": 0, "superseded": 0, "pages": 0}
-        cursor = self.store.get_snapshot_cursor(remote_id)
+        seen_ids: set[str] = set()
+        epoch = None
+        cursor = None
         while True:
             snapshot = self.snapshot(remote_id, cursor=cursor)
-            result = self.apply_snapshot(remote_id, snapshot)
+            result = self.apply_snapshot(remote_id, snapshot, final_page=False)
             totals["applied"] += result["applied"]
-            totals["deleted"] += result["deleted"]
             totals["superseded"] += result["superseded"]
             totals["pages"] += 1
+            epoch = int(snapshot.get("state_epoch") or 1)
+            seen_ids |= {str(j.get("job_id")) for j in (snapshot.get("jobs") or [])}
             cursor = snapshot.get("cursor")
             if not snapshot.get("has_more"):
                 break
+        finalize = self.finalize_snapshot(remote_id, epoch=epoch, seen_ids=seen_ids, cursor=cursor)
+        totals["deleted"] = finalize["deleted"]
         return totals
 
     # ------------------------------------------------------------------
@@ -569,6 +637,13 @@ class RemoteControl:
                 payload=result,
                 state_epoch=epoch,
             )
+            # The placeholder ``submitting`` shadow keyed by request id has
+            # served its purpose — retire it so no phantom job lingers in the
+            # read model (review P2-1).
+            try:
+                self.store.suppress_shadow(remote_id, request["request_id"])
+            except Exception:
+                pass
         return completed
 
     def _finish_error(self, remote_id: str, request: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:

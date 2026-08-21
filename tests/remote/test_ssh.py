@@ -51,8 +51,12 @@ def test_allowlist_config_contains_hardened_directives():
     assert "ForwardX11 no" in cfg
     assert "RequestTTY no" in cfg
     assert "ProxyCommand none" in cfg
-    # No ambient config surface.
-    assert "Host *" not in cfg
+    # Single-target dedicated file: Host * covers every invocation made with
+    # -F, so directives can never be skipped by targeting the raw hostname
+    # (review P0-1).
+    assert "Host *" in cfg
+    assert "IdentityFile /tmp/id" in cfg
+    assert "IdentitiesOnly yes" in cfg
 
 
 def test_authorized_keys_line_is_forced_command():
@@ -135,3 +139,38 @@ def test_resolve_target_uses_generated_config(monkeypatch, tmp_path):
     assert resolved["hostname"] == "example.com"
     assert resolved["user"] == "alice"
     assert resolved["port"] == 22
+
+
+def test_effective_config_offers_only_vanth_identity(tmp_path):
+    """Review P0-1 required test: real `ssh -G -F <generated>` proves the
+    dedicated identity/known-hosts/no-forwarding set applies to the final
+    target - ambient ~/.ssh/config cannot inject anything."""
+    import subprocess as sp
+
+    from vanth.remote.ssh import allowlist_config
+
+    identity = str(tmp_path / "id_ed25519")
+    known_hosts = str(tmp_path / "known_hosts")
+    cfg_text = allowlist_config(
+        hostname="example.com", user="ubuntu", port=2222,
+        identity_file=identity, known_hosts=known_hosts,
+    )
+    cfg_path = tmp_path / "ssh_config"
+    cfg_path.write_text(cfg_text, encoding="utf-8")
+    result = sp.run(
+        ["ssh", "-G", "-F", str(cfg_path), "alice@example.com"],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    resolved = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        resolved[key] = value
+    assert resolved["identityfile"] == identity
+    assert resolved["identitiesonly"] in ("yes", "true")
+    assert resolved["userknownhostsfile"] == known_hosts
+    assert resolved["stricthostkeychecking"] in ("yes", "true")
+    assert resolved["batchmode"] in ("yes", "true")
+    assert resolved["forwardagent"] in ("no", "false")
+    assert resolved["requesttty"] in ("no", "false")
+    assert resolved["controlmaster"] in ("no", "false")

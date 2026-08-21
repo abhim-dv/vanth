@@ -84,31 +84,39 @@ def require_binaries() -> dict[str, str]:
 
 def allowlist_config(
     *,
-    hostname: str,
-    user: str | None,
-    port: int | None,
+    hostname: str = "*",
+    user: str | None = None,
+    port: int | None = None,
     identity_file: str,
     known_hosts: str,
     timeout: float = 15.0,
+    include_identity: bool = True,
 ) -> str:
     """Build a dedicated OpenSSH config from an explicit allowlist.
 
-    The returned text is written to a generated file and passed via ``-F``.
-    Only the allowlisted directives appear; ambient user config can never
-    leak identities, forwarding, control sockets, ProxyCommand, or remote
-    commands into the connection.
+    Defaults to ``Host *`` because the config lives in a per-remote directory
+    and is ALWAYS passed via ``-F`` — pattern-matching on a fixed alias while
+    invoking ssh with the raw target made every directive dead (review P0-1:
+    ambient credentials were used instead of the dedicated identity). With
+    ``include_identity=False`` the config is a BOOTSTRAP profile: it pins host
+    keys and forbids forwarding but deliberately omits IdentityFile so the
+    installer's pre-existing ambient credential performs the one-time
+    authorized-keys installation.
     """
     lines = [
-        "Host vanth-remote",
+        "Host *",
         f"    HostName {hostname}",
     ]
     if user:
         lines.append(f"    User {user}")
     if port:
         lines.append(f"    Port {port}")
+    if include_identity:
+        lines += [
+            f"    IdentityFile {identity_file}",
+            "    IdentitiesOnly yes",
+        ]
     lines += [
-        f"    IdentityFile {identity_file}",
-        "    IdentitiesOnly yes",
         f"    UserKnownHostsFile {known_hosts}",
         "    StrictHostKeyChecking yes",
         "    BatchMode yes",
@@ -121,6 +129,133 @@ def allowlist_config(
         "    ControlMaster no",
     ]
     return "\n".join(lines) + "\n"
+
+
+_TARGET_RE = __import__("re").compile(r"^(?:(?P<user>[A-Za-z_][A-Za-z0-9._-]*)@)?(?P<host>[A-Za-z0-9._-]+|\[[0-9a-fA-F:.]+\])(?::(?P<port>\d{1,5}))?$")
+
+
+def parse_target(target: str) -> dict[str, Any]:
+    """Parse and validate ``[user@]hostname[:port]`` strictly.
+
+    Rejects control characters, whitespace, quotes and any metacharacter that
+    could inject OpenSSH config options or shell text (review P0-1).
+    Returns ``{"user", "hostname", "port"}``.
+    """
+    if not isinstance(target, str) or not target.strip():
+        raise VanthRemoteError("target must be a non-empty string")
+    if any(ord(ch) < 0x20 or ch in "\"'`$\\;|&<>!{}[]()#~*= " for ch in target):
+        raise VanthRemoteError(f"target contains forbidden characters: {target!r}")
+    match = _TARGET_RE.match(target)
+    if not match:
+        raise VanthRemoteError(f"target must look like [user@]hostname[:port], got: {target!r}")
+    user = match.group("user")
+    host = match.group("host")
+    port_text = match.group("port")
+    port = int(port_text) if port_text else None
+    if port is not None and not (1 <= port <= 65535):
+        raise VanthRemoteError(f"port out of range: {port}")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return {"user": user, "hostname": host, "port": port}
+
+
+def fetch_host_keys(hostname: str, port: int | None, *, timeout: float = 15.0) -> list[str]:
+    """Fetch the host's public keys via ``ssh-keyscan`` (TOFU material).
+
+    Returns raw known_hosts lines. Callers MUST display fingerprints and get
+    human approval (or verify a supplied SHA256 fingerprint) before trusting
+    them (review P0-1: pin a human-approved host key).
+    """
+    require_binaries()
+    argv = ["ssh-keyscan", "-T", str(int(max(1, timeout))), "-p", str(port or 22), hostname]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout + 10)
+    lines = [
+        line.strip()
+        for line in (result.stdout or "").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if not lines:
+        raise VanthRemoteError(f"ssh-keyscan returned no host keys for {hostname}:{port or 22}")
+    return lines
+
+
+def host_key_fingerprints(known_hosts_lines: list[str]) -> list[str]:
+    """SHA256 fingerprints for raw known_hosts lines (via ssh-keygen -lf -)."""
+    require_binaries()
+    blobs: dict[str, str] = {}
+    for line in known_hosts_lines:
+        fields = line.split()
+        if len(fields) >= 3:
+            blobs.setdefault((fields[0], fields[1]), fields[2])
+    fingerprints = []
+    for (hosts, _ktype), key in blobs.items():
+        proc = subprocess.run(
+            ["ssh-keygen", "-lf", "-"],
+            input=f"{hosts} x {key}\n".encode(),
+            capture_output=True,
+            timeout=15,
+        )
+        if proc.returncode == 0:
+            parts = proc.stdout.decode().strip().split()
+            if len(parts) >= 2:
+                fingerprints.append(parts[1])
+    return fingerprints
+
+
+def authorized_keys_install_script(public_key_line: str, marker_comment: str) -> str:
+    """POSIX shell snippet that atomically installs ONE exact authorization.
+
+    - Refuses when an UNRESTRICTED line containing the same key blob already
+      exists (exit 42 / ``UNRESTRICTED_KEY_PRESENT``) — review P0-1.
+    - Idempotent: exits 0 / ``ALREADY_INSTALLED`` when the exact line exists.
+    - Replaces only lines carrying our marker comment, then installs via
+      mktemp + mv (atomic within the same filesystem).
+    """
+    import shlex
+
+    fields = public_key_line.split()
+    key_blob = " ".join(fields[1:3]) if len(fields) >= 3 else ""
+    line_literal = shlex.quote(public_key_line.rstrip("\n"))
+    marker_literal = shlex.quote(marker_comment)
+    blob_literal = shlex.quote(key_blob)
+    return "\n".join([
+        "set -eu",
+        'AK="$HOME/.ssh/authorized_keys"',
+        'mkdir -p "$HOME/.ssh"',
+        'chmod 700 "$HOME/.ssh"',
+        'touch "$AK"',
+        'chmod 600 "$AK"',
+        f"if awk -v k={blob_literal} 'index($0, k) && $0 !~ /^command=/' \"$AK\"; then",
+        "  echo 'UNRESTRICTED_KEY_PRESENT' >&2",
+        "  exit 42",
+        "fi",
+        f"if grep -Fq {line_literal} \"$AK\"; then",
+        "  echo 'ALREADY_INSTALLED'",
+        "  exit 0",
+        "fi",
+        "TMP=$(mktemp)",
+        f"grep -vF {marker_literal} \"$AK\" > \"$TMP\" || true",
+        f"printf '%s\\n' {line_literal} >> \"$TMP\"",
+        "sort -u -o \"$TMP\" \"$TMP\"",
+        'mv "$TMP" "$AK"',
+        "echo 'INSTALLED'",
+    ]) + "\n"
+
+
+def authorized_keys_remove_script(public_key_line: str, marker_comment: str) -> str:
+    """POSIX shell snippet removing ONLY the exact Vanth-installed line."""
+    import shlex
+
+    marker_literal = shlex.quote(marker_comment)
+    return (
+        "set -eu\n"
+        "AK=\"$HOME/.ssh/authorized_keys\"\n"
+        "[ -f \"$AK\" ] || { echo 'REMOVED'; exit 0; }\n"
+        f"TMP=$(mktemp)\n"
+        f"grep -vF {marker_literal} \"$AK\" > \"$TMP\" || true\n"
+        f"mv \"$TMP\" \"$AK\"\n"
+        "echo 'REMOVED'\n"
+    )
 
 
 def generate_identity(directory: Path, *, comment: str | None = None) -> dict[str, str]:
@@ -195,30 +330,26 @@ def _current_user_sid() -> str:
 # authorized_keys handling
 # ---------------------------------------------------------------------------
 
-_AUTH_KEY_OPTIONS = (
-    "no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc"
-)
-
 
 def authorized_keys_line(
-    public_key: str,
+    public_key_blob: str,
     helper_command: str,
     *,
-    extra_options: str | None = None,
+    marker_comment: str = "vanth-remote",
 ) -> str:
     """Build a forced-command, restricted authorized_keys line.
 
-    ``helper_command`` must be an absolute path to the remote helper
-    (``vanth-remote-helper``) on the remote host. The forced command prevents
-    the key from opening a shell or running arbitrary commands.
+    ``public_key_blob`` must be the two-token key (``ssh-ed25519 AAAA...``).
+    ``helper_command`` is the absolute remote helper path. The marker comment
+    terminates the line so compensation can remove EXACTLY this line and
+    never an unrelated authorization (review P0-1).
     """
-    public_key = public_key.strip()
-    options = _AUTH_KEY_OPTIONS
-    if extra_options:
-        options = f"command=\"{helper_command}\",{extra_options}"
-    else:
-        options = f"command=\"{helper_command}\",{options}"
-    return f"{options} {public_key}\n"
+    public_key_blob = public_key_blob.strip()
+    options = (
+        f'command="{helper_command}",no-pty,no-agent-forwarding,'
+        "no-port-forwarding,no-X11-forwarding,no-user-rc"
+    )
+    return f"{options} {public_key_blob} {marker_comment}\n"
 
 
 def parse_authorized_keys(line: str) -> dict[str, Any]:

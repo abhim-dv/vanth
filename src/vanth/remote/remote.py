@@ -31,7 +31,9 @@ trigger, quota, and cleanup code stay entirely on the local ``jobs`` table.
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import stat as _stat
 import threading
 import time
 from pathlib import Path
@@ -194,20 +196,92 @@ class RemoteJobManager:
     def _handle_mutation(
         self, frame: dict[str, Any], method: str, payload: dict[str, Any], idempotency_key: str, digest: str
     ) -> dict[str, Any]:
+        # Dispatch by method: job.start creates a queued job; job.rerun resolves
+        # the original run spec and queues exactly ONE rerun under its own
+        # idempotency record; job.stop stops the TARGET job. Routing everything
+        # through one "create a queued job" path made stop/rerun spawn
+        # unrelated workloads (review P0-3).
+        if method == "job.stop":
+            return self._handle_stop(frame, payload, idempotency_key, digest)
+        return self._handle_start_or_rerun(frame, method, payload, idempotency_key, digest)
+
+    def _record_op_uncommitted(self, idempotency_key: str, method: str, payload: dict[str, Any], digest: str) -> tuple[dict[str, Any], bool]:
+        op = self.store.record_operation(
+            idempotency_key=idempotency_key,
+            method=method,
+            payload=payload,
+            digest=digest,
+            commit=False,
+        )
+        return op, op["status"] != "accepted"
+
+    def _handle_stop(self, frame: dict[str, Any], payload: dict[str, Any], idempotency_key: str, digest: str) -> dict[str, Any]:
+        """Stop the target job on this remote. Idempotent per caller key."""
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
-            op = self.store.record_operation(
-                idempotency_key=idempotency_key,
-                method=method,
-                payload=payload,
-                digest=digest,
-                commit=False,
+            op, replayed = self._record_op_uncommitted(idempotency_key, "job.stop", payload, digest)
+            self.store.db.commit()
+        except BaseException:
+            self.store.db.rollback()
+            raise
+        if replayed and op.get("result") is not None:
+            # Durable result replay: never re-execute or spawn anything.
+            return self._response_frame(frame, {**op["result"], "replayed": True})
+        job_id = payload["job_id"]
+        stopped_status = None
+        error = None
+        try:
+            row = self.store.db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                error = f"unknown job on remote: {job_id}"
+            elif row["status"] in TERMINAL_STATUSES:
+                stopped_status = row["status"]
+            else:
+                stop_result = self.manager.stop_sync(job_id)
+                stopped_status = stop_result.get("status")
+        except Exception as exc:
+            error = str(exc)
+        result = {
+            "op_id": op["op_id"],
+            "job_id": job_id,
+            "status": stopped_status or "stopping",
+        }
+        if error:
+            result["error"] = error
+        # Force-complete the stop op with its durable result (the generic
+        # operation machine models job launches, not management intents), so a
+        # lost response replays THIS result instead of re-executing.
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.store.db.execute(
+                "UPDATE remote_operations SET status='completed', result_json=?, updated_at=? WHERE op_id=?",
+                (json.dumps(result, separators=(",", ":")), now_iso(), op["op_id"]),
             )
-            replay = op["status"] != "accepted"
+            self.store.db.commit()
+        except BaseException:
+            self.store.db.rollback()
+            raise
+        return self._response_frame(frame, result)
+
+    def _handle_start_or_rerun(self, frame, method, payload, idempotency_key, digest):
+        if method == "job.rerun":
+            source = self._resolve_rerun_spec(payload["job_id"])
+            if isinstance(source, str):
+                return self._response_frame(frame, {
+                    "op_id": None, "job_id": payload["job_id"],
+                    "status": "error", "error": source,
+                })
+            run_payload = {**source, **{k: v for k, v in payload.items() if v is not None and k != "job_id" and k != "idempotency_key"}}
+            run_payload.setdefault("command", source.get("command", ""))
+        else:
+            run_payload = payload
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            op, replayed = self._record_op_uncommitted(idempotency_key, method, run_payload, digest)
             job_id = None
-            if not replay:
+            if not replayed:
                 job_id = "job_" + secrets.token_hex(16)[:12]
-                self._insert_queued_job_uncommitted(job_id, payload)
+                self._insert_queued_job_uncommitted(job_id, run_payload)
                 origin = "remote:" + idempotency_key
                 self.store.record_queued_job(
                     op_id=op["op_id"],
@@ -215,12 +289,14 @@ class RemoteJobManager:
                     origin=origin,
                 )
                 self.store.update_operation_status(op["op_id"], "queued", commit=False)
+            else:
+                # Replay returns the SAME job — never a second incarnation.
+                job_id = self.store.get_remote_job_origin_op(op["op_id"])
             self.store.db.commit()
         except BaseException:
             self.store.db.rollback()
             raise
-        if replay:
-            job_id = self.store.get_remote_job_origin_op(op["op_id"]) or op.get("job_id")
+        if replayed:
             return self._response_frame(frame, {
                 "op_id": op["op_id"],
                 "job_id": job_id,
@@ -237,6 +313,33 @@ class RemoteJobManager:
             "job_id": job_id,
             "status": "queued",
         })
+
+    def _resolve_rerun_spec(self, job_id: str) -> dict[str, Any] | str:
+        """Resolve the immutable run spec of an existing remote job for rerun.
+
+        Returns the spec dict, or an error string when the job is unknown.
+        """
+        row = self.store.db.execute(
+            "SELECT command, cwd, env_json, timeout_seconds, name, notes, tags_json FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return f"unknown job on remote: {job_id}"
+        try:
+            env = json.loads(row["env_json"] or "{}")
+            tags = json.loads(row["tags_json"] or "[]")
+        except ValueError:
+            env, tags = {}, []
+        spec = {
+            "command": row["command"],
+            "cwd": row["cwd"],
+            "name": row["name"],
+            "notes": row["notes"],
+            "timeout_seconds": row["timeout_seconds"],
+            "env": env,
+            "tags": tags,
+        }
+        return {k: v for k, v in spec.items() if v is not None}
 
     def _insert_queued_job_uncommitted(self, job_id: str, payload: dict[str, Any]) -> None:
         """Insert the queued job row + origin mapping inside the caller's transaction."""
@@ -404,38 +507,46 @@ class RemoteJobManager:
     def handle_snapshot_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build one paginated snapshot frame fixed to the remote state epoch.
 
-        The cursor carries the page offset and the high-water event seq. Jobs
-        come from the remote daemon's local ``jobs`` table; events are the
-        bounded tail for the jobs on this page. ``has_more`` is true when more
-        pages follow.
+        Pagination uses a KEYSET cursor (``after_job_id``, ordered by job_id)
+        rather than mutable LIMIT/OFFSET, so concurrent inserts/deletes cannot
+        shift rows between pages and skip or duplicate entries (review P0-4).
+        Event cursors are PER JOB (``event_water: {job_id: seq}``) because
+        event sequence numbers reset per job — one shared high-water skipped
+        events on later jobs whose sequences were below an earlier job's max
+        (review P1-4).
         """
         payload = payload if payload is not None else (frame.get("payload") or {})
         cursor = payload.get("cursor") or {}
-        offset = int(cursor.get("offset", 0)) if isinstance(cursor, dict) else 0
+        if not isinstance(cursor, dict):
+            cursor = {}
+        after_job_id = str(cursor.get("after_job_id") or "")
         manager = self.manager
         rows = manager.db.execute(
             """
             SELECT job_id, name, command, status, created_at, updated_at, exit_code
-            FROM jobs ORDER BY created_at ASC LIMIT ? OFFSET ?
+            FROM jobs WHERE job_id>? ORDER BY job_id ASC LIMIT ?
             """,
-            (self.SNAPSHOT_PAGE_SIZE + 1, offset),
+            (after_job_id, self.SNAPSHOT_PAGE_SIZE + 1),
         ).fetchall()
         has_more = len(rows) > self.SNAPSHOT_PAGE_SIZE
         rows = rows[: self.SNAPSHOT_PAGE_SIZE]
         jobs = [dict(row) for row in rows]
+        event_water = dict(cursor.get("event_water") or {}) if isinstance(cursor.get("event_water"), dict) else {}
         events = []
-        high_water = int(cursor.get("high_water", 0)) if isinstance(cursor, dict) else 0
         for job in jobs:
+            job_high = int(event_water.get(job["job_id"]) or 0)
             for event_row in manager.db.execute(
                 "SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at "
                 "FROM events WHERE job_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
-                (job["job_id"], high_water, self.SNAPSHOT_EVENT_LIMIT),
+                (job["job_id"], job_high, self.SNAPSHOT_EVENT_LIMIT),
             ).fetchall():
                 events.append(dict(event_row))
-                high_water = max(high_water, int(event_row["seq"]))
+                job_high = max(job_high, int(event_row["seq"]))
+            if job_high:
+                event_water[job["job_id"]] = job_high
         next_cursor = {
-            "offset": offset + len(jobs),
-            "high_water": high_water,
+            "after_job_id": jobs[-1]["job_id"] if jobs else after_job_id,
+            "event_water": event_water,
         }
         # Reads travel in a standard response frame's result so the controller
         # run_request path handles them uniformly; the inner kind identifies
@@ -549,6 +660,12 @@ class RemoteJobManager:
 
         payload = payload if payload is not None else (frame.get("payload") or {})
         remote_job_id = payload["remote_job_id"]
+        # Opaque-ID grammar + containment: job ids are untrusted input and are
+        # concatenated into log paths (review P1-3).
+        import re as _re
+
+        if not isinstance(remote_job_id, str) or not _re.fullmatch(r"[A-Za-z0-9_\-]{4,80}", remote_job_id):
+            return self._error_frame(frame, code="INVALID_REQUEST", message="invalid remote_job_id")
         stream = payload.get("stream") or "stdout"
         if stream not in ("stdout", "stderr"):
             return self._error_frame(frame, code="INVALID_REQUEST", message="stream must be 'stdout' or 'stderr'")
@@ -556,10 +673,19 @@ class RemoteJobManager:
         size = int(payload.get("size", 65536))
         if offset < 0 or size <= 0:
             return self._error_frame(frame, code="INVALID_REQUEST", message="offset must be >= 0 and size must be > 0")
-        path = Path(str(self.manager.logs / f"{remote_job_id}.{stream}.log"))
-        if not path.exists():
+        logs_root = Path(self.manager.logs)
+        path = logs_root / f"{remote_job_id}.{stream}.log"
+        resolved_root = os.path.realpath(str(logs_root))
+        resolved_path = os.path.realpath(str(path))
+        if not resolved_path.startswith(resolved_root + os.sep):
+            return self._error_frame(frame, code="INVALID_REQUEST", message="log path escapes the logs directory")
+        try:
+            info = os.stat(str(path), follow_symlinks=False)
+        except OSError:
             return self._error_frame(frame, code="INVALID_REQUEST", message=f"unknown remote job log: {remote_job_id}")
-        file_size = path.stat().st_size
+        if not _stat.S_ISREG(info.st_mode):
+            return self._error_frame(frame, code="INVALID_REQUEST", message="log is not a regular file")
+        file_size = int(info.st_size)
         with path.open("rb") as handle:
             handle.seek(offset)
             content = handle.read(size)

@@ -151,28 +151,37 @@ def test_apply_snapshot_upserts_and_advances_cursor_one_tx(tmp_path):
     assert shadows[0]["remote_job_id"] == "job_a"
     assert shadows[0]["status"] == "running"
     cursor = cstore.get_snapshot_cursor(row["remote_id"])
-    assert cursor is not None and "high_water" in cursor
+    # Keyset pagination cursor (review P0-4): stable under concurrent writes.
+    assert cursor is not None and "after_job_id" in cursor
 
 
 def test_full_snapshot_repairs_deletions_without_merging_epochs(tmp_path):
     cstore, rstore, remote, control, row, jobs_db, logs = make_world(
         tmp_path, job_rows=[("job_a", "running"), ("job_b", "running")]
     )
-    snap1 = snap_of(remote)
-    control.apply_snapshot(row["remote_id"], snap1)
+    control.sync_snapshot(row["remote_id"])
     assert len(control.shadows(row["remote_id"])) == 2
 
-    # job_b is deleted on the remote; a new epoch begins (remote db restore).
+    # Same-epoch deletion: job_b vanishes without a restore.
     jobs_db.execute("DELETE FROM jobs WHERE job_id='job_b'")
     jobs_db.commit()
-    rstore.set_state_epoch(2)
-    snap2 = snap_of(remote)
-    result = control.apply_snapshot(row["remote_id"], snap2)
-
-    # Deletion repaired: only job_a remains live.
+    totals = control.sync_snapshot(row["remote_id"])
     live = [s["remote_job_id"] for s in control.shadows(row["remote_id"])]
     assert live == ["job_a"]
-    assert result["deleted"] >= 1
+    assert totals["deleted"] >= 1
+
+    # Restore-style deletion (new epoch): the old-epoch shadow is superseded
+    # (audit-only) rather than counted as a same-epoch deletion.
+    jobs_db.execute("INSERT INTO jobs(job_id, name, command, status, exit_code, created_at, updated_at, stdout_path, stderr_path, events_path) "
+                    "VALUES ('job_b', 'n', 'echo hi', 'running', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'o', 'e', 'ev')")
+    jobs_db.commit()
+    rstore.set_state_epoch(2)
+    jobs_db.execute("DELETE FROM jobs WHERE job_id='job_b'")
+    jobs_db.commit()
+    totals = control.sync_snapshot(row["remote_id"])
+    live = [s["remote_job_id"] for s in control.shadows(row["remote_id"])]
+    assert live == ["job_a"]
+    assert totals["superseded"] >= 1
     # Old-epoch rows retained for audit but excluded from the read path.
     audit = cstore.db.execute(
         "SELECT COUNT(*) FROM remote_shadows WHERE remote_id=? AND superseded_at IS NOT NULL",
@@ -182,6 +191,33 @@ def test_full_snapshot_repairs_deletions_without_merging_epochs(tmp_path):
     # Epochs never merged: every live shadow is at the current epoch.
     for shadow in control.shadows(row["remote_id"]):
         assert shadow["state_epoch"] == 2
+
+
+def test_multipage_snapshot_does_not_suppress_later_pages(tmp_path):
+    """Review P0-4 regression: page 1 must never delete page-2 shadows."""
+    cstore, rstore, remote, control, row, jobs_db, logs = make_world(
+        tmp_path, job_rows=[(f"job_{i:03d}", "completed") for i in range(120)]
+    )
+    totals = control.sync_snapshot(row["remote_id"])
+    assert totals["pages"] >= 3
+    live = {s["remote_job_id"] for s in control.shadows(row["remote_id"])}
+    assert len(live) == 120
+    assert totals["deleted"] == 0
+
+
+def test_second_sync_does_not_suppress_valid_shadows(tmp_path):
+    """Review P0-4 regression: resuming a sync from the terminal position
+    omitted earlier jobs, whose absence then suppressed them."""
+    cstore, rstore, remote, control, row, jobs_db, logs = make_world(
+        tmp_path, job_rows=[(f"job_{i:03d}", "completed") for i in range(60)]
+    )
+    control.sync_snapshot(row["remote_id"])
+    first = {s["remote_job_id"] for s in control.shadows(row["remote_id"])}
+    # Second full sync (fresh cursor) keeps every shadow alive.
+    totals = control.sync_snapshot(row["remote_id"])
+    second = {s["remote_job_id"] for s in control.shadows(row["remote_id"])}
+    assert second == first and len(second) == 60
+    assert totals["deleted"] == 0
 
 
 def test_forget_shadow_prevents_resurrection(tmp_path):

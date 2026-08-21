@@ -4,6 +4,41 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Review fixes (remote-artifacts-implementation-review.md)
+
+- **P0-1 Pairing hardened**: strict target validation (rejects control chars /
+  config injection), `Host *` dedicated per-remote config always passed via
+  `-F` so directives can never be skipped by targeting the raw hostname,
+  host-key pinning before any auth (`--host-fingerprint` verification or
+  explicit `--accept-host-key` TOFU consent), real authorized-keys install
+  script (atomic, idempotent, refuses unrestricted duplicates of our key),
+  canonical hello sentinel requiring a validated `vanth.remote` response, and
+  compensation that revokes ONLY the marker line on failure/remove.
+- **P0-2 Cross-thread SQLite fixed**: shared remote-store connections opened
+  with `check_same_thread=False` and every store operation serialized via
+  RLock (JobManager db_lock pattern) — pairing + subsequent job requests on
+  different handler threads no longer crash.
+- **P0-3 job.stop / job.rerun dispatch correctly**: stop targets the existing
+  job via the manager (no phantom queued job); rerun resolves the original
+  immutable run spec and queues exactly one rerun whose replay returns the
+  SAME new job id; both carry durable results for lost-response replay.
+- **P0-4 Snapshot pagination repaired**: remote pages use a stable keyset
+  cursor (job_id ordered) instead of mutable OFFSET; controller applies pages
+  WITHOUT deletion reconciliation and reconciles only after the FINAL page
+  over the accumulated identity set; every sync starts from a fresh cursor.
+  >50-job snapshots and second syncs no longer suppress valid shadows.
+- **P0-5 Helper framing**: daemon protocol frames forwarded UNCHANGED after
+  request_id/method binding — no more double-wrapped responses hiding flat
+  result fields (state_epoch, acked_offset) from the controller/transfer path.
+- **P1 fixes**: responses bound to their request_id/method; artifact ops can
+  no longer steal a live claim (only pending/failed/expired-running may be
+  claimed); remote log reads enforce opaque-ID grammar + containment +
+  no-symlink; `_run_request` re-drive seam preserved for retry.
+- **P2/P3**: placeholder `submitting` shadows only created for mutations and
+  retired when the real shadow lands; remote wait surfaces hard errors
+  immediately instead of burning an hour of timeout; collection append
+  returns the persisted timestamp; version bumped to 1.6.0rc12.
+
 ### Remote execution (in progress)
 
 - **Phase 0-3 of the remote execution plan are implemented** (see

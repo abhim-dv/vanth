@@ -163,11 +163,17 @@ class ArtifactOperations:
                 raise
 
     def _claim(self, op_id: str) -> dict[str, Any]:
-        """Claim (or re-claim an expired op): new token, generation, and lease."""
+        """Claim (or re-claim an EXPIRED op): new token, generation, and lease.
+
+        A ``running`` op with a LIVE lease can never be claimed — concurrent
+        retries of one idempotency key must not steal the original worker's
+        claim or execute side effects twice (review P1-8).
+        """
         db = self.catalog.db
         token = secrets.token_hex(16)
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(seconds=self.lease_seconds)).isoformat().replace("+00:00", "Z")
+        now_text = now_iso()
         with self.catalog.lock:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -175,9 +181,13 @@ class ArtifactOperations:
                     """
                     UPDATE operations SET status='running', claim_token=?, claimed_at=?, lease_expires_at=?,
                       attempts=attempts+1, lease_generation=lease_generation+1, updated_at=?
-                    WHERE op_id=? AND status IN ('pending','running','failed')
+                    WHERE op_id=? AND (
+                      status='pending' OR status='failed'
+                      OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                    )
                     """,
-                    (token, now.isoformat().replace("+00:00", "Z"), expires, now_iso(), op_id),
+                    (token, now.isoformat().replace("+00:00", "Z"), expires, now_text,
+                     op_id, now_text),
                 ).rowcount
                 if not changed:
                     db.rollback()

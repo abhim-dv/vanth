@@ -34,13 +34,18 @@ DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 def get_remote_store():
-    """Open (once) the controller-side RemoteStore on the shared home dir."""
+    """Open (once) the controller-side RemoteStore on the shared home dir.
+
+    ThreadingHTTPServer dispatches pairing and later job requests on different
+    handler threads, so the shared connection is opened with
+    ``check_same_thread=False`` and every store operation is serialized by the
+    store's own RLock (mirroring JobManager's db_lock pattern)."""
     global _remote_store
     with manager_lock:
         if _remote_store is None:
             import sqlite3
 
-            db = sqlite3.connect(canonical_home() / "remote.sqlite")
+            db = sqlite3.connect(canonical_home() / "remote.sqlite", check_same_thread=False)
             db.row_factory = sqlite3.Row
             from .migrations import configure_connection
             from .remote.store import RemoteStore
@@ -205,7 +210,15 @@ def _remote_wait(remote_id: str, remote_job_id: str, payload: dict[str, Any]) ->
                 idempotency_key="wait-" + secrets.token_hex(16)[:12],
                 expected_state_epoch=_remote_epoch(remote_id),
             )
-        except Exception:
+        except Exception as exc:
+            # Hard failures must surface immediately, not masquerade as a
+            # transient empty poll and burn the whole hour (review P2-3).
+            text = str(exc)
+            if any(marker in text for marker in (
+                "Unauthorized", "Unknown remote", "state epoch", "epoch",
+                "PROTOCOL_", "not paired", "recovery_required",
+            )):
+                return {"result": "error", "job_id": remote_job_id, "error": text}
             result = {}
         status = None
         if isinstance(result, dict):
