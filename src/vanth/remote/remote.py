@@ -140,6 +140,8 @@ class RemoteJobManager:
         except Exception as exc:
             return self._error_frame(frame, code="INVALID_REQUEST", message=str(exc))
 
+    _MUTATION_REQUEST_METHODS = frozenset({"job.start", "job.stop", "job.rerun"})
+
     def handle_request_checked(
         self,
         frame: dict[str, Any],
@@ -149,16 +151,27 @@ class RemoteJobManager:
         digest: str,
     ) -> dict[str, Any]:
         validate_request(method, payload)
+        # State-epoch fencing: a mutation bound to a stale remote timeline is
+        # refused transactionally before replay/acceptance (review P1-1).
+        if method in self._MUTATION_REQUEST_METHODS:
+            expected = frame.get("expected_state_epoch")
+            if expected is not None:
+                current = self.store.get_state_epoch()
+                if int(expected) != current:
+                    return self._error_frame(
+                        frame, code="STATE_EPOCH_MISMATCH",
+                        message=f"request bound to epoch {int(expected)}, remote is at {current}",
+                    )
         if method == "job.status":
             return self._handle_status(frame, payload, idempotency_key)
-        if method in _TRANSFER_METHODS:
-            return self._handle_transfer_frame(frame, method, payload)
         if method == "job.snapshot":
             return self.handle_snapshot_request(frame, payload)
         if method == "job.log_range":
             return self.handle_log_range_request(frame, payload)
         if method == "job.feed":
             return self.handle_feed_request(frame, payload)
+        if method in _TRANSFER_METHODS:
+            return self._handle_transfer_frame(frame, method, payload)
         return self._handle_mutation(frame, method, payload, idempotency_key, digest)
 
     def _handle_transfer_frame(self, frame: dict[str, Any], method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -289,6 +302,15 @@ class RemoteJobManager:
                     origin=origin,
                 )
                 self.store.update_operation_status(op["op_id"], "queued", commit=False)
+                # Outbox row commits ATOMICALLY with the acceptance — a crash
+                # after commit can no longer lose the change (review P1-6).
+                try:
+                    self.feed.append_in_tx(
+                        "job.upsert", job_id=job_id,
+                        payload={"job_id": job_id, "status": "queued"},
+                    )
+                except Exception:
+                    pass
             else:
                 # Replay returns the SAME job — never a second incarnation.
                 job_id = self.store.get_remote_job_origin_op(op["op_id"])
@@ -303,11 +325,6 @@ class RemoteJobManager:
                 "status": op["status"],
                 "replayed": True,
             })
-        # Outbox recording happens strictly AFTER the acceptance transaction
-        # commits: a crash between the two leaves the job discoverable via
-        # snapshot recovery, never a phantom feed row.
-        if job_id:
-            self._record_job_upsert(job_id)
         return self._response_frame(frame, {
             "op_id": op["op_id"],
             "job_id": job_id,
@@ -407,7 +424,7 @@ class RemoteJobManager:
         rows = self.store.db.execute(
             """
             SELECT op_id, idempotency_key, method, payload_json, digest, status
-            FROM remote_operations WHERE status IN ('queued', 'launched')
+            FROM remote_operations WHERE status IN ('queued', 'launched', 'running')
             """
         ).fetchall()
         for row in rows:
@@ -417,32 +434,121 @@ class RemoteJobManager:
                 if not job_id:
                     self.store.update_operation_status(op_id, "failed")
                     continue
-                # A `launched` row whose job is already running was spawned
-                # before a crash; do not spawn a second process.
-                if row["status"] == "launched":
-                    job_status = self.store.db.execute(
-                        "SELECT status FROM jobs WHERE job_id=?", (job_id,)
-                    ).fetchone()
-                    if job_status and job_status["status"] in TERMINAL_STATUSES:
-                        self.store.update_operation_status(op_id, job_status["status"])
-                        continue
-                    if job_status and job_status["status"] == "running":
+                job_status = self.store.db.execute(
+                    "SELECT status FROM jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                status_text = job_status["status"] if job_status else None
+                if status_text in TERMINAL_STATUSES:
+                    self._converge_terminal(op_id, job_id, status_text)
+                    continue
+                if status_text == "running":
+                    # Spawn already confirmed (by us before a crash, or the
+                    # runner published its PID); never spawn a second process.
+                    if row["status"] != "running":
                         self.store.update_operation_status(op_id, "running")
-                        continue
+                    continue
+                # Job exists but has not started: recover a crash that happened
+                # after the op reached launched/running but BEFORE the spawn was
+                # confirmed (review P1-2). The durable states stay put until the
+                # launch below actually returns.
+                payload = json.loads(row["payload_json"] or "{}")
+                gate = self._trigger_gate(payload)
+                if gate == "wait":
+                    continue
+                if gate == "cancel":
+                    self.store.db.execute(
+                        "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
+                        (now_iso(), now_iso(), job_id),
+                    )
+                    self.store.update_operation_status(op_id, "failed")
+                    continue
                 launch = self.manager.prepare_launch(job_id)
                 if launch is None:
                     self.store.update_operation_status(op_id, "failed")
                     continue
+                result = self.manager._launch_prepared(launch)
                 if row["status"] == "queued":
                     self.store.update_operation_status(op_id, "launched")
-                self.store.update_operation_status(op_id, "running")
-                result = self.manager._launch_prepared(launch)
                 if result.get("status") in TERMINAL_STATUSES:
-                    self.store.update_operation_status(op_id, result.get("status"))
+                    self._converge_terminal(op_id, job_id, result.get("status"))
+                elif result.get("status") == "running":
+                    self.store.update_operation_status(op_id, "running")
+                # Any other outcome keeps the durable state at launched so the
+                # next tick re-drives without double-spawning (the job row now
+                # reports running and hits the branch above).
             except Exception:
                 import logging
 
                 logging.getLogger("vanth.remote").exception("remote dispatch of op %s failed", row["op_id"])
+
+    def _trigger_gate(self, payload: dict[str, Any]) -> str:
+        """Evaluate a queued job's trigger metadata (review P1-2).
+
+        Returns ``"go"`` when there is no trigger or it is satisfied,
+        ``"wait"`` while the parent has not reached the requested status, and
+        ``"cancel"`` when the parent ended in a different terminal state.
+        """
+        trigger = payload.get("trigger") if isinstance(payload, dict) else None
+        if not isinstance(trigger, dict) or not trigger.get("job_id") or not trigger.get("status"):
+            return "go"
+        parent = str(trigger["job_id"])
+        wanted = str(trigger["status"])
+        row = self.manager.db.execute("SELECT status FROM jobs WHERE job_id=?", (parent,)).fetchone()
+        if row is None:
+            return "go"
+        status = row["status"]
+        if status == wanted:
+            return "go"
+        if status in TERMINAL_STATUSES:
+            return "cancel"
+        return "wait"
+
+    def _converge_terminal(self, op_id: str, job_id: str, status: str) -> None:
+        """Converge an operation to a terminal status and append the outbox
+        row ATOMICALLY with the transition (review P1-6).
+
+        The transition machine is linear (accepted→queued→launched→running→
+        terminal), so reaching a terminal state may require stepping through
+        intermediate states within the same transaction.
+        """
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.store.db.execute(
+                "SELECT status FROM remote_operations WHERE op_id=?", (op_id,)
+            ).fetchone()
+            current_status = current["status"] if current else None
+            if current_status != status:
+                sequence = [s for s in ("queued", "launched", "running") if current_status == s or (
+                    current_status in ("accepted", "queued", "launched", "running")
+                    and ["accepted", "queued", "launched", "running"].index(current_status)
+                    < ["accepted", "queued", "launched", "running"].index(s)
+                )]
+                for step in (*sequence, status):
+                    try:
+                        self.store.update_operation_status(op_id, step, commit=False)
+                    except ValueError:
+                        pass
+                # Final target must stick; anything else is a real error.
+                row = self.store.db.execute(
+                    "SELECT status FROM remote_operations WHERE op_id=?", (op_id,)
+                ).fetchone()
+                if not row or row["status"] != status:
+                    raise ValueError(f"cannot converge operation {op_id} to {status}")
+            try:
+                row = self.manager.db.execute(
+                    "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                    "FROM jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                payload = dict(row) if row else {"job_id": job_id, "status": status}
+                self.feed.append_in_tx("job.upsert", job_id=job_id, payload=payload)
+            except Exception:
+                import logging
+
+                logging.getLogger("vanth.remote").exception("feed append failed job=%s", job_id)
+            self.store.db.commit()
+        except BaseException:
+            self.store.db.rollback()
+            raise
 
     def _sync_terminal_ops(self) -> None:
         """Converge ``running`` operations to the terminal status the runner
@@ -459,15 +565,13 @@ class RemoteJobManager:
             ).fetchone()
             if job_status and job_status["status"] in TERMINAL_STATUSES:
                 try:
-                    self.store.update_operation_status(row["op_id"], job_status["status"])
+                    self._converge_terminal(row["op_id"], job_id, job_status["status"])
                 except Exception:
                     import logging
 
                     logging.getLogger("vanth.remote").exception(
                         "operation terminal sync failed op=%s job=%s", row["op_id"], job_id
                     )
-                else:
-                    self._record_job_upsert(job_id)
 
     def mark_terminal_from_job(self, job_id: str, status: str) -> None:
         """Called by the remote daemon when a local runner records a terminal
@@ -478,13 +582,11 @@ class RemoteJobManager:
         if not op_id:
             return
         try:
-            self.store.update_operation_status(op_id, status)
+            self._converge_terminal(op_id, job_id, status)
         except Exception:
             import logging
 
             logging.getLogger("vanth.remote").exception("operation terminal sync failed op=%s job=%s", op_id, job_id)
-        else:
-            self._record_job_upsert(job_id)
 
     # ------------------------------------------------------------------
     # Unsupported (Phase 3/4) frames

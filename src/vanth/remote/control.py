@@ -165,6 +165,9 @@ class RemoteControl:
         except BaseException:
             self.store.db.rollback()
             raise
+        # Carry the submit-time epoch binding into the frame builder.
+        if expected_state_epoch is not None:
+            request["expected_state_epoch"] = int(expected_state_epoch)
         if self.journal is not None:
             try:
                 self.journal.record(request)
@@ -591,7 +594,7 @@ class RemoteControl:
         return dict(payload)
 
     def _build_request_frame(self, remote_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        return {
+        frame: dict[str, Any] = {
             "version": "1",
             "kind": "request",
             "request_id": request["request_id"],
@@ -601,6 +604,13 @@ class RemoteControl:
             "digest": request["digest"],
             "sent_at": now_iso(),
         }
+        # Bind the request to the epoch the controller believed current at
+        # submit time; the remote refuses mutations bound to a stale timeline
+        # (review P1-1).
+        expected = request.get("expected_state_epoch")
+        if expected is not None:
+            frame["expected_state_epoch"] = int(expected)
+        return frame
 
     def _lost(self, remote_id: str, request: dict[str, Any]) -> dict[str, Any]:
         """Transport failure: keep the request durably ``submitting`` (lost)."""

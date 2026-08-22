@@ -56,10 +56,28 @@ def get_remote_store():
 
 
 def get_remote_control():
-    """Controller-side RemoteControl bound to the shared store (job routing)."""
+    """Controller-side RemoteControl bound to the shared store (job routing).
+
+    Requests are journaled to ``client-requests.sqlite`` so `vanth remote
+    pending` / `vanth remote retry` reflect daemon-initiated requests and a
+    lost response can be retried with the ORIGINAL key (review P1-6)."""
     from .remote.control import RemoteControl
 
-    return RemoteControl(get_remote_store())
+    return RemoteControl(get_remote_store(), journal=get_request_journal())
+
+
+_request_journal = None
+
+
+def get_request_journal():
+    global _request_journal
+    if _request_journal is None:
+        from pathlib import Path as _Path
+
+        from .remote.journal import RequestJournal
+
+        _request_journal = RequestJournal(_Path(canonical_home()) / "client-requests.sqlite")
+    return _request_journal
 
 
 _artifacts_ops = None

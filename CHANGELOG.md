@@ -34,6 +34,26 @@ All notable changes to Vanth are documented here.
   no longer steal a live claim (only pending/failed/expired-running may be
   claimed); remote log reads enforce opaque-ID grammar + containment +
   no-symlink; `_run_request` re-drive seam preserved for retry.
+- **P1-9 GC/publication fence**: blob publication (put_file/put_dir) and GC's
+  unlink phase hold the same O_EXCL root fence, and GC re-verifies
+  reachability inside the fence — a publisher can no longer commit a version
+  whose blob GC just deleted.
+- **P1-10 Restore crash windows closed**: backups are validated into a temp
+  database (integrity_check + schema ceiling) BEFORE touching the live
+  catalog; the recovery lockout is applied to the live catalog BEFORE content
+  moves (any crash leaves it locked, never writable with a stale identity);
+  `complete_restore` rewrites the blob owner marker first and only then
+  unlocks mutations.
+- **P1-12/P1-13**: storage-profile create/update/probe are gated behind
+  `recovery_required`; S3-backed managed-artifact storage is explicitly
+  marked UNSUPPORTED this release (provider/lease machinery only) until a
+  full provider-side publication round trip ships.
+- **P2 fixes**: dedup verifies the referenced blob before returning an
+  existing version (corrupt content is republished instead of returned);
+  Windows reserved-name validation covers basenames before extension after
+  trailing dot/space trimming (`CON.txt`, `LPT1.log`); alias CAS refuses
+  cross-root movement as a separate explicit error (`ALIAS_CROSS_ROOT_MOVE`);
+  long artifact operations renew their claim lease between work units.
 - **P2/P3**: placeholder `submitting` shadows only created for mutations and
   retired when the real shadow lands; remote wait surfaces hard errors
   immediately instead of burning an hour of timeout; collection append

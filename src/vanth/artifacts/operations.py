@@ -248,6 +248,34 @@ class ArtifactOperations:
                 raise
         return self._op_dict(row)
 
+    def renew(self, op_id: str, claim_token: str) -> dict[str, Any]:
+        """Extend the lease on a running op (review P2-12).
+
+        Long operations (large directory captures, provider calls) must renew
+        their claim so a fixed lease cannot expire mid-work and let a reclaim
+        fence out the still-active worker."""
+        db = self.catalog.db
+        now = datetime.now(timezone.utc)
+        expires = (now + timedelta(seconds=self.lease_seconds)).isoformat().replace("+00:00", "Z")
+        with self.catalog.lock:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                changed = db.execute(
+                    """
+                    UPDATE operations SET lease_expires_at=?, updated_at=?
+                    WHERE op_id=? AND claim_token=? AND status='running'
+                    """,
+                    (expires, now_iso(), op_id, claim_token),
+                ).rowcount
+                if not changed:
+                    raise ValueError(f"cannot renew: operation {op_id} is not claimed by this worker")
+                row = db.execute("SELECT * FROM operations WHERE op_id=?", (op_id,)).fetchone()
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return self._op_dict(row)
+
     def complete(self, op_id: str, claim_token: str, result: dict[str, Any]) -> dict[str, Any]:
         return self._finish(op_id, claim_token, status="completed", result=result)
 
@@ -350,83 +378,93 @@ class ArtifactOperations:
                 "SELECT * FROM versions WHERE root_id=? AND manifest_digest=?", (root["root_id"], mdigest)
             ).fetchone()
             if existing:
-                result = {
-                    "version_id": existing["version_id"],
-                    "root_id": root["root_id"],
-                    "name": name,
-                    "manifest_digest": mdigest,
-                    "size_bytes": int(existing["size_bytes"]),
-                    "sha256": manifest["sha256"],
-                    "deduplicated": True,
-                }
-                self.complete(op["op_id"], token, result)
-                return result
-            staged = self.blobs.stage(data)
-            if self.crash_hook is not None:
-                self.crash_hook(op["op_id"])
-            self.blobs.publish_staged(staged, manifest["sha256"])
-            # Publication transaction boundary: the blob is durable above; the
-            # single transaction below commits version + root pointer + op result.
-            db = self.catalog.db
-            with self.catalog.lock:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    row = db.execute(
-                        "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
-                        (root["root_id"], mdigest),
-                    ).fetchone()
-                    deduplicated = bool(row)
-                    version_id = row["version_id"] if row else self.catalog.new_version_id()
-                    if not row:
-                        db.execute(
-                            "INSERT INTO versions(version_id, root_id, manifest_digest, manifest_json, size_bytes, created_at)"
-                            " VALUES (?, ?, ?, ?, ?, ?)",
-                            (
-                                version_id,
-                                root["root_id"],
-                                mdigest,
-                                json.dumps(manifest, separators=(",", ":")),
-                                manifest["size_bytes"],
-                                now_iso(),
-                            ),
-                        )
-                    db.execute(
-                        "UPDATE roots SET latest_version_id=?, updated_at=? WHERE root_id=?",
-                        (version_id, now_iso(), root["root_id"]),
-                    )
+                # Dedup must never hand back a CORRUPT version: verify the
+                # referenced blob before returning it. On mismatch, fall
+                # through and republish (repairing the content) instead of
+                # returning bytes we cannot vouch for (review P2-8).
+                existing_sha = json.loads(existing["manifest_json"])["sha256"]
+                if self.blobs.has_blob(existing_sha) and self.blobs.verify_blob(existing_sha):
                     result = {
-                        "version_id": version_id,
+                        "version_id": existing["version_id"],
                         "root_id": root["root_id"],
                         "name": name,
                         "manifest_digest": mdigest,
-                        "size_bytes": manifest["size_bytes"],
+                        "size_bytes": int(existing["size_bytes"]),
                         "sha256": manifest["sha256"],
-                        "deduplicated": deduplicated,
+                        "deduplicated": True,
                     }
-                    changed = db.execute(
-                        """
-                        UPDATE operations SET status='completed', result_json=?, updated_at=?,
-                          claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
-                        WHERE op_id=? AND claim_token=? AND status='running'
-                          AND (lease_expires_at IS NULL OR lease_expires_at > ?)
-                        """,
-                        (
-                            json.dumps(result, separators=(",", ":")),
-                            now_iso(),
-                            op["op_id"],
-                            token,
-                            now_iso(),
-                        ),
-                    ).rowcount
-                    if not changed:
-                        raise ValueError(
-                            f"stale worker: operation {op['op_id']} cannot be completed with this claim "
-                            "(expired lease or reclaimed generation)"
+                    self.complete(op["op_id"], token, result)
+                    return result
+            staged = self.blobs.stage(data)
+            if self.crash_hook is not None:
+                self.crash_hook(op["op_id"])
+            # Publication/GC fence: the blob replace and the catalog commit
+            # that references it happen inside one fence so a concurrent GC
+            # can never unlink the blob in between (review P1-9).
+            with self.blobs.gc_fence():
+                self.blobs.publish_staged(staged, manifest["sha256"])
+                # Publication transaction boundary: the blob is durable above; the
+                # single transaction below commits version + root pointer + op result.
+                db = self.catalog.db
+                with self.catalog.lock:
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        row = db.execute(
+                            "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
+                            (root["root_id"], mdigest),
+                        ).fetchone()
+                        deduplicated = bool(row)
+                        version_id = row["version_id"] if row else self.catalog.new_version_id()
+                        if not row:
+                            db.execute(
+                                "INSERT INTO versions(version_id, root_id, manifest_digest, manifest_json, size_bytes, created_at)"
+                                " VALUES (?, ?, ?, ?, ?, ?)",
+                                (
+                                    version_id,
+                                    root["root_id"],
+                                    mdigest,
+                                    json.dumps(manifest, separators=(",", ":")),
+                                    manifest["size_bytes"],
+                                    now_iso(),
+                                ),
+                            )
+                        db.execute(
+                            "UPDATE roots SET latest_version_id=?, updated_at=? WHERE root_id=?",
+                            (version_id, now_iso(), root["root_id"]),
                         )
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
+                        result = {
+                            "version_id": version_id,
+                            "root_id": root["root_id"],
+                            "name": name,
+                            "manifest_digest": mdigest,
+                            "size_bytes": manifest["size_bytes"],
+                            "sha256": manifest["sha256"],
+                            "deduplicated": deduplicated,
+                        }
+                        changed = db.execute(
+                            """
+                            UPDATE operations SET status='completed', result_json=?, updated_at=?,
+                              claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                            WHERE op_id=? AND claim_token=? AND status='running'
+                              AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                            """,
+                            (
+                                json.dumps(result, separators=(",", ":")),
+                                now_iso(),
+                                op["op_id"],
+                                token,
+                                now_iso(),
+                            ),
+                        ).rowcount
+                        if not changed:
+                            raise ValueError(
+                                f"stale worker: operation {op['op_id']} cannot be completed with this claim "
+                                "(expired lease or reclaimed generation)"
+                            )
+                        db.commit()
+                    except BaseException:
+                        db.rollback()
+                        raise
             return result
         except BaseException as exc:
             try:
@@ -498,8 +536,17 @@ class ArtifactOperations:
                 staged_paths.append((self.blobs.stage(file_path), sha256))
             if self.crash_hook is not None:
                 self.crash_hook(op["op_id"])
-            for staged, sha256 in staged_paths:
-                self.blobs.publish_staged(staged, sha256)
+            # Publication/GC fence (review P1-9): all blob publishes plus the
+            # catalog commit hold the fence so GC cannot interleave an unlink.
+            with self.blobs.gc_fence():
+                for staged, sha256 in staged_paths:
+                    self.blobs.publish_staged(staged, sha256)
+                    # Long captures must not have their lease expire mid-work
+                    # (review P2-12).
+                    try:
+                        self.renew(op["op_id"], token)
+                    except ValueError:
+                        pass
             # Publication transaction boundary (same as put_file): blobs are
             # durable above; this single transaction commits version + root
             # pointer + fenced op completion.

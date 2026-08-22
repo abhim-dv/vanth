@@ -58,6 +58,56 @@ class LocalBlobStore:
         self.catalog = catalog
         self._claim_ownership()
 
+    # -- publication / GC fence --------------------------------------------
+
+    class _Fence:
+        """OS-level exclusion between blob publication and GC deletion.
+
+        Both windows hold the same O_CREAT|O_EXCL lock file under the store
+        root: publication holds it from the first ``os.replace`` into blobs
+        until its catalog commit; GC holds it across unlink. This closes the
+        race where GC deleted a blob a concurrent publisher had just made
+        reachable (review P1-9). A stale fence older than ``stale_seconds``
+        is broken once (crashed holder)."""
+
+        def __init__(self, path: Path, *, timeout: float = 30.0, stale_seconds: float = 900.0):
+            self.path = Path(path)
+            self.timeout = timeout
+            self.stale_seconds = stale_seconds
+            self._fd = None
+
+        def __enter__(self) -> "_Fence":
+            import time as _time
+
+            deadline = _time.monotonic() + self.timeout
+            while True:
+                try:
+                    self._fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.write(self._fd, str(os.getpid()).encode())
+                    return self
+                except FileExistsError:
+                    try:
+                        age = _time.time() - self.path.stat().st_mtime
+                        if age > self.stale_seconds:
+                            self.path.unlink(missing_ok=True)
+                            continue
+                    except OSError:
+                        pass
+                    if _time.monotonic() > deadline:
+                        raise TimeoutError(f"artifact gc fence held too long: {self.path}")
+                    _time.sleep(0.05)
+
+        def __exit__(self, *exc) -> None:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                finally:
+                    self.path.unlink(missing_ok=True)
+                self._fd = None
+
+    def gc_fence(self) -> "LocalBlobStore._Fence":
+        return LocalBlobStore._Fence(self.root / ".vanth-gc-fence.lock")
+
     # -- ownership ---------------------------------------------------------
 
     def _claim_ownership(self) -> None:

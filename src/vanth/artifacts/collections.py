@@ -327,6 +327,15 @@ class Collections:
                                 f"ALIAS_CAS_MISMATCH: alias '{alias_name}' points at "
                                 f"{previous!r}, expected {expected_version_id!r}"
                             )
+                        # Cross-root movement is a separate, explicit decision:
+                        # silently rebasing an alias onto another root would
+                        # change the meaning of every consumer that resolved it
+                        # (review P2-14). Remove and re-create deliberately.
+                        if current["root_id"] != root_id:
+                            raise ValueError(
+                                f"ALIAS_CROSS_ROOT_MOVE: alias '{alias_name}' belongs to root "
+                                f"{current['root_id']}; refusing move to {root_id}"
+                            )
                         created = False
                         db.execute(
                             "UPDATE aliases SET root_id=?, version_id=?, updated_at=?, updated_by=?"

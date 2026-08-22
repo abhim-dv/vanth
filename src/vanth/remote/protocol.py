@@ -75,6 +75,7 @@ ERROR_REGISTRY: dict[str, tuple[int, str]] = {
     "PROTOCOL_DUPLICATE_KEY": (400, "object contains a duplicate key"),
     "PROTOCOL_UNKNOWN_FIELD": (400, "object contains an unknown field"),
     "PROTOCOL_REPLAY_MISMATCH": (409, "idempotency key was reused with a different request"),
+    "STATE_EPOCH_MISMATCH": (409, "request was bound to a stale remote state epoch"),
     "UNSUPPORTED_FEATURE": (501, "requested feature is not supported"),
     "AUTH_FAILED": (401, "authentication failed"),
     "INVALID_REQUEST": (422, "request payload is invalid"),
@@ -244,8 +245,9 @@ def decode_frame(line: str, *, max_bytes: int | None = None, validate: bool = Tr
 FRAME_SCHEMAS: dict[str, tuple[set[str], set[str]]] = {
     "hello": ({"version", "kind", "protocol", "agent", "remote_id", "state_epoch", "sent_at"},
               {"version", "kind", "protocol"}),
-    "request": ({"version", "kind", "request_id", "idempotency_key", "method", "payload", "digest", "sent_at"},
-                {"version", "kind", "method", "payload", "idempotency_key"}),
+    "request": ({"version", "kind", "request_id", "idempotency_key", "method", "payload", "digest",
+                 "expected_state_epoch", "sent_at"},
+              {"version", "kind", "method", "payload", "idempotency_key"}),
     "response": ({"version", "kind", "request_id", "method", "result", "sent_at"},
                  {"version", "kind", "method"}),
     "error": ({"version", "kind", "request_id", "method", "code", "message", "sent_at"},
@@ -461,29 +463,48 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         direction = payload.get("direction")
         push_required = {"transfer_id", "direction", "root_name", "manifest_digest", "total_bytes", "sha256"}
         pull_required = {"transfer_id", "direction"}
-        if isinstance(direction, str) and direction == "pull":
-            required = pull_required
-        else:
-            required = push_required
+        if direction not in TRANSFER_DIRECTIONS:
+            raise VanthRemoteProtocolError(
+                "INVALID_REQUEST", f"direction must be one of {sorted(TRANSFER_DIRECTIONS)}"
+            )
+        required = pull_required if direction == "pull" else push_required
         _check_required_and_unknown(payload, required, TRANSFER_INIT_ALLOWED, "payload")
         for field in ("transfer_id", "root_name", "manifest_digest"):
             _check_string_field(payload, field)
+            value = payload.get(field)
+            if isinstance(value, str) and (not value.strip() or any(ord(ch) < 0x20 for ch in value)):
+                raise VanthRemoteProtocolError("INVALID_REQUEST", f"{field} contains forbidden characters")
         _check_string_field(payload, "version_id")
         _check_numeric_field(payload, "total_bytes", minimum=0)
         _check_hex64_field(payload, "sha256")
+        tid = payload.get("transfer_id")
+        if isinstance(tid, str) and not re.fullmatch(r"xfr_[0-9a-f]{32}", tid):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "transfer_id must be 'xfr_' + 32 hex chars")
     elif method == "artifact.blob_chunk":
         # One chunk at a byte offset. Push chunks carry data_b64+sha256; pull
         # chunk REQUESTS omit them and carry a size instead (the response
         # carries the requested bytes).
         _check_required_and_unknown(payload, {"transfer_id", "offset"}, BLOB_CHUNK_ALLOWED, "payload")
         _check_string_field(payload, "transfer_id")
+        tid = payload.get("transfer_id")
+        if isinstance(tid, str) and not re.fullmatch(r"xfr_[0-9a-f]{32}", tid):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "transfer_id must be 'xfr_' + 32 hex chars")
         _check_numeric_field(payload, "offset", minimum=0)
+        size = payload.get("size")
+        if size is not None:
+            if isinstance(size, bool) or not isinstance(size, int) or size < 1 or size > 4 * 1024 * 1024:
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "size must be an integer in [1, 4194304]")
+        data_b64 = payload.get("data_b64")
+        if isinstance(data_b64, str) and len(data_b64) > 8 * 1024 * 1024:
+            raise VanthRemoteProtocolError("PROTOCOL_OVERSIZED", "chunk data exceeds the maximum chunk size")
         _check_string_field(payload, "data_b64")
         _check_hex64_field(payload, "sha256")
-        _check_numeric_field(payload, "size", minimum=0)
     elif method == "artifact.transfer_complete":
         _check_required_and_unknown(payload, TRANSFER_COMPLETE_ALLOWED, TRANSFER_COMPLETE_ALLOWED, "payload")
         _check_string_field(payload, "transfer_id")
+        tid = payload.get("transfer_id")
+        if isinstance(tid, str) and not re.fullmatch(r"xfr_[0-9a-f]{32}", tid):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "transfer_id must be 'xfr_' + 32 hex chars")
         _check_hex64_field(payload, "sha256")
 
 
@@ -520,6 +541,11 @@ def validate_frame(frame: dict[str, Any]) -> dict[str, Any]:
             raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", f"{key} must be a string")
     if "state_epoch" in frame and (isinstance(frame["state_epoch"], bool) or not isinstance(frame["state_epoch"], int)):
         raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", "state_epoch must be an integer")
+    if "expected_state_epoch" in frame and (
+        isinstance(frame["expected_state_epoch"], bool) or not isinstance(frame["expected_state_epoch"], int)
+        or frame["expected_state_epoch"] < 1
+    ):
+        raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", "expected_state_epoch must be an integer >= 1")
     if "cursor" in frame and not isinstance(frame["cursor"], dict):
         raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", "cursor must be an object")
     for key in ("has_more", "truncated"):

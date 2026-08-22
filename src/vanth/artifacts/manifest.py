@@ -130,8 +130,15 @@ def validate_v1_path(path: object) -> str:
                     f"entry path component contains a character illegal on Windows "
                     f"({char!r}): {path!r}"
                 )
-        if component.upper() in _WINDOWS_RESERVED:
-            raise ValueError(f"entry path uses a Windows-reserved device name: {component!r}")
+        # Windows strips trailing dots/spaces before resolving, and applies
+        # device-name semantics to the BASENAME before any extension: "CON.txt"
+        # and "NUL." cannot materialize faithfully (review P2-13).
+        stem = component.split(".", 1)[0].rstrip(" .")
+        if stem.upper() in _WINDOWS_RESERVED:
+            raise ValueError(
+                f"entry path uses a Windows-reserved device name (before extension "
+                f"and after trailing dot/space trimming): {component!r}"
+            )
     return path
 
 

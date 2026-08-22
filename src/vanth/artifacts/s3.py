@@ -1,9 +1,18 @@
 """S3 storage: provider abstraction with conditional operations, writer
 leases, and immutable storage-profile revisions (Phase 8).
 
+**Scope decision (review P1-13):** managed-artifact CONTENT is still stored
+only in the local CAS this release. Profiles, capability probing, conditional
+primitives, and writer leases are production-grade, but no artifact
+operation binds a root to an S3 profile yet; S3-backed artifact storage is
+therefore explicitly UNSUPPORTED here and the Phase 8 release-note claim is
+limited to the provider/lease machinery. Wiring one complete S3 publication/
+materialization round trip (with provider-side ownership markers) is
+scheduled before any S3 storage claim.
+
 Providers expose EXACTLY the conditional primitives the catalog writer
-needs — no generic object-store interface (the plan explicitly defers
-GCS/Azure/fsspec backends until a second backend is scheduled).
+needs (the plan explicitly defers GCS/Azure/fsspec backends until a second
+backend is scheduled).
 
 Conditional contract (mirrored at the SQLite level by :class:`WriterLeases`):
 
@@ -676,6 +685,11 @@ class StorageProfiles:
     A profile is NEVER updated in place: changing configuration inserts a
     new row with ``revision+1`` under the same ``profile_id``; every
     historical revision stays queryable through :meth:`revisions`.
+
+    All mutating/probing methods are gated behind the catalog's
+    ``recovery_required`` marker (review P1-12): a restored catalog cannot
+    register, revise, or probe storage backends until an explicit recovery
+    completion.
     """
 
     ALLOWED_KINDS = frozenset({"s3"})
@@ -697,6 +711,10 @@ class StorageProfiles:
     # -- revision writes --------------------------------------------------------
 
     def create(self, kind: str = "s3", config: dict[str, Any] | None = None) -> dict[str, Any]:
+        from .catalog import is_recovery_required
+
+        if is_recovery_required(self.catalog.db):
+            raise ValueError("recovery_required: complete restore first")
         config = config or {}
         self._validate(kind, config)
         profile_id = new_id("spr")
@@ -726,6 +744,10 @@ class StorageProfiles:
 
     def update(self, profile_id: str, config: dict[str, Any]) -> dict[str, Any]:
         """Insert the NEXT immutable revision; old revisions stay queryable."""
+        from .catalog import is_recovery_required
+
+        if is_recovery_required(self.catalog.db):
+            raise ValueError("recovery_required: complete restore first")
         config = config or {}
         db = self.catalog.db
         with self.catalog.lock:
@@ -804,6 +826,10 @@ class StorageProfiles:
         which raises the targeted missing-extra ``ProviderError`` when boto3
         is not installed.
         """
+        from .catalog import is_recovery_required
+
+        if is_recovery_required(self.catalog.db):
+            raise ValueError("recovery_required: complete restore first")
         latest = self.get(profile_id)
         if provider is None:
             if latest["kind"] != "s3":

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -330,15 +331,23 @@ class Lifecycle:
                 except BaseException:
                     db.rollback()
                     raise
-            # Physical blob removal happens after the fence commits; each
-            # unlink failure is tolerated (a concurrent publisher may have
-            # recreated the file).
+            # Physical blob removal happens while holding the SAME fence as
+            # publication (blob replace -> catalog commit), so a concurrent
+            # publisher can neither lose its blob nor interleave between our
+            # reachability decision and the unlink (review P1-9). Reachability
+            # is re-verified inside the fence.
             if not result["dry_run"]:
-                for sha in result["blobs_freed"]:
-                    try:
-                        os.unlink(self.ops.blobs.blob_path(sha))
-                    except OSError:
-                        pass
+                with self.ops.blobs.gc_fence():
+                    still_referenced: set[str] = set()
+                    for row in db.execute("SELECT manifest_json FROM versions"):
+                        still_referenced |= self._manifest_shas(row["manifest_json"])
+                    freed = [sha for sha in result["blobs_freed"] if sha not in still_referenced]
+                    for sha in freed:
+                        try:
+                            os.unlink(self.ops.blobs.blob_path(sha))
+                        except OSError:
+                            pass
+                    result["blobs_freed"] = freed
             return result
         except BaseException as exc:
             try:
@@ -367,15 +376,60 @@ class Lifecycle:
     def begin_restore(self, backup_path: str | Path, *, home: str | Path | None = None) -> dict[str, Any]:
         """Replace catalog content from a backup copy and lock mutations.
 
-        Rotates ``instance_id``, bumps ``state_epoch``, and sets the
-        ``recovery_required`` marker so every mutating operation raises until
-        :meth:`complete_restore` clears it.
+        Crash-safe ordering (review P1-10):
+        1. The backup is VALIDATED into a temporary database first
+           (integrity_check + schema version) — an invalid/newer backup never
+           touches the live catalog.
+        2. The live catalog is locked (``recovery_required``) BEFORE the
+           backup content is copied in, so a crash at ANY later point leaves
+           the catalog locked rather than writable with a stale identity.
+        3. Rotation of ``instance_id``/``state_epoch`` happens with the marker
+           already set; :meth:`complete_restore` re-binds the blob owner
+           marker FIRST and only then clears the flag.
         """
         source_path = Path(backup_path)
         if not source_path.is_file():
             raise ValueError(f"backup not found: {source_path}")
         home = Path(home) if home is not None else self.catalog.home
+        from .migrations import ARTIFACTS_LATEST_SCHEMA_VERSION, migrate_artifacts
+
+        # --- validate into a temp database; the live db is untouched yet ----
+        tmp_db = home / "backups" / f"restore-validate-{os.getpid()}.sqlite"
+        tmp_db.parent.mkdir(parents=True, exist_ok=True)
+        if tmp_db.exists():
+            tmp_db.unlink()
+        shutil.copyfile(source_path, tmp_db)
+        try:
+            probe = sqlite3.connect(tmp_db)
+            try:
+                check = probe.execute("PRAGMA integrity_check").fetchone()[0]
+                if check != "ok":
+                    raise ValueError(f"backup failed integrity_check: {check}")
+                version = int(procedure_version := probe.execute("PRAGMA user_version").fetchone()[0])
+                if version > ARTIFACTS_LATEST_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"backup schema v{version} is newer than this binary supports "
+                        f"(v{ARTIFACTS_LATEST_SCHEMA_VERSION})"
+                    )
+            finally:
+                probe.close()
+            trial = sqlite3.connect(tmp_db)
+            try:
+                migrate_artifacts(trial, home)
+                trial.execute("SELECT 1 FROM catalog LIMIT 1").fetchone()
+            finally:
+                trial.close()
+        finally:
+            tmp_db.unlink(missing_ok=True)
+
+        # --- pre-lockout BEFORE any content moves --------------------------
         db = self.catalog.db
+        with self.catalog.lock:
+            from .catalog import set_recovery_required
+
+            set_recovery_required(db, True)
+            db.commit()
+
         with self.catalog.lock:
             db.commit()
             source = sqlite3.connect(source_path)
@@ -383,8 +437,6 @@ class Lifecycle:
                 source.backup(db)
             finally:
                 source.close()
-            from .migrations import migrate_artifacts
-
             migrate_artifacts(db, home)
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -394,8 +446,6 @@ class Lifecycle:
                     " WHERE id=(SELECT id FROM catalog LIMIT 1)",
                     (instance_id, now_iso()),
                 )
-                from .catalog import set_recovery_required
-
                 set_recovery_required(db, True)
                 db.commit()
             except BaseException:
@@ -411,21 +461,18 @@ class Lifecycle:
             }
 
     def complete_restore(self) -> dict[str, Any]:
-        """Clear the recovery marker and re-bind the blob store ownership."""
+        """Clear the recovery marker and re-bind the blob store ownership.
+
+        Ordering (review P1-10): the blob-store owner marker is rewritten and
+        durable FIRST; only then is the recovery flag cleared, so a crash in
+        between leaves the catalog locked rather than writable against
+        mismatched ownership."""
         from .catalog import set_recovery_required
 
         db = self.catalog.db
         with self.catalog.lock:
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                set_recovery_required(db, False)
-                db.commit()
-            except BaseException:
-                db.rollback()
-                raise
             row = db.execute("SELECT * FROM catalog LIMIT 1").fetchone()
-        # Rebind the blob-store owner marker to the rotated instance so
-        # future opens accept this catalog again.
+        # 1. Ownership metadata first — durably.
         marker = self.ops.blobs.root / OWNER_MARKER_NAME
         payload = {
             "catalog_id": row["id"],
@@ -435,6 +482,15 @@ class Lifecycle:
         tmp = self.ops.blobs.root / (OWNER_MARKER_NAME + ".tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         os.replace(tmp, marker)
+        # 2. Only then unlock mutations.
+        with self.catalog.lock:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                set_recovery_required(db, False)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
         return {
             "catalog_id": row["id"],
             "instance_id": row["instance_id"],

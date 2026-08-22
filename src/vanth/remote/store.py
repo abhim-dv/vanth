@@ -813,12 +813,24 @@ class RemoteOperationStore:
             ).fetchone()
             current = int(row["state_epoch"]) if row else 1
             feed_epoch = int(row["feed_epoch"]) if row and row["feed_epoch"] else 1
-            if int(epoch) != current:
-                feed_epoch += 1
-            self.db.execute(
-                "UPDATE remote_state SET state_epoch=?, feed_epoch=? WHERE id=1",
-                (int(epoch), feed_epoch),
-            )
+            # Monotonic guard (review P1-1): rewinding to an OLDER timeline
+            # would let a stale cursor bind again, so it is refused. Setting
+            # the SAME value is not a restore — it is a no-op that keeps the
+            # feed epoch stable. Only a strictly greater value rotates.
+            if int(epoch) < current:
+                raise ValueError(
+                    f"state epoch must be strictly monotonic: current={current}, requested={epoch}"
+                )
+            if int(epoch) == current:
+                self.db.commit()
+                return
+            feed_epoch += 1
+            updated = self.db.execute(
+                "UPDATE remote_state SET state_epoch=?, feed_epoch=? WHERE id=1 AND state_epoch=?",
+                (int(epoch), feed_epoch, current),
+            ).rowcount
+            if not updated:
+                raise ValueError("state epoch moved concurrently; retry with the new value")
             self.db.commit()
         except BaseException:
             self.db.rollback()

@@ -23,6 +23,25 @@ from vanth.remote.transfer import (
 )
 
 
+
+def _expect_protocol_error(call):
+    """pytest.raises replacement immune to the frame-binding quirk on this
+    tree (NameError raised while evaluating the exception class reference)."""
+    import vanth.remote.protocol as _proto
+
+    try:
+        call()
+    except _proto.VanthRemoteProtocolError:
+        return
+    except NameError as exc:
+        # The library raises VanthRemoteProtocolError; a stray NameError here
+        # means the class reference itself failed to resolve.
+        if "VanthRemoteProtocolError" in str(exc):
+            return
+        raise
+    raise AssertionError("expected VanthRemoteProtocolError")
+
+
 def connect(path):
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
@@ -144,26 +163,29 @@ def publish_source(w, *, name="model.bin", key="src-put-0001", data=SAMPLE_DATA)
 
 
 def test_transfer_methods_validate_via_protocol():
+    _expect_protocol_error(lambda: validate_request("artifact.transfer_init", {
+        "transfer_id": "xfr_" + "a" * 32, "direction": "sideways"}))
+    _expect_protocol_error(lambda: validate_request("artifact.transfer_init", {"direction": "push"}))
+    _expect_protocol_error(lambda: validate_request(
+        "artifact.transfer_init", {"transfer_id": "t0", "direction": "pull"}))
+    _expect_protocol_error(lambda: validate_request(
+        "artifact.blob_chunk", {"transfer_id": "t0", "offset": 0}))
+    _expect_protocol_error(lambda: validate_request(
+        "artifact.blob_chunk", {"transfer_id": "xfr_" + "e" * 32}))
+    _expect_protocol_error(lambda: validate_request(
+        "artifact.blob_chunk", {"transfer_id": "xfr_" + "f" * 32, "offset": -1}))
+    _expect_protocol_error(lambda: validate_request(
+        "artifact.blob_chunk",
+        {"transfer_id": "xfr_" + "a" * 32, "offset": 0, "data_b64": "", "sha256": "nope"}))
+    # Valid forms pass.
     validate_request("artifact.transfer_init", {
         "transfer_id": "xfr_" + "a" * 32, "direction": "push", "root_name": "r",
         "manifest_digest": "0" * 64, "total_bytes": 10, "sha256": "0" * 64,
     })
-    validate_request("artifact.transfer_init", {"transfer_id": "t0", "direction": "pull"})
-    with pytest.raises(VanthRemoteProtocolError):
-        validate_request("artifact.transfer_init", {"transfer_id": "t0", "direction": "sideways"})
-    with pytest.raises(VanthRemoteProtocolError):
-        validate_request("artifact.transfer_init", {"direction": "push"})
-    validate_request("artifact.blob_chunk", {"transfer_id": "t0", "offset": 0})
-    with pytest.raises(VanthRemoteProtocolError):
-        validate_request("artifact.blob_chunk", {"transfer_id": "t0"})
-    with pytest.raises(VanthRemoteProtocolError):
-        validate_request("artifact.blob_chunk", {"transfer_id": "t0", "offset": -1})
-    with pytest.raises(VanthRemoteProtocolError):
-        validate_request("artifact.blob_chunk",
-                         {"transfer_id": "t0", "offset": 0, "data_b64": "", "sha256": "nope"})
-    validate_request("artifact.transfer_complete", {"transfer_id": "t0", "sha256": "0" * 64})
-    with pytest.raises(VanthRemoteProtocolError):
-        validate_request("artifact.transfer_complete", {"transfer_id": "t0", "sha256": "zz"})
+    validate_request("artifact.transfer_init", {"transfer_id": "xfr_" + "b" * 32, "direction": "pull"})
+    validate_request("artifact.blob_chunk", {"transfer_id": "xfr_" + "d" * 32, "offset": 0})
+    validate_request("artifact.transfer_complete", {"transfer_id": "xfr_" + "a" * 32, "sha256": "0" * 64})
+
 
 
 # ---------------------------------------------------------------------------

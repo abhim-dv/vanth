@@ -79,24 +79,39 @@ class FeedStore:
         state_epoch, feed_epoch = self.epochs()
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            cursor = self.db.execute(
-                """
-                INSERT INTO remote_feed(state_epoch, feed_epoch, kind, job_id, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    state_epoch, feed_epoch, kind, job_id,
-                    json.dumps(payload if payload is not None else {},
-                               separators=(",", ":")),
-                    now_iso(),
-                ),
-            )
-            seq = int(cursor.lastrowid)
+            seq = self._insert(kind, state_epoch, feed_epoch, job_id, payload)
             self.db.commit()
             return seq
         except BaseException:
             self.db.rollback()
             raise
+
+    def append_in_tx(self, kind: str, *, job_id: str | None = None,
+                     payload: Any | None = None) -> int:
+        """Append inside the CALLER'S transaction (no BEGIN/commit here).
+
+        Outbox rows for acceptance/terminal transitions must commit atomically
+        with the change itself — a best-effort append after commit lost the
+        change on a crash (review P1-6).
+        """
+        state_epoch, feed_epoch = self.epochs()
+        return self._insert(kind, state_epoch, feed_epoch, job_id, payload)
+
+    def _insert(self, kind: str, state_epoch: int, feed_epoch: int,
+                job_id: str | None, payload: Any | None) -> int:
+        cursor = self.db.execute(
+            """
+            INSERT INTO remote_feed(state_epoch, feed_epoch, kind, job_id, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state_epoch, feed_epoch, kind, job_id,
+                json.dumps(payload if payload is not None else {},
+                           separators=(",", ":")),
+                now_iso(),
+            ),
+        )
+        return int(cursor.lastrowid)
 
     def read(self, cursor: dict[str, Any] | None = None, *, limit: int = 100) -> dict[str, Any]:
         """Read rows strictly after ``cursor['seq']`` within the CURRENT epochs."""

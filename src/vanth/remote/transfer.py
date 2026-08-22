@@ -352,37 +352,33 @@ class TransferRegistry:
         size = int(payload.get("size") or DEFAULT_CHUNK_BYTES)
         if size <= 0:
             raise VanthRemoteProtocolError("INVALID_REQUEST", "size must be > 0 for pull chunks")
-        acked_offset = int(row["acked_offset"])
-        if offset != acked_offset:
-            raise VanthRemoteProtocolError(
-                "INVALID_REQUEST",
-                f"chunk offset discontinuity: expected_offset={acked_offset}",
-            )
         total = int(row["total_bytes"])
+        # Pull chunks are replayable (review P1-14): the controller may request
+        # any in-range offset — including one it already holds — because its
+        # ledger is authoritative. Enforce range, not continuity.
+        if offset < 0 or offset >= total:
+            raise VanthRemoteProtocolError(
+                "INVALID_REQUEST", f"chunk offset out of range: {offset} (total={total})"
+            )
         with open(row["staging_path"], "rb") as handle:
             handle.seek(offset)
             data = handle.read(min(size, max(0, total - offset)))
-        served_to = offset + len(data)
-        # Advance the resume point in one tx so a retry with the same key
-        # resumes after the bytes already served.
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            self.db.execute(
-                "UPDATE remote_transfers SET acked_offset=?, updated_at=? "
-                "WHERE transfer_id=? AND acked_offset=?",
-                (served_to, now_iso(), row["transfer_id"], acked_offset),
-            )
-            self.db.commit()
-        except BaseException:
-            self.db.rollback()
-            raise
+        # Pull chunks are REPLAYABLE: the durable resume point is NOT advanced
+        # here. Advancing on serve meant a lost response left the remote
+        # believing bytes were delivered that the controller never received,
+        # and retrying the prior offset failed (review P1-14). The
+        # controller-side ledger is authoritative for pull resume.
         return {
             "transfer_id": row["transfer_id"],
             "offset": offset,
             "size": len(data),
             "data_b64": base64.b64encode(data).decode("ascii"),
             "sha256": hashlib.sha256(data).hexdigest(),
-            "acked_offset": served_to,
+            # Replayable chunks: the served window end is informational only;
+            # the DURABLE remote offset advances solely via push-style chunk
+            # acceptance, never on serve (review P1-14).
+            "served_to": offset + len(data),
+            "acked_offset": int(row["acked_offset"]),
             "state_epoch": int(self._epoch_fn()),
         }
 
@@ -534,8 +530,11 @@ class RemoteArtifactBroker:
         if not (self.ops.blobs.has_blob(sha256) and self.ops.blobs.verify_blob(sha256)):
             raise TransferAborted(f"source blob missing or corrupt: {sha256}")
 
+        # Identity binds REMOTE + direction + caller key + immutable version:
+        # the same key/version against a DIFFERENT remote (or destination for
+        # pull) must never replay the first ledger entry (review P1-15).
         transfer_id = "xfr_" + hashlib.sha256(
-            f"push:{key}:{local_version_id}".encode("utf-8")
+            f"push:{remote_id}:{key}:{local_version_id}".encode("utf-8")
         ).hexdigest()[:32]
         record = self._begin_transfer(
             transfer_id, remote_id, "push", root_name, mdigest, total, sha256, key
@@ -649,8 +648,12 @@ class RemoteArtifactBroker:
             raise VanthRemoteProtocolError(
                 "INVALID_REQUEST", "idempotency_key must be 8..128 chars in [A-Za-z0-9_-]"
             )
+        # Destination identity is part of the transfer identity (review P1-15).
+        import hashlib as _h
+
+        dest_token = _h.sha256(str(dest.resolve()).encode("utf-8")).hexdigest()[:16]
         transfer_id = "xfr_" + hashlib.sha256(
-            f"pull:{key}:{remote_version_id}".encode("utf-8")
+            f"pull:{remote_id}:{key}:{remote_version_id}:{dest_token}".encode("utf-8")
         ).hexdigest()[:32]
         record = self._begin_transfer(
             transfer_id, remote_id, "pull", "", "", 0, "0" * 64, key
@@ -717,7 +720,10 @@ class RemoteArtifactBroker:
                     out.seek(offset)
                     out.write(data)
                     received_hash.update(data)
-                    offset = int(result["acked_offset"])
+                    # Pull chunks are replayable: advance locally by the
+                    # served window; the remote's durable offset does not
+                    # move on serve (review P1-14).
+                    offset = int(result.get("served_to", offset + len(data)))
                     self._persist_progress(transfer_id, record["op_claim_token"], acked_offset=offset)
             if offset != total or received_hash.hexdigest() != sha256:
                 raise TransferInterrupted(transfer_id, offset, "pull did not assemble the full content")
