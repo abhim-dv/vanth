@@ -133,6 +133,18 @@ func (q *Querier) Refresh(ctx context.Context, req RefreshRequest) RefreshResult
 			res.Mode = ModeFallback
 		}
 	}
+	// Remote shadow projection (review P1-7): merge current-timeline shadows
+	// so remote jobs appear alongside local ones instead of the loader being
+	// dead code. Failures are non-fatal (monitor still shows local state).
+	if !res.Stale && q.cfg.RemoteDBPath != "" {
+		if _, statErr := os.Stat(q.cfg.RemoteDBPath); statErr == nil {
+			if shadowRows, err := LoadRemoteShadows(q.cfg.RemoteDBPath); err == nil {
+				res.Jobs = append(res.Jobs, ProjectShadows(shadowRows)...)
+			} else {
+				res.Warnings++
+			}
+		}
+	}
 	if !res.Stale && len(req.Targets) > 0 {
 		if err := q.loadEvents(ctx, db, req, &res); err != nil {
 			if isBusy(err) {

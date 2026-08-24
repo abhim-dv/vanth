@@ -4,6 +4,40 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+- **P1-7 monitor wiring**: the Go monitor now consumes remote shadows —
+  `Config.RemoteDBPath` makes `Refresh` merge current-timeline shadow
+  projections into the job list (failures are non-fatal warnings), with an
+  end-to-end refresh test proving `job_live` arrives flagged as a remote.
+- **P1-11**: materialization sweeps every existing ancestor of the
+  destination fail-closed (any metadata error is fatal; symlink/reparse
+  parents abort) for BOTH file and directory roots, revalidating immediately
+  before bytes move. Full openat-level TOCTOU immunity remains future work.
+- **P2-5 transfer completion binding**: push completion validates the
+  published version against the registered identity on sha256, total_bytes,
+  manifest digest, AND root name, and re-checks the epoch immediately before
+  acknowledging — any drift stops the transfer instead of committing.
+- **P2-7 publication intent ledger**: put_file/put_dir write an explicit
+  `<op_id>.intent.json` (content shas + manifest digest) before the first
+  blob replace, removed only after the catalog commit — a crash in that
+  window leaves discoverable evidence of exactly what was being published.
+- **P2-9 storage profiles**: config is whitelisted to
+  bucket/prefix/region/endpoint_url; secret-shaped keys are rejected outright
+  before the whitelist; output configs are redacted on read; custom
+  `endpoint_url` requires an explicit `VANTH_S3_ENDPOINT_ALLOWLIST` (SSRF).
+- **P2-10 multipart**: InMemoryProvider completion enforces contiguous
+  1..N part numbers, rejects duplicates, verifies every supplied ETag
+  against stored parts, and assembles by part number (not list order);
+  Boto3Provider detects S3's HTTP-200-with-embedded-error completion form.
+- **P2-11**: caller-supplied idempotency keys exposed across the alias/
+  delete/restore/pin/unpin/gc MCP tool surface (daemon routes already
+  accepted them).
+- **P2-15 capabilities-as-observations**: probe results are recorded in a
+  separate `capability_observations` table with provenance/time; the
+  immutable revision row is never rewritten (`get()` attaches the newest
+  observation).
+- **CLI**: `vanth remote pair` gains `--host-fingerprint <SHA256>` and
+  `--accept-host-key`, matching the P0-1 host-key pinning contract.
+
 ### Review fixes (remote-artifacts-implementation-review.md)
 
 - **P0-1 Pairing hardened**: strict target validation (rejects control chars /

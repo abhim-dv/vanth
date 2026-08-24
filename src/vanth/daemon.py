@@ -672,6 +672,8 @@ class Handler(BaseHTTPRequestHandler):
                     target=payload.get("target", ""),
                     name=payload.get("name"),
                     allow_root=bool(payload.get("allow_root", False)),
+                    accept_host_key=bool(payload.get("accept_host_key", False)),
+                    host_fingerprint=payload.get("host_fingerprint"),
                     store=get_remote_store(),
                 ))
             elif parsed.path == "/remotes/remove":

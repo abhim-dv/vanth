@@ -368,18 +368,26 @@ def test_chunk_tamper_stops_without_publication(world):
 # ---------------------------------------------------------------------------
 
 
-def test_no_cloud_credentials_in_any_transfer_frame(world):
+def test_no_cloud_credentials_in_any_transfer_frame(world, monkeypatch):
+    """Review P1-14/P2-9 combined: transfer frames carry only content ids and
+    bytes. Storage-profile configs reject credential fields outright, and
+    ambient secret material from the environment never reaches the wire."""
     from vanth.artifacts.s3 import StorageProfiles
 
+    # P2-9: credential-shaped config keys are rejected at creation.
     profiles = StorageProfiles(world.controller_ops.catalog)
-    profile = profiles.create("s3", {
-        "bucket": "secret-bucket",
-        "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
-        "aws_secret_access_key": "supersecret-access-value-123",
-        "session_token": "tok-super-secret-session-token",
-        "password": "hunter2-passphrase",
-    })
+    with pytest.raises(ValueError, match="credential fields"):
+        profiles.create("s3", {
+            "bucket": "secret-bucket",
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+        })
+    # A legitimate profile carries no secret material.
+    profile = profiles.create("s3", {"bucket": "secret-bucket", "prefix": "runs"})
     assert profile is not None
+
+    # Ambient credentials exist in the environment; none may leak onto the wire.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAENVLEAKEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "env-super-secret-value-456")
 
     put = publish_source(world)
     world.broker.push_blob(world.remote_row["remote_id"], put["version_id"],
@@ -390,6 +398,8 @@ def test_no_cloud_credentials_in_any_transfer_frame(world):
         "supersecret-access-value-123",
         "tok-super-secret-session-token",
         "hunter2-passphrase",
+        "AKIAENVLEAKEXAMPLE",
+        "env-super-secret-value-456",
         "aws_secret",
         "credential",
     ):

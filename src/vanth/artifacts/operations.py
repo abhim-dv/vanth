@@ -332,6 +332,30 @@ class ArtifactOperations:
     # Public operations
     # ------------------------------------------------------------------
 
+    def _write_intent(self, op_id: str, *, kind: str, shas: list[str], manifest_digest: str) -> Path:
+        """Persist a publication-intent ledger entry (review P2-7).
+
+        Written BEFORE any blob is published and removed only after the
+        catalog commit, so a crash in that window leaves an explicit,
+        discoverable record of exactly which content-addressed blobs were
+        being published (reconciliation can sweep them; nothing is silent).
+        """
+        intent_path = self.blobs.staging_dir / f"{op_id}.intent.json"
+        intent_path.write_text(
+            json.dumps(
+                {
+                    "op_id": op_id,
+                    "kind": kind,
+                    "sha256_list": shas,
+                    "manifest_digest": manifest_digest,
+                    "started_at": now_iso(),
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        return intent_path
+
     def put_file(
         self,
         name: str,
@@ -398,13 +422,17 @@ class ArtifactOperations:
             staged = self.blobs.stage(data)
             if self.crash_hook is not None:
                 self.crash_hook(op["op_id"])
+            intent = self._write_intent(
+                op["op_id"], kind="put_file", shas=[manifest["sha256"]], manifest_digest=mdigest
+            )
             # Publication/GC fence: the blob replace and the catalog commit
             # that references it happen inside one fence so a concurrent GC
             # can never unlink the blob in between (review P1-9).
             with self.blobs.gc_fence():
                 self.blobs.publish_staged(staged, manifest["sha256"])
-                # Publication transaction boundary: the blob is durable above; the
-                # single transaction below commits version + root pointer + op result.
+                # Publication transaction boundary: the blob is durable above;
+                # the single transaction below commits version + root pointer
+                # + fenced op completion.
                 db = self.catalog.db
                 with self.catalog.lock:
                     db.execute("BEGIN IMMEDIATE")
@@ -465,6 +493,8 @@ class ArtifactOperations:
                     except BaseException:
                         db.rollback()
                         raise
+                # Commit succeeded: retire the publication intent (review P2-7).
+                intent.unlink(missing_ok=True)
             return result
         except BaseException as exc:
             try:
@@ -536,6 +566,11 @@ class ArtifactOperations:
                 staged_paths.append((self.blobs.stage(file_path), sha256))
             if self.crash_hook is not None:
                 self.crash_hook(op["op_id"])
+            intent = self._write_intent(
+                op["op_id"], kind="put_dir",
+                shas=[sha for _, sha in staged_paths],
+                manifest_digest=mdigest,
+            )
             # Publication/GC fence (review P1-9): all blob publishes plus the
             # catalog commit hold the fence so GC cannot interleave an unlink.
             with self.blobs.gc_fence():
@@ -611,6 +646,8 @@ class ArtifactOperations:
                 except BaseException:
                     db.rollback()
                     raise
+                # Commit succeeded: retire the publication intent (review P2-7).
+                intent.unlink(missing_ok=True)
             return result
         except BaseException as exc:
             try:
@@ -723,6 +760,24 @@ class ArtifactOperations:
                 pass
             raise
 
+    def _verify_dest_parents(self, dest: Path) -> None:
+        """Fail-closed sweep of every existing ancestor of ``dest`` (review
+        P1-11): any metadata error is fatal, and any symlink/reparse point in
+        the parent chain aborts materialization before bytes move."""
+        import os as _os
+
+        for ancestor in list(dest.parents):
+            try:
+                info = _os.lstat(str(ancestor))
+            except FileNotFoundError:
+                continue  # will be created below
+            except OSError as exc:
+                raise ValueError(f"destination parent unusable ({ancestor}): {exc}") from None
+            if hasattr(info, "st_reparse_tag") and getattr(info, "st_reparse_tag", 0):
+                raise ValueError(f"destination parent is a reparse point; refused: {ancestor}")
+            if _os.path.islink(str(ancestor)):
+                raise ValueError(f"destination parent is a symlink; refused: {ancestor}")
+
     def materialize(
         self,
         version_id: str,
@@ -757,7 +812,12 @@ class ArtifactOperations:
                 raise ValueError(f"destination already exists: {dest}")
             staged = self.blobs.stage(self.blobs.blob_path(sha256))
             dest.parent.mkdir(parents=True, exist_ok=True)
+            # Fail-closed parent sweep + immediate pre-rename revalidation
+            # (review P1-11): a parent swapped for a symlink/reparse point
+            # after earlier checks aborts here instead of writing through it.
+            self._verify_dest_parents(dest)
             os.replace(staged, dest)
+            self._verify_dest_parents(dest.parent)
             result = {
                 "version_id": version_id,
                 "dest_path": str(dest),
@@ -900,6 +960,9 @@ class ArtifactOperations:
         dest.parent.mkdir(parents=True, exist_ok=True)
         # Refuse a planted symlink/junction anywhere along the parent chain.
         self._check_component_chain(dest.parent)
+        # Fail-closed sweep (review P1-11): any lstat error on an existing
+        # ancestor is fatal, not "safe".
+        self._verify_dest_parents(dest)
 
         entries = sorted(manifest["entries"], key=lambda e: str(e["path"]).encode("utf-8"))
         file_entries = [e for e in entries if e["kind"] == "file"]

@@ -444,9 +444,40 @@ class TransferRegistry:
         result = self.ops().put_file(
             row["root_name"], data=data, idempotency_key="xfer-" + transfer_id
         )
+        # Full binding at the fenced commit (review P2-5): the published
+        # version must match the REGISTERED identity on every immutable
+        # field — sha, size, manifest digest, root name — not just the sha.
+        vrow = self.ops().catalog.db.execute(
+            "SELECT manifest_json, size_bytes FROM versions WHERE version_id=?",
+            (result["version_id"],),
+        ).fetchone()
+        if vrow is None:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "published version row missing")
+        manifest = json.loads(vrow["manifest_json"])
+        mismatches = []
         if result.get("sha256") != row["sha256"]:
+            mismatches.append("sha256")
+        if int(vrow["size_bytes"]) != int(row["total_bytes"]):
+            mismatches.append(f"total_bytes ({vrow['size_bytes']} != {row['total_bytes']})")
+        if row["manifest_digest"] and manifest.get("manifest_version") == 0:
+            from ..artifacts.manifest import manifest_digest as _md
+
+            if _md(manifest) != row["manifest_digest"]:
+                mismatches.append("manifest_digest")
+        rrow = self.ops().catalog.db.execute(
+            "SELECT 1 FROM roots WHERE root_id=? AND name=?", (result.get("root_id"), row["root_name"])
+        ).fetchone()
+        if not rrow:
+            mismatches.append(f"root_name ({row['root_name']!r})")
+        # Epoch revalidated IMMEDIATELY before acknowledging the commit: an
+        # epoch change during hashing/publication stops the transfer rather
+        # than rebinding it (review P1-1/P2-5).
+        now_epoch = int(self._epoch_fn())
+        if now_epoch != current_epoch or now_epoch != int(row["state_epoch"]):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
+        if mismatches:
             raise VanthRemoteProtocolError(
-                "INVALID_REQUEST", "published version does not match the transfer identity"
+                "INVALID_REQUEST", "published version binding mismatch: " + ", ".join(mismatches)
             )
         # The staged file is intentionally retained: a replayed completion
         # (crash after publish, before the controller's ack) must be able to

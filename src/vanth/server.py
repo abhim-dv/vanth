@@ -2887,7 +2887,8 @@ def artifact_collection_get(name: str) -> dict[str, Any]:
 
 @mcp.tool()
 def artifact_alias_set(alias_name: str, root_id: str, new_version_id: str,
-                       expected_version_id: str | None = None, updated_by: str | None = None) -> dict[str, Any]:
+                       expected_version_id: str | None = None, updated_by: str | None = None,
+                       idempotency_key: str | None = None) -> dict[str, Any]:
     """Compare-and-swap an alias pin: moves only if it currently points at expected_version_id.
 
     Pass expected_version_id=None to create a new alias; any mismatch fails
@@ -2895,7 +2896,8 @@ def artifact_alias_set(alias_name: str, root_id: str, new_version_id: str,
     """
     return get_client().post("/artifacts/alias-set",
                              {"alias_name": alias_name, "root_id": root_id, "new_version_id": new_version_id,
-                              "expected_version_id": expected_version_id, "updated_by": updated_by})
+                              "expected_version_id": expected_version_id, "updated_by": updated_by,
+                              "idempotency_key": idempotency_key})
 
 
 @mcp.tool()
@@ -2915,33 +2917,37 @@ def artifact_lineage_for(version_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def artifact_delete_request(version_id: str) -> dict[str, Any]:
+def artifact_delete_request(version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Logically delete an artifact version (content stays until GC reclaims it); rejects aliased versions."""
-    return get_client().post("/artifacts/delete-request", {"version_id": version_id})
+    return get_client().post("/artifacts/delete-request",
+                             {"version_id": version_id, "idempotency_key": idempotency_key})
 
 
 @mcp.tool()
-def artifact_restore(version_id: str) -> dict[str, Any]:
+def artifact_restore(version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Clear a pending delete request on an artifact version."""
-    return get_client().post("/artifacts/restore-version", {"version_id": version_id})
+    return get_client().post("/artifacts/restore-version",
+                             {"version_id": version_id, "idempotency_key": idempotency_key})
 
 
 @mcp.tool()
-def artifact_pin(version_id: str, hold_reason: str) -> dict[str, Any]:
+def artifact_pin(version_id: str, hold_reason: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Pin/hold an artifact version so GC can never reclaim it."""
-    return get_client().post("/artifacts/pin", {"version_id": version_id, "hold_reason": hold_reason})
+    return get_client().post("/artifacts/pin", {"version_id": version_id, "hold_reason": hold_reason,
+                                                "idempotency_key": idempotency_key})
 
 
 @mcp.tool()
-def artifact_unpin(version_id: str) -> dict[str, Any]:
+def artifact_unpin(version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Remove a pin/hold from an artifact version."""
-    return get_client().post("/artifacts/unpin", {"version_id": version_id})
+    return get_client().post("/artifacts/unpin", {"version_id": version_id,
+                                                  "idempotency_key": idempotency_key})
 
 
 @mcp.tool()
-def artifact_gc(dry_run: bool = True) -> dict[str, Any]:
+def artifact_gc(dry_run: bool = True, idempotency_key: str | None = None) -> dict[str, Any]:
     """Fenced garbage collection of unreachable versions/blobs; dry_run=True only reports candidates."""
-    return get_client().post("/artifacts/gc", {"dry_run": dry_run})
+    return get_client().post("/artifacts/gc", {"dry_run": dry_run, "idempotency_key": idempotency_key})
 
 
 @mcp.tool()

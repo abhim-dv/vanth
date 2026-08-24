@@ -726,6 +726,12 @@ def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     if sub == "pair":
         args = argv[1:]
         allow_root = "--allow-root" in args
+        accept_host_key = "--accept-host-key" in args
+        host_fingerprint = None
+        if "--host-fingerprint" in args:
+            i = args.index("--host-fingerprint")
+            if i + 1 < len(args):
+                host_fingerprint = args[i + 1]
         name = None
         if "--name" in args:
             i = args.index("--name")
@@ -738,7 +744,11 @@ def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         target = targets[0]
         try:
             client.ensure()
-            result = client.post("/remotes/pair", {"target": target, "name": name, "allow_root": allow_root})
+            result = client.post("/remotes/pair", {
+                "target": target, "name": name, "allow_root": allow_root,
+                "accept_host_key": accept_host_key,
+                "host_fingerprint": host_fingerprint,
+            })
         except Exception as exc:
             print(f"vanth remote pair: failed to reach daemon: {exc}", file=sys.stderr)
             return 1

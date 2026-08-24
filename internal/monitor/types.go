@@ -98,10 +98,14 @@ type Event struct {
 // Config carries all tunable monitor parameters. Refresh intervals are
 // configurable so tests can drive deterministic cadence without a TTY.
 type Config struct {
-	Home      string
-	DBPath    string
-	EventsDir string
-	LogsDir   string
+	Home         string
+	DBPath       string
+	EventsDir    string
+	LogsDir      string
+	// RemoteDBPath optionally points at the controller's remote.sqlite
+	// (review P1-7). When set and the file exists, Refresh merges
+	// current-timeline remote shadows into the job list.
+	RemoteDBPath string
 
 	JobLimit        int
 	EventLimit      int // events retained per job in memory

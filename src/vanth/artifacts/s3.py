@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import secrets
 import threading
 from datetime import datetime, timedelta, timezone
@@ -215,14 +217,17 @@ class InMemoryProvider:
         self, key: str, upload_id: str, part_number: int, data: bytes
     ) -> dict[str, Any]:
         data = bytes(data)
+        etag = self._next_etag(data)
         with self._lock:
             stored = self._uploads.get((key, upload_id))
             if stored is None:
                 raise ProviderError(f"NoSuchUpload: {upload_id}")
-            stored[int(part_number)] = data
+            # Store the minted etag alongside the bytes so completion can
+            # verify caller-supplied ETags exactly (review P2-10).
+            stored[int(part_number)] = (data, etag)
         return {
             "part_number": int(part_number),
-            "etag": self._next_etag(data),
+            "etag": etag,
             "size_bytes": len(data),
         }
 
@@ -233,13 +238,28 @@ class InMemoryProvider:
             stored = self._uploads.pop((key, upload_id), None)
             if stored is None:
                 raise ProviderError(f"NoSuchUpload: {upload_id}")
-            ordered = sorted(parts, key=lambda p: int(p["part_number"]))
-            missing = [int(p["part_number"]) for p in ordered if int(p["part_number"]) not in stored]
-            if missing:
-                raise ProviderError(f"InvalidPart: missing parts {missing}")
-            data = b"".join(stored[int(p["part_number"])] for p in ordered)
-            record = self._store(key, data)
-            return {**_meta(record), "size_bytes": len(data)}
+            # Strict part identity (review P2-10): contiguous 1..N numbering,
+            # no duplicates, and every listed ETag must match the stored part.
+            numbers = [int(p["part_number"]) for p in parts]
+            if len(numbers) != len(set(numbers)):
+                raise ProviderError("InvalidPart: duplicate part numbers")
+            if sorted(numbers) != list(range(1, len(numbers) + 1)):
+                raise ProviderError(
+                    f"InvalidPart: part numbers must be contiguous 1..N, got {sorted(numbers)}"
+                )
+            chunks: list[bytes] = []
+            # Assemble by PART NUMBER (S3 semantics), never list order.
+            by_number = {int(p["part_number"]): p for p in parts}
+            for n in range(1, len(numbers) + 1):
+                supplied = by_number[n].get("etag")
+                if not supplied:
+                    raise ProviderError(f"InvalidPart: part {n} missing etag")
+                data, etag = stored[n]
+                if supplied != etag:
+                    raise ProviderError(f"InvalidPart: etag mismatch on part {n}")
+                chunks.append(data)
+            record = self._store(key, b"".join(chunks))
+            return {**_meta(record), "size_bytes": sum(len(c) for c in chunks)}
 
     def abort_multipart(self, key: str, upload_id: str) -> None:
         with self._lock:
@@ -403,6 +423,13 @@ class Boto3Provider:
         resp = self._client.complete_multipart_upload(
             Bucket=self.bucket, Key=key, UploadId=upload_id, MultipartUpload=payload,
         )
+        # S3 can return HTTP 200 with an embedded Error document (review
+        # P2-10): a successful completion always carries a Location/ETag.
+        if not resp.get("ETag") and not resp.get("Location"):
+            raise ProviderError(
+                f"complete_multipart_upload returned 200 without result "
+                f"(embedded error): keys={sorted(resp)}"
+            )
         return {
             "etag": str(resp.get("ETag", "")).strip('"'),
             "version_id": resp.get("VersionId"),
@@ -693,9 +720,58 @@ class StorageProfiles:
     """
 
     ALLOWED_KINDS = frozenset({"s3"})
+    # Whitelisted non-secret config fields (review P2-9): anything else is
+    # rejected so credentials can never enter the catalog; endpoint_url is
+    # additionally gated behind an explicit host allowlist (SSRF).
+    ALLOWED_CONFIG_FIELDS = frozenset({"bucket", "prefix", "region", "endpoint_url"})
+    _SECRETISH = re.compile(r"secret|token|password|credential|api[_-]?key|access[_-]?key", re.IGNORECASE)
+    _ENDPOINT_ALLOWLIST_ENV = "VANTH_S3_ENDPOINT_ALLOWLIST"
 
-    def __init__(self, catalog: Catalog) -> None:
+    def __init__(self, catalog) -> None:
         self.catalog = catalog
+        self.catalog.db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS capability_observations (
+              obs_id TEXT PRIMARY KEY,
+              profile_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              capabilities_json TEXT NOT NULL,
+              observed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cap_obs_profile
+              ON capability_observations(profile_id, revision, observed_at);
+            """
+        )
+        self.catalog.db.commit()
+
+    @classmethod
+    def _validate_endpoint(cls, endpoint_url: str) -> None:
+        """SSRF gate: custom endpoints require an explicit admin allowlist."""
+        from urllib.parse import urlparse
+
+        host = (urlparse(endpoint_url).hostname or "").lower()
+        if not host:
+            raise ValueError("endpoint_url has no parseable host")
+        raw = os.environ.get(cls._ENDPOINT_ALLOWLIST_ENV, "")
+        allowed = {h.strip().lower() for h in raw.split(",") if h.strip()}
+        if not allowed:
+            raise ValueError(
+                f"custom endpoint_url requires an explicit allowlist: set "
+                f"{cls._ENDPOINT_ALLOWLIST_ENV}=<comma-separated hosts> "
+                "(default AWS endpoints need no endpoint_url)"
+            )
+        if host not in allowed and not any(host.endswith("." + h) for h in allowed):
+            raise ValueError(f"endpoint host '{host}' is not in {cls._ENDPOINT_ALLOWLIST_ENV}")
+
+    def _latest_observation(self, profile_id: str, revision: int) -> dict[str, Any] | None:
+        row = self.catalog.db.execute(
+            """
+            SELECT capabilities_json FROM capability_observations
+            WHERE profile_id=? AND revision=? ORDER BY observed_at DESC LIMIT 1
+            """,
+            (profile_id, revision),
+        ).fetchone()
+        return json.loads(row["capabilities_json"]) if row else None
 
     # -- validation -----------------------------------------------------------
 
@@ -707,6 +783,20 @@ class StorageProfiles:
         for key in config:
             if not isinstance(key, str):
                 raise ValueError("storage profile config keys must be strings")
+        # Secret-shaped keys are rejected outright, BEFORE the whitelist, so
+        # credentials can never enter the catalog under any name (review P2-9).
+        for key in config:
+            if isinstance(key, str) and self._SECRETISH.search(key):
+                raise ValueError(f"storage profile config must not contain credential fields: {key!r}")
+        unknown = sorted(set(config) - self.ALLOWED_CONFIG_FIELDS)
+        if unknown:
+            raise ValueError(
+                "storage profile config only allows "
+                f"{sorted(self.ALLOWED_CONFIG_FIELDS)}; rejected: {unknown}"
+            )
+        endpoint = config.get("endpoint_url")
+        if endpoint:
+            self._validate_endpoint(str(endpoint))
 
     # -- revision writes --------------------------------------------------------
 
@@ -791,24 +881,35 @@ class StorageProfiles:
 
     @staticmethod
     def _row_dict(row) -> dict[str, Any]:
+        config = json.loads(row["config_json"])
+        # Defense-in-depth redaction on the way out (review P2-9).
+        for key in list(config):
+            if re.search(r"secret|token|password|credential|api[_-]?key|access[_-]?key", key, re.IGNORECASE):
+                config[key] = "***"
         return {
             "profile_id": row["profile_id"],
             "revision": int(row["revision"]),
             "kind": row["kind"],
-            "config": json.loads(row["config_json"]),
+            "config": config,
+            # Capabilities are OBSERVATIONS, not part of the immutable
+            # revision row (review P2-15); attached by get()/revisions().
             "capabilities": json.loads(row["capabilities_json"]),
             "created_at": row["created_at"],
         }
 
     def get(self, profile_id: str) -> dict[str, Any]:
-        """Latest revision of a profile."""
+        """Latest revision of a profile, with the newest capability observation attached."""
         row = self.catalog.db.execute(
             "SELECT * FROM storage_profiles WHERE profile_id=? ORDER BY revision DESC LIMIT 1",
             (profile_id,),
         ).fetchone()
         if not row:
             raise ValueError(f"Unknown storage profile: {profile_id}")
-        return self._row_dict(row)
+        result = self._row_dict(row)
+        result["capabilities"] = (
+            self._latest_observation(profile_id, int(row["revision"])) or result["capabilities"]
+        )
+        return result
 
     def revisions(self, profile_id: str) -> list[dict[str, Any]]:
         rows = self.catalog.db.execute(
@@ -844,20 +945,22 @@ class StorageProfiles:
         with self.catalog.lock:
             db.execute("BEGIN IMMEDIATE")
             try:
-                changed = db.execute(
+                # Capabilities are OBSERVATIONS with provenance/time (review
+                # P2-15): the immutable revision row is never mutated.
+                db.execute(
                     """
-                    UPDATE storage_profiles SET capabilities_json=?
-                    WHERE profile_id=? AND revision=?
+                    INSERT INTO capability_observations(obs_id, profile_id, revision,
+                      capabilities_json, observed_at)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
-                        json.dumps(caps, separators=(",", ":"), sort_keys=True),
+                        new_id("cob"),
                         profile_id,
                         int(latest["revision"]),
+                        json.dumps(caps, separators=(",", ":"), sort_keys=True),
+                        now_iso(),
                     ),
-                ).rowcount
-                if not changed:
-                    db.rollback()
-                    raise ValueError(f"Unknown storage profile: {profile_id}")
+                )
                 db.commit()
             except BaseException:
                 db.rollback()

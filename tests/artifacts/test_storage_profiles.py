@@ -89,30 +89,57 @@ def test_kind_and_config_validation(profiles):
 # ---------------------------------------------------------------------------
 
 
-def test_probe_stores_capabilities_on_latest_revision(profiles):
+def test_probe_records_observation_without_mutating_revision(profiles):
+    """Review P2-15: the immutable revision row is never rewritten; capability
+    probes land in a separate observations table with provenance."""
     created = profiles.create("s3", {"bucket": "bkt"})
     caps = {"conditional_put": True, "versioning": True, "multipart": True}
-    out = profiles.probe(
-        created["profile_id"], provider=InMemoryProvider(bucket="bkt")
-    )
+    out = profiles.probe(created["profile_id"], provider=InMemoryProvider(bucket="bkt"))
     assert out["capabilities"] == caps
-    stored = json.loads(
+    # The revision row itself stays untouched ('{}' from creation).
+    row_caps = json.loads(
         profiles.catalog.db.execute(
             "SELECT capabilities_json FROM storage_profiles WHERE profile_id=? AND revision=?",
             (created["profile_id"], 1),
         ).fetchone()["capabilities_json"]
     )
-    assert stored == caps
-    # after an update, probe lands on the new latest revision
-    profiles.update(created["profile_id"], {"bucket": "bkt2"})
-    probed = profiles.probe(created["profile_id"], provider=InMemoryProvider())
-    assert probed["revision"] == 2
-    assert probed["capabilities"] == caps
-    old_row = profiles.catalog.db.execute(
-        "SELECT capabilities_json FROM storage_profiles WHERE profile_id=? AND revision=1",
-        (created["profile_id"],),
-    ).fetchone()
-    assert json.loads(old_row["capabilities_json"]) == caps
+    assert row_caps == {}
+    # The observation is recorded with provenance.
+    obs = profiles.catalog.db.execute(
+        "SELECT COUNT(*) FROM capability_observations WHERE profile_id=? AND revision=? "
+        "AND capabilities_json=?",
+        (created["profile_id"], 1, json.dumps(caps, separators=(",", ":"), sort_keys=True)),
+    ).fetchone()[0]
+    assert obs == 1
+    # get() attaches the latest observation for callers.
+    assert profiles.get(created["profile_id"])["capabilities"] == caps
+
+
+def test_profile_config_whitelist_and_secret_rejection(profiles):
+    """Review P2-9: only whitelisted non-secret fields persist; secret-shaped
+    keys are rejected outright."""
+    with pytest.raises(ValueError, match="credential fields"):
+        profiles.create("s3", {"bucket": "bkt", "session_token": "leak"})
+    with pytest.raises(ValueError, match="credential fields"):
+        profiles.create("s3", {"bucket": "bkt", "aws_secret_access_key": "leak"})
+    # Non-secret but unwhitelisted keys still fail the whitelist.
+    with pytest.raises(ValueError, match="only allows"):
+        profiles.create("s3", {"bucket": "bkt", "mystery": "1"})
+
+
+def test_endpoint_url_requires_explicit_allowlist(profiles, monkeypatch):
+    """Review P2-9: custom endpoints are an SSRF vector; they require an
+    explicit administrative host allowlist."""
+    monkeypatch.delenv("VANTH_S3_ENDPOINT_ALLOWLIST", raising=False)
+    with pytest.raises(ValueError, match="allowlist"):
+        profiles.create("s3", {"bucket": "bkt",
+                               "endpoint_url": "http://169.254.169.254/latest"})
+    monkeypatch.setenv("VANTH_S3_ENDPOINT_ALLOWLIST", "s3.internal.example,10.0.0.5")
+    with pytest.raises(ValueError, match="not in"):
+        profiles.create("s3", {"bucket": "bkt", "endpoint_url": "http://evil.example:9000"})
+    created = profiles.create("s3", {"bucket": "bkt",
+                                     "endpoint_url": "https://s3.internal.example:9000"})
+    assert created["config"]["endpoint_url"].startswith("https://s3.internal.example")
 
 
 # ---------------------------------------------------------------------------
