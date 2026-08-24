@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS remote_requests (
   payload_json TEXT NOT NULL,
   digest TEXT NOT NULL,
   status TEXT NOT NULL,
+  expected_state_epoch INTEGER,
   response_json TEXT,
   error_json TEXT,
   created_at TEXT NOT NULL,
@@ -154,6 +155,7 @@ class RemoteStore:
             ("remotes", "snapshot_cursor_json", "TEXT"),
             ("remotes", "installed_authorization", "TEXT"),
             ("remotes", "feed_cursor_json", "TEXT"),
+            ("remote_requests", "expected_state_epoch", "INTEGER"),
             ("remote_shadows", "state_epoch", "INTEGER NOT NULL DEFAULT 1"),
             ("remote_shadows", "suppressed_at", "TEXT"),
             ("remote_shadows", "superseded_at", "TEXT"),
@@ -274,6 +276,7 @@ class RemoteStore:
         method: str,
         payload: dict[str, Any],
         digest: str,
+        expected_state_epoch: int | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         if not self.db.execute("SELECT remote_id FROM remotes WHERE remote_id=?", (remote_id,)).fetchone():
@@ -289,6 +292,11 @@ class RemoteStore:
                 if existing["digest"] != digest:
                     raise VanthRemoteProtocolError("PROTOCOL_REPLAY_MISMATCH")
                 result = self._request_dict(existing)
+                # Replay re-binds the caller's epoch expectation so a retry
+                # carries the SAME binding the original had durably stored.
+                stored_epoch = existing["expected_state_epoch"]
+                if stored_epoch is not None:
+                    result["expected_state_epoch"] = int(stored_epoch)
                 if commit:
                     self.db.commit()
                 return result
@@ -297,12 +305,14 @@ class RemoteStore:
             self.db.execute(
                 """
                 INSERT INTO remote_requests(request_id, remote_id, idempotency_key, method, payload_json,
-                  digest, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'creating', ?, ?)
+                  digest, status, expected_state_epoch, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?)
                 """,
                 (
                     request_id, remote_id, idempotency_key, method,
-                    json.dumps(payload, separators=(",", ":")), digest, stamp, stamp,
+                    json.dumps(payload, separators=(",", ":")), digest,
+                    int(expected_state_epoch) if expected_state_epoch is not None else None,
+                    stamp, stamp,
                 ),
             )
             result = self._request_dict(self.db.execute(

@@ -4,6 +4,47 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Re-review fixes (remote-artifacts-rc14-rereview.md)
+
+- **P0-1 pairing**: `ssh-keyscan` failure now falls back to a real OpenSSH
+  accept-new connection against the dedicated known-hosts file (Ubuntu
+  hybrid-KEX servers no longer break pinning); fingerprinting preserves the
+  real key type; the install script takes the key blob explicitly and uses
+  awk END semantics (unrestricted-duplicate detection actually fires);
+  pairing installs a restricted wrapper binding
+  VANTH_REMOTE_HELPER_URL/TOKEN from the REMOTE user's own daemon.json/token,
+  and the sentinel hello must carry a live state_epoch fetched from the
+  remote daemon (`/remote/identity` route added) — a bare protocol string is
+  a false positive and fails.
+- **P0-2 snapshots**: every page carries a fixed rowid high-water boundary;
+  the controller fail-fasts on any malformed/lost page or boundary change —
+  failed syncs suppress nothing and advance nothing.
+- **P1-1 concurrency**: the whole request handler and dispatcher iterations
+  run under one store lock; a 30-thread concurrent-start stress test passes
+  deterministically.
+- **P1-2 durable fencing**: mutations REQUIRE an epoch (auto-bound from the
+  stored remote); expected epoch persisted with requests + journal; replay
+  re-binds the stored epoch; response id/method matching is mandatory.
+- **P1-3 caller keys preserved** through HTTP → payload → submit.
+- **P1-4 stop intents recoverable + trigger validation**: accepted stops are
+  reconciled by the dispatcher after crashes; malformed/unknown triggers
+  cancel instead of launching; already-terminal stop is an idempotent no-op
+  (fixes the reproducible full-suite red).
+- **P1-5**: journal connection is thread-safe; production DefaultConfig wires
+  RemoteDBPath so monitor shadow merging works without manual config.
+- **P1-7 put_dir fence encloses catalog commit** (GC can no longer delete
+  blobs between publish and version commit).
+- **P1-10 transfers**: pull staging retained for resume; old-epoch transfers
+  refused at init; pull completion validates epoch/sha/bytes; push epoch
+  fence moved BEFORE publication; manifest-digest binding covers v0+v1;
+  same-digest cross-root lookups scoped by root name.
+- P2: structured remote-wait errors; IPv6 bracket targets; dir-version dedup
+  verifies all blobs; lease renewal in dir publication; collection append
+  returns persisted timestamp; StorageProfiles.update exposed as guarded
+  route+tool.
+
+### Earlier rc14 items (monitor wiring, sweeps, transfer binding)
+
 - **P1-7 monitor wiring**: the Go monitor now consumes remote shadows —
   `Config.RemoteDBPath` makes `Refresh` merge current-timeline shadow
   projections into the job list (failures are non-fatal warnings), with an

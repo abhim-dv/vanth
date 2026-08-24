@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import stat as _stat
 import threading
@@ -123,7 +124,16 @@ class RemoteJobManager:
     # ------------------------------------------------------------------
 
     def handle_request(self, frame: dict[str, Any]) -> dict[str, Any]:
-        """Handle one request frame; returns a response or error frame."""
+        """Handle one request frame; returns a response or error frame.
+
+        The ENTIRE handler runs under the store lock (review rc14 P1-1):
+        multi-statement BEGIN/commit sequences on the shared connection were
+        interleaved by concurrent HTTP handlers and the dispatcher, producing
+        nested-transaction corruption under load."""
+        with self.store.db_lock:
+            return self._handle_request_locked(frame)
+
+    def _handle_request_locked(self, frame: dict[str, Any]) -> dict[str, Any]:
         try:
             method = frame["method"]
             payload = frame["payload"]
@@ -402,8 +412,12 @@ class RemoteJobManager:
     def _dispatch_loop(self) -> None:
         while not self.dispatcher_stop.wait(self.poll_interval):
             try:
-                self._dispatch_queued_ops()
-                self._sync_terminal_ops()
+                # Dispatcher transactions share the store lock with HTTP
+                # handlers so BEGIN/commit sequences can never interleave
+                # (review rc14 P1-1).
+                with self.store.db_lock:
+                    self._dispatch_queued_ops()
+                    self._sync_terminal_ops()
             except Exception:
                 import logging
 
@@ -424,12 +438,18 @@ class RemoteJobManager:
         rows = self.store.db.execute(
             """
             SELECT op_id, idempotency_key, method, payload_json, digest, status
-            FROM remote_operations WHERE status IN ('queued', 'launched', 'running')
+            FROM remote_operations WHERE status IN ('accepted', 'queued', 'launched', 'running')
             """
         ).fetchall()
         for row in rows:
             try:
                 op_id = row["op_id"]
+                # Recoverable STOP intents (review rc14 P1-4): a crash between
+                # recording an accepted stop and executing it used to strand
+                # the operation forever. Reconcile it here.
+                if row["method"] == "job.stop":
+                    self._reconcile_stop_intent(row)
+                    continue
                 job_id = self.store.get_remote_job_origin_op(op_id)
                 if not job_id:
                     self.store.update_operation_status(op_id, "failed")
@@ -481,6 +501,38 @@ class RemoteJobManager:
 
                 logging.getLogger("vanth.remote").exception("remote dispatch of op %s failed", row["op_id"])
 
+    def _reconcile_stop_intent(self, row) -> None:
+        """Execute a durably-recorded stop intent that has not completed
+        (review rc14 P1-4)."""
+        payload = json.loads(row["payload_json"] or "{}")
+        job_id = str(payload.get("job_id") or "")
+        if not job_id:
+            self.store.db.execute(
+                "UPDATE remote_operations SET status='failed', error='stop intent missing job_id' WHERE op_id=?",
+                (row["op_id"],),
+            )
+            self.store.db.commit()
+            return
+        try:
+            stop_result = self.manager.stop_sync(job_id)
+            status = stop_result.get("status") or "stopping"
+        except Exception as exc:
+            status = "unknown"
+            self.store.db.execute(
+                "UPDATE remote_operations SET error=?, updated_at=? WHERE op_id=?",
+                (str(exc)[:500], now_iso(), row["op_id"]),
+            )
+            self.store.db.commit()
+        self.store.db.execute(
+            "UPDATE remote_operations SET status='completed', result_json=?, updated_at=? WHERE op_id=?",
+            (
+                json.dumps({"op_id": row["op_id"], "job_id": job_id, "status": status},
+                           separators=(",", ":")),
+                now_iso(), row["op_id"],
+            ),
+        )
+        self.store.db.commit()
+
     def _trigger_gate(self, payload: dict[str, Any]) -> str:
         """Evaluate a queued job's trigger metadata (review P1-2).
 
@@ -493,9 +545,16 @@ class RemoteJobManager:
             return "go"
         parent = str(trigger["job_id"])
         wanted = str(trigger["status"])
+        # Validate the trigger contract (review rc14 P1-4): malformed ids,
+        # invalid statuses, and UNKNOWN parents cancel instead of falling
+        # through to an unconditional launch.
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{4,80}", parent):
+            return "cancel"
+        if wanted not in (set(TERMINAL_STATUSES) | {"running", "queued"}):
+            return "cancel"
         row = self.manager.db.execute("SELECT status FROM jobs WHERE job_id=?", (parent,)).fetchone()
         if row is None:
-            return "go"
+            return "cancel"
         status = row["status"]
         if status == wanted:
             return "go"
@@ -622,13 +681,21 @@ class RemoteJobManager:
         if not isinstance(cursor, dict):
             cursor = {}
         after_job_id = str(cursor.get("after_job_id") or "")
+        high_water = cursor.get("high_water") if isinstance(cursor.get("high_water"), int) else None
         manager = self.manager
+        # Fixed high-water boundary (review rc14 P0-2): every page of one
+        # snapshot only sees rows with rowid <= the boundary captured on the
+        # FIRST page, so inserts/deletes between pages cannot produce a mixed
+        # authoritative set.
+        if high_water is None:
+            row = manager.db.execute("SELECT COALESCE(MAX(rowid), 0) AS hw FROM jobs").fetchone()
+            high_water = int(row["hw"])
         rows = manager.db.execute(
             """
             SELECT job_id, name, command, status, created_at, updated_at, exit_code
-            FROM jobs WHERE job_id>? ORDER BY job_id ASC LIMIT ?
+            FROM jobs WHERE job_id>? AND rowid<=? ORDER BY job_id ASC LIMIT ?
             """,
-            (after_job_id, self.SNAPSHOT_PAGE_SIZE + 1),
+            (after_job_id, high_water, self.SNAPSHOT_PAGE_SIZE + 1),
         ).fetchall()
         has_more = len(rows) > self.SNAPSHOT_PAGE_SIZE
         rows = rows[: self.SNAPSHOT_PAGE_SIZE]
@@ -649,6 +716,7 @@ class RemoteJobManager:
         next_cursor = {
             "after_job_id": jobs[-1]["job_id"] if jobs else after_job_id,
             "event_water": event_water,
+            "high_water": high_water,
         }
         # Reads travel in a standard response frame's result so the controller
         # run_request path handles them uniformly; the inner kind identifies

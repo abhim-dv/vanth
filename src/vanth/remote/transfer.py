@@ -229,6 +229,11 @@ class TransferRegistry:
                         "PROTOCOL_REPLAY_MISMATCH",
                         "transfer_id was reused with different content identity",
                     )
+                # A registered transfer from an OLD timeline can never resume:
+                # its staging content belonged to a rolled-back world (review
+                # rc14 P1-10).
+                if int(existing["state_epoch"]) != epoch:
+                    raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
                 result = {
                     "transfer_id": transfer_id,
                     "direction": direction,
@@ -440,6 +445,11 @@ class TransferRegistry:
         # the live claim can commit the version row — so a duplicated
         # completion (crash between publish and ack) collapses onto the same
         # immutable version.
+        # Epoch fence BEFORE publication (review rc14 P1-10): checking only
+        # after put_file let a stale publication land before the error.
+        now_epoch = int(self._epoch_fn())
+        if now_epoch != current_epoch or now_epoch != int(row["state_epoch"]):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
         data = staged.read_bytes()
         result = self.ops().put_file(
             row["root_name"], data=data, idempotency_key="xfer-" + transfer_id
@@ -459,7 +469,7 @@ class TransferRegistry:
             mismatches.append("sha256")
         if int(vrow["size_bytes"]) != int(row["total_bytes"]):
             mismatches.append(f"total_bytes ({vrow['size_bytes']} != {row['total_bytes']})")
-        if row["manifest_digest"] and manifest.get("manifest_version") == 0:
+        if row["manifest_digest"]:
             from ..artifacts.manifest import manifest_digest as _md
 
             if _md(manifest) != row["manifest_digest"]:
@@ -469,12 +479,6 @@ class TransferRegistry:
         ).fetchone()
         if not rrow:
             mismatches.append(f"root_name ({row['root_name']!r})")
-        # Epoch revalidated IMMEDIATELY before acknowledging the commit: an
-        # epoch change during hashing/publication stops the transfer rather
-        # than rebinding it (review P1-1/P2-5).
-        now_epoch = int(self._epoch_fn())
-        if now_epoch != current_epoch or now_epoch != int(row["state_epoch"]):
-            raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
         if mismatches:
             raise VanthRemoteProtocolError(
                 "INVALID_REQUEST", "published version binding mismatch: " + ", ".join(mismatches)
@@ -759,7 +763,11 @@ class RemoteArtifactBroker:
             if offset != total or received_hash.hexdigest() != sha256:
                 raise TransferInterrupted(transfer_id, offset, "pull did not assemble the full content")
         finally:
-            if offset != total:
+            # Keep the staging file on INCOMPLETE pulls (review rc14 P1-10):
+            # the ledger's acknowledged offset refers to it; deleting forced
+            # the retry to zero-fill a "completed" prefix and fail verification.
+            # Only an interrupted-before-first-byte transfer has nothing to keep.
+            if offset == 0:
                 try:
                     staging.unlink(missing_ok=True)
                 except OSError:
@@ -771,6 +779,17 @@ class RemoteArtifactBroker:
         resp = self._exchange(session, complete_frame)
         if resp.get("kind") != "response":
             raise TransferInterrupted(transfer_id, offset, str(resp.get("message")))
+        # Pull completion binding (review rc14 P1-10): the remote's final
+        # answer must agree on epoch, SHA, and byte count before local
+        # publication. Drift means the source changed mid-transfer.
+        cresult = resp.get("result") or {}
+        if int(cresult.get("state_epoch", epoch)) != epoch:
+            self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
+            raise TransferAborted(EPOCH_STOP_MESSAGE)
+        if str(cresult.get("sha256")) != sha256:
+            raise TransferInterrupted(transfer_id, offset, "pull completion sha mismatch")
+        if int(cresult.get("total_bytes", total)) != total:
+            raise TransferInterrupted(transfer_id, offset, "pull completion byte-count mismatch")
 
         # Materialize locally through the standard durable-op pattern, then
         # write dest_path atomically via materialize().

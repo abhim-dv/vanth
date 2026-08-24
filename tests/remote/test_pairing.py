@@ -43,7 +43,8 @@ class FakeTransport:
         self.calls = []
         self.fail_sentinel_with = None
 
-    def fetch_host_keys(self, hostname, port):
+    def fetch_host_keys(self, hostname, port, *, known_hosts_path=None, fallback_config=None,
+                        config_dir=None):
         self.calls.append("fetch_host_keys")
         return [f"{hostname} ssh-ed25519 AAAAfakehostkey"]
 
@@ -65,16 +66,12 @@ class FakeTransport:
         self.calls.append("install_authorized_key")
         assert "IdentityFile" not in bootstrap_config, "bootstrap must NOT offer the dedicated key"
         assert "UserKnownHostsFile" in bootstrap_config
-        if self.install_result != "INSTALLED":
-            raise ssh.VanthRemoteError(self.install_result)
-        # Extract the installed line from the script for inspection.
-        for ln in install_script.splitlines():
-            if ln.startswith("printf '%s\\n' "):
-                import shlex
-
-                self.installed_lines.append(shlex.unquote(ln.split("' ", 2)[1].rsplit("'", 1)[0]) if False else ln)
-        # Simpler: capture via the marker grep argument.
-        self.last_install_script = install_script
+        if "UNRESTRICTED_KEY_PRESENT" in install_script and self.install_result != "INSTALLED":
+            raise ssh.VanthRemoteError("UNRESTRICTED_KEY_PRESENT")
+        if "WRAPPER_INSTALLED" in install_script:
+            self.last_wrapper_script = install_script
+        elif "UNRESTRICTED_KEY_PRESENT" in install_script:
+            self.last_install_script = install_script
         self.installed = True
 
     def remove_authorized_key(self, *, remove_script, bootstrap_config, config_dir, target_argv, timeout=60.0):
@@ -93,7 +90,8 @@ class FakeTransport:
             raise ssh.VanthRemoteError("sentinel handshake failed: ssh exit 255")
         frame = {
             "version": "1", "kind": "hello", "protocol": "vanth.remote",
-            "agent": "vanth-remote-helper", "sent_at": "2026-08-21T00:00:00Z",
+            "agent": "vanth-remote-helper", "state_epoch": 3,
+            "sent_at": "2026-08-21T00:00:00Z",
         }
         # Round-trip through the real validator so contract drift fails loudly.
         return validate_hello_response(encode_frame(frame))
@@ -122,9 +120,13 @@ def test_pair_remote_success_pins_host_key_and_installs_forced_command(tmp_path)
     assert "fetch_host_keys" in transport.calls, "host key must be pinned before auth"
     assert result["host_key_fingerprints"] == ["SHA256:fakehostkey"]
     line = _installed_marker_line(transport, pairing.marker_comment(result["remote_id"]))
-    assert line.startswith('command="vanth-remote-helper",no-pty,'), line
+    assert line.startswith('command="$HOME/.vanth/remote-wrapper.sh",no-pty,'), line
     assert PUB in line
     assert line.rstrip().endswith(pairing.marker_comment(result["remote_id"]))
+    # Wrapper setup ran before the authorization install (review rc14 P0-1.4).
+    scripts = [c for c in transport.calls if c == "install_authorized_key"]
+    assert len(scripts) >= 2
+    assert "$HOME/.vanth/remote-wrapper.sh" in getattr(transport, "last_wrapper_script", "")
     remote_dir = tmp_path / "remote" / result["remote_id"]
     assert (remote_dir / "known_hosts").exists()
     stored = store.get_remote(result["remote_id"])
@@ -203,13 +205,22 @@ def test_remove_remote_revokes_only_marker_line(tmp_path):
 
 
 def test_validate_hello_response_rejects_non_vanth():
-    with pytest.raises(ssh.VanthRemoteError, match="no response"):
+    # Function-local binding: module-global exception references have proven
+    # flaky under collection on this tree (see rc14 P2-5 note).
+    from vanth.remote.ssh import VanthRemoteError
+
+    with pytest.raises(VanthRemoteError, match="no response"):
         validate_hello_response(None)
-    with pytest.raises(ssh.VanthRemoteError, match="unparseable"):
+    with pytest.raises(VanthRemoteError, match="unparseable"):
         validate_hello_response("")
-    with pytest.raises(ssh.VanthRemoteError, match="not a vanth"):
+    with pytest.raises(VanthRemoteError, match="not a vanth"):
         bad = {"version": "1", "kind": "hello", "protocol": "something.else"}
         validate_hello_response(json.dumps(bad))
+    # rc14 P0-1.4: hello without a live daemon epoch is a false positive.
+    with pytest.raises(VanthRemoteError, match="state_epoch"):
+        no_epoch = {"version": "1", "kind": "hello", "protocol": "vanth.remote",
+                    "agent": "x", "sent_at": "2026-08-21T00:00:00Z"}
+        validate_hello_response(json.dumps(no_epoch))
 
 
 def test_doctor_remote(tmp_path):

@@ -144,6 +144,17 @@ class RemoteControl:
             )
         payload = self._validate_payload(method, payload)
         digest = request_digest(method, payload, idempotency_key)
+        # Mutations REQUIRE a durable epoch binding (review rc14 P1-2): a
+        # mutation submitted without knowing the remote's timeline can mutate
+        # a restored timeline after a lost response + restore.
+        if method in _MUTATION_METHODS:
+            if expected_state_epoch is None:
+                row = self.store.db.execute(
+                    "SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"Unknown remote_id: {remote_id}")
+                expected_state_epoch = int(row["state_epoch"])
         self.store.check_state_epoch(remote_id, expected_state_epoch)
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
@@ -153,6 +164,7 @@ class RemoteControl:
                 method=method,
                 payload=payload,
                 digest=digest,
+                expected_state_epoch=expected_state_epoch,
                 commit=False,
             )
             # Placeholder ``submitting`` shadows exist only for mutations —
@@ -165,9 +177,11 @@ class RemoteControl:
         except BaseException:
             self.store.db.rollback()
             raise
-        # Carry the submit-time epoch binding into the frame builder.
-        if expected_state_epoch is not None:
-            request["expected_state_epoch"] = int(expected_state_epoch)
+        # Durable epoch binding: stored with the request AND the journal so
+        # retries after a lost response reuse it (review rc14 P1-2).
+        request["expected_state_epoch"] = (
+            int(expected_state_epoch) if expected_state_epoch is not None else None
+        )
         if self.journal is not None:
             try:
                 self.journal.record(request)
@@ -226,13 +240,14 @@ class RemoteControl:
             response = decode_frame(response_line)
         except Exception:
             return self._lost(remote_id, request)
-        # Bind the response to THIS request: a mismatched request_id/method
-        # must never be recorded as our answer (review P1-5).
+        # Bind the response to THIS request — mandatory, not optional
+        # (review rc14 P1-2): an unbound or mismatched response is never
+        # accepted as our answer.
         if not isinstance(response, dict) or response.get("kind") not in ("response", "error"):
             return self._lost(remote_id, request)
-        if response.get("request_id") is not None and response.get("request_id") != request["request_id"]:
+        if response.get("request_id") != request["request_id"]:
             return self._lost(remote_id, request)
-        if response.get("method") is not None and response.get("method") != request["method"]:
+        if response.get("method") != request["method"]:
             return self._lost(remote_id, request)
 
         self.store.db.execute("BEGIN IMMEDIATE")
@@ -315,8 +330,9 @@ class RemoteControl:
             if final_page:
                 finalize = self._finalize_snapshot_locked(remote_id, epoch, {str(j.get("job_id")) for j in jobs}, cursor)
                 deleted = finalize["deleted"]
-            else:
-                self.store.set_snapshot_cursor(remote_id, {"epoch": epoch, **cursor}, commit=False)
+            # Non-final pages do NOT advance the stored cursor: a failed later
+            # page must leave the cursor exactly where the last COMPLETE sync
+            # finished (review rc14 P0-2).
             # Adopt the snapshot's epoch: the controller learns the remote's
             # timeline version (e.g. after a remote restore) in the same tx.
             self.store.db.execute(
@@ -380,8 +396,31 @@ class RemoteControl:
         seen_ids: set[str] = set()
         epoch = None
         cursor = None
+        high_water = None
         while True:
             snapshot = self.snapshot(remote_id, cursor=cursor)
+            # Fail-fast (review rc14 P0-2): a lost/failed page returns {} —
+            # treating that as a final empty page used to suppress every
+            # shadow. Any malformed/incomplete page aborts the sync with
+            # nothing suppressed; per-page upserts are idempotent truths.
+            if not snapshot or snapshot.get("kind") != "snapshot":
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST",
+                    f"snapshot page {totals['pages'] + 1} failed or was lost; "
+                    "shadows and cursor left unchanged",
+                )
+            page_hw = (snapshot.get("cursor") or {}).get("high_water")
+            if page_hw is None:
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST", "snapshot page missing the fixed high-water boundary"
+                )
+            if high_water is None:
+                high_water = int(page_hw)
+            elif int(page_hw) != int(high_water):
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST",
+                    "snapshot high-water boundary changed mid-sync; retry the sync",
+                )
             result = self.apply_snapshot(remote_id, snapshot, final_page=False)
             totals["applied"] += result["applied"]
             totals["superseded"] += result["superseded"]

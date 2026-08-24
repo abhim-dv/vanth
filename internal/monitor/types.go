@@ -59,8 +59,8 @@ type JobSummary struct {
 	// Remote shadow projection (Phase 3): set when the row comes from a
 	// remote_shadows table rather than the local jobs table. A shadow has no
 	// local PID/heartbeat; the view renders its remote location + status.
-	RemoteID   string
-	Shadow     bool
+	RemoteID string
+	Shadow   bool
 }
 
 // IsRemote reports whether this summary is a projected remote shadow.
@@ -98,10 +98,10 @@ type Event struct {
 // Config carries all tunable monitor parameters. Refresh intervals are
 // configurable so tests can drive deterministic cadence without a TTY.
 type Config struct {
-	Home         string
-	DBPath       string
-	EventsDir    string
-	LogsDir      string
+	Home      string
+	DBPath    string
+	EventsDir string
+	LogsDir   string
 	// RemoteDBPath optionally points at the controller's remote.sqlite
 	// (review P1-7). When set and the file exists, Refresh merges
 	// current-timeline remote shadows into the job list.
@@ -128,10 +128,13 @@ type Config struct {
 // DefaultConfig returns the production monitor configuration for a home dir.
 func DefaultConfig(home string) Config {
 	return Config{
-		Home:                home,
-		DBPath:              filepath.Join(home, "jobs.sqlite"),
-		EventsDir:           filepath.Join(home, "events"),
-		LogsDir:             filepath.Join(home, "logs"),
+		Home:      home,
+		DBPath:    filepath.Join(home, "jobs.sqlite"),
+		EventsDir: filepath.Join(home, "events"),
+		LogsDir:   filepath.Join(home, "logs"),
+		// Production wiring for the remote shadow projection (review
+		// rc14 P1-5): the controller's remote.sqlite sits beside jobs.sqlite.
+		RemoteDBPath:        filepath.Join(home, "remote.sqlite"),
 		JobLimit:            100,
 		EventLimit:          2000,
 		EventBatchLimit:     5000,

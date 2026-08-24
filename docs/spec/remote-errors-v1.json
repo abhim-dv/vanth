@@ -26,6 +26,10 @@
       "status": 409,
       "message": "idempotency key was reused with a different request"
     },
+    "STATE_EPOCH_MISMATCH": {
+      "status": 409,
+      "message": "request was bound to a stale remote state epoch"
+    },
     "UNSUPPORTED_FEATURE": {
       "status": 501,
       "message": "requested feature is not supported"

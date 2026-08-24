@@ -173,7 +173,12 @@ def _remote_epoch(remote_id: str):
 
 
 def _remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Translate a local job payload to a remote protocol payload."""
+    """Translate a local job payload to a remote protocol payload.
+
+    ``idempotency_key`` and ``remote_id`` are preserved for the caller:
+    dropping the key forced a random mint per HTTP attempt, so a lost
+    response + retry created a second remote operation (review rc14 P1-3).
+    """
     return {
         key: value
         for key, value in payload.items()
@@ -181,6 +186,7 @@ def _remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "command", "cwd", "name", "env", "timeout_seconds", "notify_on",
             "wake_targets", "origin_thread_id", "tags", "notes", "interactive",
             "trigger", "signal", "kill_after_seconds", "overrides",
+            "idempotency_key",
         }
     }
 
@@ -475,6 +481,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/health":
                 ok(self, {"ok": True})
+            elif parsed.path == "/remote/identity":
+                # Loopback-only identity probe for the remote helper sentinel
+                # (review rc14 P0-1.4): proves daemon reachability and returns
+                # the live state_epoch for hello binding.
+                ok(self, {"state_epoch": _remote_job_manager().store.get_state_epoch()})
             elif parsed.path == "/ready":
                 report = get_manager().doctor()
                 ok(self, report, 200 if report["ok"] else 503)
@@ -680,6 +691,10 @@ class Handler(BaseHTTPRequestHandler):
                 from .remote.pairing import remove_remote
 
                 ok(self, remove_remote(remote_id=payload.get("remote_id"), store=get_remote_store()))
+            elif parsed.path == "/remote/identity":
+                # Loopback-only identity probe used by the remote helper's
+                # sentinel hello (review rc14 P0-1.4).
+                ok(self, {"state_epoch": _remote_job_manager().store.get_state_epoch()})
             elif parsed.path == "/remote/helper":
                 frame = payload.get("frame", payload)
                 remote = _remote_job_manager()
@@ -783,6 +798,9 @@ class Handler(BaseHTTPRequestHandler):
                     payload.get("kind", "s3"), payload.get("config")))
             elif parsed.path.startswith("/artifacts/storage-profiles/") and parsed.path.endswith("/probe"):
                 ok(self, get_artifact_storage_profiles().probe(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/artifacts/storage-profiles/") and parsed.path.endswith("/update"):
+                ok(self, get_artifact_storage_profiles().update(
+                    parsed.path.split("/")[2], payload.get("config") or {}))
             elif parsed.path == "/artifacts/push-remote":
                 ok(self, get_artifact_broker().push_blob(
                     payload["remote_id"], payload["version_id"],

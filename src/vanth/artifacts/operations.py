@@ -571,8 +571,9 @@ class ArtifactOperations:
                 shas=[sha for _, sha in staged_paths],
                 manifest_digest=mdigest,
             )
-            # Publication/GC fence (review P1-9): all blob publishes plus the
-            # catalog commit hold the fence so GC cannot interleave an unlink.
+            # Publication/GC fence (review P1-9, rc14 P1-7): the fence spans
+            # ALL blob publishes AND the catalog commit — exiting early let GC
+            # delete freshly-published blobs as unreachable.
             with self.blobs.gc_fence():
                 for staged, sha256 in staged_paths:
                     self.blobs.publish_staged(staged, sha256)
@@ -582,72 +583,72 @@ class ArtifactOperations:
                         self.renew(op["op_id"], token)
                     except ValueError:
                         pass
-            # Publication transaction boundary (same as put_file): blobs are
-            # durable above; this single transaction commits version + root
-            # pointer + fenced op completion.
-            db = self.catalog.db
-            total_size = sum(int(e["size_bytes"]) for e in manifest["entries"] if e["kind"] == "file")
-            with self.catalog.lock:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    row = db.execute(
-                        "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
-                        (root["root_id"], mdigest),
-                    ).fetchone()
-                    deduplicated = bool(row)
-                    version_id = row["version_id"] if row else self.catalog.new_version_id()
-                    if not row:
+                # Publication transaction boundary (same as put_file): blobs are
+                # durable above; this single transaction commits version + root
+                # pointer + fenced op completion.
+                db = self.catalog.db
+                total_size = sum(int(e["size_bytes"]) for e in manifest["entries"] if e["kind"] == "file")
+                with self.catalog.lock:
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        row = db.execute(
+                            "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
+                            (root["root_id"], mdigest),
+                        ).fetchone()
+                        deduplicated = bool(row)
+                        version_id = row["version_id"] if row else self.catalog.new_version_id()
+                        if not row:
+                            db.execute(
+                                "INSERT INTO versions(version_id, root_id, manifest_digest, manifest_json, size_bytes, created_at)"
+                                " VALUES (?, ?, ?, ?, ?, ?)",
+                                (
+                                    version_id,
+                                    root["root_id"],
+                                    mdigest,
+                                    json.dumps(manifest, separators=(",", ":")),
+                                    total_size,
+                                    now_iso(),
+                                ),
+                            )
                         db.execute(
-                            "INSERT INTO versions(version_id, root_id, manifest_digest, manifest_json, size_bytes, created_at)"
-                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            "UPDATE roots SET latest_version_id=?, updated_at=? WHERE root_id=?",
+                            (version_id, now_iso(), root["root_id"]),
+                        )
+                        result = {
+                            "version_id": version_id,
+                            "root_id": root["root_id"],
+                            "name": name,
+                            "manifest_digest": mdigest,
+                            "size_bytes": total_size,
+                            "file_count": sum(1 for e in manifest["entries"] if e["kind"] == "file"),
+                            "deduplicated": deduplicated,
+                        }
+                        changed = db.execute(
+                            """
+                            UPDATE operations SET status='completed', result_json=?, updated_at=?,
+                              claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                            WHERE op_id=? AND claim_token=? AND status='running'
+                              AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                            """,
                             (
-                                version_id,
-                                root["root_id"],
-                                mdigest,
-                                json.dumps(manifest, separators=(",", ":")),
-                                total_size,
+                                json.dumps(result, separators=(",", ":")),
+                                now_iso(),
+                                op["op_id"],
+                                token,
                                 now_iso(),
                             ),
-                        )
-                    db.execute(
-                        "UPDATE roots SET latest_version_id=?, updated_at=? WHERE root_id=?",
-                        (version_id, now_iso(), root["root_id"]),
-                    )
-                    result = {
-                        "version_id": version_id,
-                        "root_id": root["root_id"],
-                        "name": name,
-                        "manifest_digest": mdigest,
-                        "size_bytes": total_size,
-                        "file_count": sum(1 for e in manifest["entries"] if e["kind"] == "file"),
-                        "deduplicated": deduplicated,
-                    }
-                    changed = db.execute(
-                        """
-                        UPDATE operations SET status='completed', result_json=?, updated_at=?,
-                          claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
-                        WHERE op_id=? AND claim_token=? AND status='running'
-                          AND (lease_expires_at IS NULL OR lease_expires_at > ?)
-                        """,
-                        (
-                            json.dumps(result, separators=(",", ":")),
-                            now_iso(),
-                            op["op_id"],
-                            token,
-                            now_iso(),
-                        ),
-                    ).rowcount
-                    if not changed:
-                        raise ValueError(
-                            f"stale worker: operation {op['op_id']} cannot be completed with this claim "
-                            "(expired lease or reclaimed generation)"
-                        )
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
-                # Commit succeeded: retire the publication intent (review P2-7).
-                intent.unlink(missing_ok=True)
+                        ).rowcount
+                        if not changed:
+                            raise ValueError(
+                                f"stale worker: operation {op['op_id']} cannot be completed with this claim "
+                                "(expired lease or reclaimed generation)"
+                            )
+                        db.commit()
+                    except BaseException:
+                        db.rollback()
+                        raise
+                    # Commit succeeded: retire the publication intent (review P2-7).
+                    intent.unlink(missing_ok=True)
             return result
         except BaseException as exc:
             try:

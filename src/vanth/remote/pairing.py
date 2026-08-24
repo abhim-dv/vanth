@@ -74,14 +74,29 @@ def validate_hello_response(line: str | bytes | None) -> dict[str, Any]:
         raise ssh.VanthRemoteError(
             f"sentinel handshake failed: not a vanth.remote hello response (kind={frame.get('kind')!r})"
         )
+    # Daemon-bound hello (review rc14 P0-1.4): the helper must have fetched
+    # the epoch live from the remote daemon — a locally-faked hello without
+    # one can no longer pass the sentinel.
+    epoch = frame.get("state_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise ssh.VanthRemoteError(
+            "sentinel handshake failed: hello is not bound to a reachable remote daemon "
+            "(missing state_epoch)"
+        )
     return frame
 
 
 class DefaultTransport:
     """Real transport bound to OpenSSH binaries. Injectable for tests."""
 
-    def fetch_host_keys(self, hostname: str, port: int | None) -> list[str]:
-        return ssh.fetch_host_keys(hostname, port)
+    def fetch_host_keys(self, hostname: str, port: int | None, *, known_hosts_path: str | None = None,
+                        fallback_config: str | None = None, config_dir: Any = None) -> list[str]:
+        return ssh.fetch_host_keys(
+            hostname, port,
+            known_hosts_path=known_hosts_path,
+            fallback_config=fallback_config,
+            config_dir=config_dir,
+        )
 
     def host_key_fingerprints(self, known_hosts_lines: list[str]) -> list[str]:
         return ssh.host_key_fingerprints(known_hosts_lines)
@@ -190,7 +205,18 @@ def pair_remote(
         store.update_remote_state(remote_id, "pairing")
 
         # --- 1. Host-key pinning BEFORE any authentication -----------------
-        host_keys = transport.fetch_host_keys(target_info["hostname"], target_info["port"])
+        known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+        bootstrap_probe_config = ssh.allowlist_config(
+            hostname=target_info["hostname"], user=target_info["user"], port=target_info["port"],
+            identity_file=str(remote_dir / "id_ed25519"), known_hosts=str(known_hosts_path),
+            include_identity=False,
+        )
+        host_keys = transport.fetch_host_keys(
+            target_info["hostname"], target_info["port"],
+            known_hosts_path=str(known_hosts_path),
+            fallback_config=bootstrap_probe_config,
+            config_dir=remote_dir,
+        )
         fingerprints = transport.host_key_fingerprints(host_keys)
         if host_fingerprint:
             if host_fingerprint not in fingerprints:
@@ -225,9 +251,30 @@ def pair_remote(
         )
         argv = _target_argv(target_info)
 
-        # --- 3. Exact forced-command install over bootstrap credential -----
+        # --- 3. Wrapper + exact forced-command install over bootstrap -----
+        # The forced command is a RESTRICTED WRAPPER that binds the helper to
+        # the remote daemon's loopback URL and the remote user's own token at
+        # exec time — a bare executable answered hello without any daemon and
+        # made the sentinel a false positive (review rc14 P0-1.4).
+        url_expr = ('sed -n \'s/.*"url"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' '
+                    '"$HOME/.vanth/daemon.json" 2>/dev/null | head -1')
+        wrapper_script = ssh.remote_wrapper_setup_script(url_expr)
         transport.install_authorized_key(
-            install_script=ssh.authorized_keys_install_script(installed_line, marker),
+            install_script=wrapper_script,
+            bootstrap_config=bootstrap_config,
+            config_dir=remote_dir,
+            target_argv=argv,
+        )
+        wrapper_command = "$HOME/.vanth/remote-wrapper.sh"
+        installed_line = ssh.authorized_keys_line(
+            public_key_blob, "", marker_comment=marker, forced_command=wrapper_command
+        )
+        transport.install_authorized_key(
+            install_script=ssh.authorized_keys_install_script(
+                installed_line, marker,
+                key_blob=public_key_blob,
+                wrapper_command="$HOME/.vanth/remote-wrapper.sh",
+            ),
             bootstrap_config=bootstrap_config,
             config_dir=remote_dir,
             target_argv=argv,

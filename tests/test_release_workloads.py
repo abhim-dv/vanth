@@ -47,6 +47,22 @@ def all_event_seqs(manager: JobManager, job_id: str) -> list[int]:
     return [row["seq"] for row in rows]
 
 
+def wait_event_counts(manager: JobManager, job_id: str, expected: dict[str, int], timeout: float = 30) -> None:
+    """Wait until per-type event counts reach expectations.
+
+    Status flips to terminal before the terminal EVENT row is necessarily
+    observed by a separate reader connection; asserting counts immediately
+    after wait_completed raced under load (review rc14 P1-11)."""
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        last = event_counts(manager, job_id)
+        if all(last.get(t, 0) >= c for t, c in expected.items()):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"events did not reach {expected} in time; last={last}")
+
+
 def test_concurrent_burst_loses_no_events_and_keeps_unique_seq(tmp_path):
     jobs = 10
     per_job = 40
@@ -67,6 +83,11 @@ def test_concurrent_burst_loses_no_events_and_keeps_unique_seq(tmp_path):
             )
         for job_id in started:
             wait_completed(manager, job_id)
+            wait_event_counts(manager, job_id, {
+                "metric": per_job * 2,
+                "started": 1,
+                "completed": 1,
+            })
 
         for job_id in started:
             counts = event_counts(manager, job_id)

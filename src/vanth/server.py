@@ -2464,7 +2464,14 @@ class JobManager:
                 self._emit(job_id, "cancelled", message="Queued job cancelled before its trigger fired")
             return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Queued job cancelled"}
         if row and row["status"] != "running":
-            raise ValueError(f"Job is not running: {job_id}")
+            # Already-terminal stop is an idempotent no-op (review rc14 P1-11):
+            # repeated/cleanup stops must not raise when the job finished
+            # between a caller's observation and its stop request.
+            return {
+                "job_id": job_id,
+                "status": row["status"],
+                "message": f"Job already {row['status']}; stop is a no-op",
+            }
         deadline = time.monotonic() + kill_after_seconds
         stop_token = now_iso()
         with self.db_lock:
@@ -2984,6 +2991,14 @@ def artifact_storage_profile_get(profile_id: str) -> dict[str, Any]:
 def artifact_storage_profile_probe(profile_id: str) -> dict[str, Any]:
     """Probe a storage profile's endpoint capabilities and store them on the latest revision."""
     return get_client().post(f"/artifacts/storage-profiles/{profile_id}/probe", {})
+
+
+@mcp.tool()
+def artifact_storage_profile_update(profile_id: str, config: dict[str, Any],
+                                    idempotency_key: str | None = None) -> dict[str, Any]:
+    """Insert the NEXT immutable revision of a storage profile; old revisions stay queryable."""
+    return get_client().post(f"/artifacts/storage-profiles/{profile_id}/update",
+                             {"config": config, "idempotency_key": idempotency_key})
 
 
 @mcp.tool()

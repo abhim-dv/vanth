@@ -113,9 +113,32 @@ def error_frame(frame: dict[str, Any], *, code: str, message: str) -> dict[str, 
     return result
 
 
+def _fetch_daemon_identity(url: str, token: str) -> int | None:
+    """GET the remote daemon's live state_epoch.
+
+    The sentinel hello is only meaningful if it proves the daemon is actually
+    reachable and configured — a bare protocol string passed on unconfigured
+    hosts (review rc14 P0-1.4). Returns None on any failure so the caller can
+    answer with an error frame instead."""
+    request = urllib.request.Request(
+        url + "/remote/identity",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode())
+    except Exception:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("state_epoch"), int):
+        return payload["state_epoch"]
+    return None
+
+
 def _handle_frame(frame: dict[str, Any]) -> dict[str, Any]:
     kind = frame.get("kind")
     if kind == "hello":
+        url = os.environ.get("VANTH_REMOTE_HELPER_URL", "").rstrip("/")
+        token = os.environ.get("VANTH_REMOTE_HELPER_TOKEN", "")
         response: dict[str, Any] = {
             "version": "1",
             "kind": "hello",
@@ -126,7 +149,15 @@ def _handle_frame(frame: dict[str, Any]) -> dict[str, Any]:
         remote_id = os.environ.get("VANTH_REMOTE_HELPER_REMOTE_ID")
         if remote_id:
             response["remote_id"] = remote_id
-        state_epoch = _state_epoch()
+        # Prove daemon connectivity in the hello itself: without a reachable
+        # loopback daemon the helper is useless, and the old locally-faked
+        # hello made the sentinel a false positive (review rc14 P0-1.4).
+        if url and token and _loopback_url(url):
+            state_epoch = _fetch_daemon_identity(url, token)
+        else:
+            state_epoch = None
+        if state_epoch is None:
+            state_epoch = _state_epoch()
         if state_epoch is not None:
             response["state_epoch"] = state_epoch
         return response

@@ -15,6 +15,7 @@ no forwarding, no agent, no TTY, no control master), so anything in
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -143,6 +144,26 @@ def parse_target(target: str) -> dict[str, Any]:
     """
     if not isinstance(target, str) or not target.strip():
         raise VanthRemoteError("target must be a non-empty string")
+    # Bracketed IPv6 literals are validated structurally BEFORE the generic
+    # forbidden-char check, which would otherwise reject [ and ] (review
+    # rc14 P2-4).
+    import ipaddress as _ip
+
+    if target.count("[") == 1 and target.count("]") == 1:
+        pre, rest = target.split("[", 1)
+        host_part, _, suffix = rest.partition("]")
+        try:
+            _ip.IPv6Address(host_part)
+        except ValueError:
+            raise VanthRemoteError(f"invalid IPv6 literal in target: {target!r}") from None
+        if suffix and not suffix.startswith(":"):
+            raise VanthRemoteError(f"malformed text after IPv6 literal: {target!r}")
+        if pre and "@" in pre:
+            user = pre.rstrip("@")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9._-]*", user):
+                raise VanthRemoteError(f"invalid user in target: {target!r}")
+        return {"user": None, "hostname": host_part,
+                "port": int(suffix[1:]) if suffix.startswith(":") else None}
     if any(ord(ch) < 0x20 or ch in "\"'`$\\;|&<>!{}[]()#~*= " for ch in target):
         raise VanthRemoteError(f"target contains forbidden characters: {target!r}")
     match = _TARGET_RE.match(target)
@@ -159,12 +180,24 @@ def parse_target(target: str) -> dict[str, Any]:
     return {"user": user, "hostname": host, "port": port}
 
 
-def fetch_host_keys(hostname: str, port: int | None, *, timeout: float = 15.0) -> list[str]:
-    """Fetch the host's public keys via ``ssh-keyscan`` (TOFU material).
+def fetch_host_keys(
+    hostname: str,
+    port: int | None,
+    *,
+    timeout: float = 15.0,
+    known_hosts_path: str | None = None,
+    fallback_config: str | None = None,
+    config_dir: str | os.PathLike[str] | None = None,
+) -> list[str]:
+    """Fetch the host's public keys (TOFU material).
 
-    Returns raw known_hosts lines. Callers MUST display fingerprints and get
-    human approval (or verify a supplied SHA256 fingerprint) before trusting
-    them (review P0-1: pin a human-approved host key).
+    Primary path is ``ssh-keyscan``. Some servers negotiate KEX algorithms
+    keyscan does not support (e.g. Ubuntu 24.04's sntrup761x25519 hybrid),
+    so when keyscan returns nothing AND a bootstrap config is supplied we
+    fall back to a real ``ssh`` connection with ``StrictHostKeyChecking=
+    accept-new`` against the DEDICATED known_hosts file — OpenSSH itself
+    performs full negotiation and pins the keys, then we read them back
+    (review rc14 P0-1.1).
     """
     require_binaries()
     argv = ["ssh-keyscan", "-T", str(int(max(1, timeout))), "-p", str(port or 22), hostname]
@@ -174,24 +207,47 @@ def fetch_host_keys(hostname: str, port: int | None, *, timeout: float = 15.0) -
         for line in (result.stdout or "").splitlines()
         if line.strip() and not line.startswith("#")
     ]
-    if not lines:
-        raise VanthRemoteError(f"ssh-keyscan returned no host keys for {hostname}:{port or 22}")
-    return lines
+    if lines:
+        return lines
+    if known_hosts_path and fallback_config and config_dir:
+        connect_args: list[str] = []
+        if port and port != 22:
+            connect_args += ["-p", str(port)]
+        probe = subprocess.run(
+            ["ssh", "-F", str(config_dir), *connect_args, "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=%d" % int(max(1, timeout)), hostname, "true"],
+            capture_output=True, text=True, timeout=timeout + 10,
+        )
+        kh = Path(known_hosts_path)
+        if kh.exists():
+            pinned = [
+                ln.strip() for ln in kh.read_text(encoding="utf-8", errors="replace").splitlines()
+                if ln.strip() and not ln.startswith("#")
+            ]
+            if pinned:
+                return pinned
+        raise VanthRemoteError(
+            f"host key acquisition failed for {hostname}:{port or 22} "
+            f"(keyscan empty; accept-new probe exit {probe.returncode})"
+        )
+    raise VanthRemoteError(f"ssh-keyscan returned no host keys for {hostname}:{port or 22}")
 
 
 def host_key_fingerprints(known_hosts_lines: list[str]) -> list[str]:
     """SHA256 fingerprints for raw known_hosts lines (via ssh-keygen -lf -)."""
     require_binaries()
-    blobs: dict[str, str] = {}
+    seen: dict[tuple[str, str], str] = {}
     for line in known_hosts_lines:
         fields = line.split()
         if len(fields) >= 3:
-            blobs.setdefault((fields[0], fields[1]), fields[2])
+            # Preserve the REAL key type — writing 'x' breaks ssh-keygen
+            # parsing and returned an empty list (review rc14 P0-1.2).
+            seen.setdefault((fields[0], fields[1]), fields[2])
     fingerprints = []
-    for (hosts, _ktype), key in blobs.items():
+    for (hosts, ktype), blob in seen.items():
         proc = subprocess.run(
             ["ssh-keygen", "-lf", "-"],
-            input=f"{hosts} x {key}\n".encode(),
+            input=f"{hosts} {ktype} {blob}\n".encode(),
             capture_output=True,
             timeout=15,
         )
@@ -202,22 +258,37 @@ def host_key_fingerprints(known_hosts_lines: list[str]) -> list[str]:
     return fingerprints
 
 
-def authorized_keys_install_script(public_key_line: str, marker_comment: str) -> str:
+def authorized_keys_install_script(
+    public_key_line: str,
+    marker_comment: str,
+    *,
+    key_blob: str | None = None,
+    wrapper_command: str | None = None,
+) -> str:
     """POSIX shell snippet that atomically installs ONE exact authorization.
 
-    - Refuses when an UNRESTRICTED line containing the same key blob already
-      exists (exit 42 / ``UNRESTRICTED_KEY_PRESENT``) — review P0-1.
-    - Idempotent: exits 0 / ``ALREADY_INSTALLED`` when the exact line exists.
-    - Replaces only lines carrying our marker comment, then installs via
-      mktemp + mv (atomic within the same filesystem).
+    - ``key_blob`` is the explicit two-token public key ("ssh-ed25519 AAAA…")
+      passed separately: parsing it back out of an option-prefixed line is
+      fragile and broke live pairing (review rc14 P0-1.3).
+    - The unrestricted-duplicate check uses awk END semantics — a plain
+      ``if awk 'cond'`` exits zero even with no match, which made the script
+      ALWAYS report UNRESTRICTED_KEY_PRESENT on the live target (rc14 P0-1.3).
+    - Idempotent via exact-line grep; replaces only marker lines; mktemp+mv.
+    - When ``wrapper_command`` is given, that (not a bare helper) becomes the
+      forced command so daemon env vars travel through a restricted wrapper
+      instead of the raw executable (rc14 P0-1.4).
     """
     import shlex
 
-    fields = public_key_line.split()
-    key_blob = " ".join(fields[1:3]) if len(fields) >= 3 else ""
-    line_literal = shlex.quote(public_key_line.rstrip("\n"))
+    if key_blob is None:
+        fields = public_key_line.split()
+        key_blob = " ".join(fields[1:3]) if len(fields) >= 3 else ""
+    forced = wrapper_command or "vanth-remote-helper"
+    # Rebuild the line around the chosen forced command to avoid ambiguity.
+    key_type_and_blob = " ".join(public_key_line.split()[-2:]) if not key_blob else None
+    blob_literal = shlex.quote(key_blob or key_type_and_blob or "")
+    line_literal = shlex.quote(f'command="{forced}",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc {key_blob or ""} {marker_comment}'.replace("  ", " ").strip())
     marker_literal = shlex.quote(marker_comment)
-    blob_literal = shlex.quote(key_blob)
     return "\n".join([
         "set -eu",
         'AK="$HOME/.ssh/authorized_keys"',
@@ -225,7 +296,8 @@ def authorized_keys_install_script(public_key_line: str, marker_comment: str) ->
         'chmod 700 "$HOME/.ssh"',
         'touch "$AK"',
         'chmod 600 "$AK"',
-        f"if awk -v k={blob_literal} 'index($0, k) && $0 !~ /^command=/' \"$AK\"; then",
+        # END{exit !found} semantics: plain awk exits 0 regardless of matches.
+        f"if awk -v k={blob_literal} 'index($0, k) && $0 !~ /^command=/ {{ found=1 }} END {{ exit !found }}' \"$AK\"; then",
         "  echo 'UNRESTRICTED_KEY_PRESENT' >&2",
         "  exit 42",
         "fi",
@@ -239,6 +311,33 @@ def authorized_keys_install_script(public_key_line: str, marker_comment: str) ->
         "sort -u -o \"$TMP\" \"$TMP\"",
         'mv "$TMP" "$AK"',
         "echo 'INSTALLED'",
+    ]) + "\n"
+
+
+def remote_wrapper_setup_script(daemon_url_expr: str) -> str:
+    """POSIX shell snippet creating the restricted helper wrapper ON THE
+    REMOTE (review rc14 P0-1.4).
+
+    The wrapper binds the helper to the remote daemon's loopback URL and the
+    remote user's own auth token at EXEC time, so the sentinel hello proves
+    real daemon connectivity instead of passing on an unconfigured host. The
+    token never travels from the controller — it is read remotely from the
+    user's own $HOME/.vanth/token by their own shell."""
+    return "\n".join([
+        "set -eu",
+        'mkdir -p "$HOME/.vanth"',
+        'URL=' + daemon_url_expr,
+        '[ -n "$URL" ] || { echo "NO_DAEMON_URL" >&2; exit 51; }',
+        '[ -f "$HOME/.vanth/token" ] || { echo "NO_REMOTE_TOKEN" >&2; exit 52; }',
+        'WRAPPER="$HOME/.vanth/remote-wrapper.sh"',
+        '{',
+        '  printf "#!/bin/sh\\n"',
+        '  printf "exec env VANTH_REMOTE_HELPER_URL=%q VANTH_REMOTE_HELPER_TOKEN=$(cat \\"$HOME/.vanth/token\\") vanth-remote-helper\\" "$URL" 2>/dev/null || {',
+        '    printf "exec env VANTH_REMOTE_HELPER_URL=\\"%s\\" VANTH_REMOTE_HELPER_TOKEN=\\"$(cat \\"$HOME/.vanth/token\\")\\" vanth-remote-helper\\n" "$URL"',
+        '  }',
+        '} > "$WRAPPER"',
+        'chmod 700 "$WRAPPER"',
+        "echo 'WRAPPER_INSTALLED'",
     ]) + "\n"
 
 
@@ -336,6 +435,7 @@ def authorized_keys_line(
     helper_command: str,
     *,
     marker_comment: str = "vanth-remote",
+    forced_command: str | None = None,
 ) -> str:
     """Build a forced-command, restricted authorized_keys line.
 
@@ -345,8 +445,9 @@ def authorized_keys_line(
     never an unrelated authorization (review P0-1).
     """
     public_key_blob = public_key_blob.strip()
+    forced = forced_command or helper_command
     options = (
-        f'command="{helper_command}",no-pty,no-agent-forwarding,'
+        f'command="{forced}",no-pty,no-agent-forwarding,'
         "no-port-forwarding,no-X11-forwarding,no-user-rc"
     )
     return f"{options} {public_key_blob} {marker_comment}\n"

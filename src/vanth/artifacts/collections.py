@@ -209,6 +209,13 @@ class Collections:
                             " VALUES (?, ?, ?, ?)",
                             (coll["collection_id"], version_id, ordinal, now_iso()),
                         )
+                        # Capture the persisted stamp once and reuse it in the
+                        # result (review rc14 P2-6): the response previously
+                        # generated a DIFFERENT timestamp than the stored row.
+                        appended_created_at = db.execute(
+                            "SELECT created_at FROM collection_versions WHERE collection_id=? AND version_id=?",
+                            (coll["collection_id"], version_id),
+                        ).fetchone()["created_at"]
                         db.execute(
                             "UPDATE collections SET updated_at=? WHERE collection_id=?",
                             (now_iso(), coll["collection_id"]),
@@ -223,7 +230,8 @@ class Collections:
                             {"version_id": r["version_id"], "ordinal": int(r["ordinal"]), "created_at": r["created_at"]}
                             for r in current
                         ]
-                        + ([{"version_id": version_id, "ordinal": ordinal, "created_at": now_iso()}] if appended else []),
+                        + ([{"version_id": version_id, "ordinal": ordinal,
+                             "created_at": appended_created_at}] if appended else []),
                     }
                     changed = db.execute(
                         """
