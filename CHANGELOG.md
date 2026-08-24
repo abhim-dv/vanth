@@ -38,6 +38,14 @@ All notable changes to Vanth are documented here.
   refused at init; pull completion validates epoch/sha/bytes; push epoch
   fence moved BEFORE publication; manifest-digest binding covers v0+v1;
   same-digest cross-root lookups scoped by root name.
+- **P1-10b controller ledger**: `controller_transfers` no longer
+  global-unique-keys idempotency (transfer ids bind context); existing
+  databases are migrated automatically; takeover verifies the ledger row
+  against the requested remote/direction/content binding; pull-derived
+  publication/materialization op keys are scoped by destination token so
+  shared caller keys across destinations cannot collide.
+- **P2-5**: transfer protocol tests use direct `pytest.raises` again (the
+  NameError-swallowing helper is gone).
 - P2: structured remote-wait errors; IPv6 bracket targets; dir-version dedup
   verifies all blobs; lease renewal in dir publication; collection append
   returns persisted timestamp; StorageProfiles.update exposed as guarded

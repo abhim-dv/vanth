@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS controller_transfers (
   total_bytes INTEGER NOT NULL,
   sha256 TEXT NOT NULL,
   acked_offset INTEGER NOT NULL DEFAULT 0,
-  idempotency_key TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL,
   op_claim_token TEXT,
   state_epoch INTEGER,
   status TEXT NOT NULL DEFAULT 'active',
@@ -110,6 +110,49 @@ CREATE TABLE IF NOT EXISTS controller_transfers (
   updated_at TEXT NOT NULL
 );
 """
+
+
+def _ensure_controller_schema(db: Any) -> None:
+    """Migrate the controller ledger off the legacy global-unique key.
+
+    Transfer ids bind remote/destination context, so the SAME caller key in a
+    DIFFERENT context must be allowed its own row (review rc14 P1-10b): with
+    ``UNIQUE(idempotency_key)`` the INSERT was silently ignored and the
+    takeover UPDATE latched onto the other context's row."""
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='controller_transfers'"
+    ).fetchone()
+    if not row or "idempotency_key" not in str(row["sql"]):
+        return
+    if "UNIQUE" not in str(row["sql"]).upper():
+        return
+    db.executescript(
+        """
+        BEGIN;
+        CREATE TABLE controller_transfers_new (
+          transfer_id TEXT PRIMARY KEY,
+          remote_id TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          root_name TEXT NOT NULL,
+          manifest_digest TEXT NOT NULL,
+          total_bytes INTEGER NOT NULL,
+          sha256 TEXT NOT NULL,
+          acked_offset INTEGER NOT NULL DEFAULT 0,
+          idempotency_key TEXT NOT NULL,
+          op_claim_token TEXT,
+          state_epoch INTEGER,
+          status TEXT NOT NULL DEFAULT 'active',
+          error TEXT,
+          result_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO controller_transfers_new SELECT * FROM controller_transfers;
+        DROP TABLE controller_transfers;
+        ALTER TABLE controller_transfers_new RENAME TO controller_transfers;
+        COMMIT;
+        """
+    )
 
 EPOCH_STOP_MESSAGE = "epoch changed; transfer stopped rather than rebound"
 
@@ -518,6 +561,7 @@ class RemoteArtifactBroker:
         self.ops = ops
         db = ops.catalog.db
         db.executescript(CONTROLLER_TRANSFER_DDL)
+        _ensure_controller_schema(db)
         db.commit()
         self.db = db
 
@@ -792,12 +836,16 @@ class RemoteArtifactBroker:
             raise TransferInterrupted(transfer_id, offset, "pull completion byte-count mismatch")
 
         # Materialize locally through the standard durable-op pattern, then
-        # write dest_path atomically via materialize().
+        # write dest_path atomically via materialize(). Derived op keys are
+        # scoped by the destination token (review rc14 P1-10b): two pulls
+        # sharing one caller key but landing on different destinations must
+        # not collide in the controller's op ledger.
         with staging.open("rb") as handle:
             local_bytes = handle.read()
-        put = self.ops.put_file(root_name, data=local_bytes, idempotency_key=key + "-localpub")
+        put = self.ops.put_file(root_name, data=local_bytes,
+                                idempotency_key=f"{key}-pub-{dest_token}")
         mat = self.ops.materialize(put["version_id"], dest, overwrite=True,
-                                   idempotency_key=key + "-localmat")
+                                   idempotency_key=f"{key}-mat-{dest_token}")
         try:
             staging.unlink(missing_ok=True)
         except OSError:
@@ -884,16 +932,20 @@ class RemoteArtifactBroker:
         token = secrets.token_hex(16)
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute(
-                """
-                INSERT OR IGNORE INTO controller_transfers(transfer_id, remote_id, direction, root_name,
-                  manifest_digest, total_bytes, sha256, acked_offset, idempotency_key, op_claim_token,
-                  status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', ?, ?)
-                """,
-                (transfer_id, remote_id, direction, root_name, manifest_digest, total, sha256,
-                 key, token, now, now),
-            )
+            existing = self.db.execute(
+                "SELECT * FROM controller_transfers WHERE transfer_id=?", (transfer_id,)
+            ).fetchone()
+            if existing is None:
+                self.db.execute(
+                    """
+                    INSERT INTO controller_transfers(transfer_id, remote_id, direction, root_name,
+                      manifest_digest, total_bytes, sha256, acked_offset, idempotency_key, op_claim_token,
+                      status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', ?, ?)
+                    """,
+                    (transfer_id, remote_id, direction, root_name, manifest_digest, total, sha256,
+                     key, token, now, now),
+                )
             # Takeover: this process now owns the fence token (single-writer
             # assumption per transfer; the token gate below fences stale
             # writers from committing progress after a takeover).
@@ -905,6 +957,30 @@ class RemoteArtifactBroker:
             row = self.db.execute(
                 "SELECT * FROM controller_transfers WHERE transfer_id=?", (transfer_id,)
             ).fetchone()
+            # Binding verification: catches legacy-schema takeovers of a
+            # foreign row. Pull begins with placeholders (content unknown
+            # until transfer_init), so content fields are checked only when
+            # actually supplied.
+            if (
+                row is None
+                or row["remote_id"] != remote_id
+                or row["direction"] != direction
+            ):
+                raise ValueError(
+                    f"transfer {transfer_id} ledger row does not match the requested "
+                    "remote/destination/content binding"
+                )
+            for column, value in (("root_name", root_name), ("manifest_digest", manifest_digest),
+                                  ("sha256", sha256)):
+                if value and row[column] not in ("", None) and row[column] != value:
+                    raise ValueError(
+                        f"transfer {transfer_id} ledger row does not match the requested "
+                        f"{column} binding"
+                    )
+            if total and int(row["total_bytes"]) not in (0, int(total)):
+                raise ValueError(
+                    f"transfer {transfer_id} ledger row does not match the requested total_bytes"
+                )
             self.db.commit()
         except BaseException:
             self.db.rollback()

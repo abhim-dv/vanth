@@ -23,25 +23,6 @@ from vanth.remote.transfer import (
 )
 
 
-
-def _expect_protocol_error(call):
-    """pytest.raises replacement immune to the frame-binding quirk on this
-    tree (NameError raised while evaluating the exception class reference)."""
-    import vanth.remote.protocol as _proto
-
-    try:
-        call()
-    except _proto.VanthRemoteProtocolError:
-        return
-    except NameError as exc:
-        # The library raises VanthRemoteProtocolError; a stray NameError here
-        # means the class reference itself failed to resolve.
-        if "VanthRemoteProtocolError" in str(exc):
-            return
-        raise
-    raise AssertionError("expected VanthRemoteProtocolError")
-
-
 def connect(path):
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
@@ -163,20 +144,34 @@ def publish_source(w, *, name="model.bin", key="src-put-0001", data=SAMPLE_DATA)
 
 
 def test_transfer_methods_validate_via_protocol():
-    _expect_protocol_error(lambda: validate_request("artifact.transfer_init", {
-        "transfer_id": "xfr_" + "a" * 32, "direction": "sideways"}))
-    _expect_protocol_error(lambda: validate_request("artifact.transfer_init", {"direction": "push"}))
-    _expect_protocol_error(lambda: validate_request(
-        "artifact.transfer_init", {"transfer_id": "t0", "direction": "pull"}))
-    _expect_protocol_error(lambda: validate_request(
-        "artifact.blob_chunk", {"transfer_id": "t0", "offset": 0}))
-    _expect_protocol_error(lambda: validate_request(
-        "artifact.blob_chunk", {"transfer_id": "xfr_" + "e" * 32}))
-    _expect_protocol_error(lambda: validate_request(
-        "artifact.blob_chunk", {"transfer_id": "xfr_" + "f" * 32, "offset": -1}))
-    _expect_protocol_error(lambda: validate_request(
-        "artifact.blob_chunk",
-        {"transfer_id": "xfr_" + "a" * 32, "offset": 0, "data_b64": "", "sha256": "nope"}))
+    def _vre():
+        # Function-local binding sidesteps the frame-binding quirk on this
+        # tree (review P2-5: prefer direct pytest.raises over a swallowing
+        # helper).
+        from vanth.remote.protocol import VanthRemoteProtocolError
+        return VanthRemoteProtocolError
+
+    with pytest.raises(_vre()):
+        validate_request("artifact.transfer_init", {
+            "transfer_id": "xfr_" + "a" * 32, "direction": "sideways"})
+    with pytest.raises(_vre()):
+        validate_request("artifact.transfer_init", {"direction": "push"})
+    with pytest.raises(_vre()):
+        validate_request(
+            "artifact.transfer_init", {"transfer_id": "t0", "direction": "pull"})
+    with pytest.raises(_vre()):
+        validate_request(
+            "artifact.blob_chunk", {"transfer_id": "t0", "offset": 0})
+    with pytest.raises(_vre()):
+        validate_request(
+            "artifact.blob_chunk", {"transfer_id": "xfr_" + "e" * 32})
+    with pytest.raises(_vre()):
+        validate_request(
+            "artifact.blob_chunk", {"transfer_id": "xfr_" + "f" * 32, "offset": -1})
+    with pytest.raises(_vre()):
+        validate_request(
+            "artifact.blob_chunk",
+            {"transfer_id": "xfr_" + "a" * 32, "offset": 0, "data_b64": "", "sha256": "nope"})
     # Valid forms pass.
     validate_request("artifact.transfer_init", {
         "transfer_id": "xfr_" + "a" * 32, "direction": "push", "root_name": "r",
@@ -437,3 +432,24 @@ def test_pull_roundtrip_materializes_remote_version(world, tmp_path):
     served = [f["payload"]["offset"] for f in world.transport.frames
               if f["method"] == "artifact.blob_chunk"
               and json.dumps(f).count("data_b64") == 1 and f["payload"].get("data_b64")]
+
+
+def test_same_idempotency_key_across_contexts_gets_separate_rows(world, tmp_path):
+    """Review rc14 P1-10b: the controller ledger must not globally unique-key
+    idempotency; the same caller key against a DIFFERENT destination creates
+    its own transfer instead of taking over the other context's row."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+    pushed = world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0009")
+
+    dest_a = tmp_path / "out-a" / "model.bin"
+    dest_b = tmp_path / "out-b" / "model.bin"
+    a = world.broker.pull_blob(rid, pushed["version_id"], dest_a, idempotency_key="shared-key-01")
+    b = world.broker.pull_blob(rid, pushed["version_id"], dest_b, idempotency_key="shared-key-01")
+
+    assert dest_a.read_bytes() == SAMPLE_DATA
+    assert dest_b.read_bytes() == SAMPLE_DATA
+    assert a["transfer_id"] != b["transfer_id"]
+    rows = controller_transfer_row(world)
+    keys = [r["idempotency_key"] for r in rows]
+    assert keys.count("shared-key-01") == 2
