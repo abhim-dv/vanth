@@ -515,7 +515,7 @@ class RemoteControl:
                 # reflected by the applied pages, so resuming from the stale
                 # stored cursor would replay OLD statuses over FRESHER
                 # snapshot shadows.
-                self.store.set_feed_cursor(remote_id, {
+                self._advance_feed_cursor(remote_id, {
                     "state_epoch": epoch,
                     "feed_epoch": int(feed_epoch),
                     "seq": int(feed_boundary_seq),
@@ -571,12 +571,15 @@ class RemoteControl:
 
         if self._cursor_is_gapped(remote_id, cursor, result):
             totals = self.sync_snapshot(remote_id)
-            new_cursor = {
+            # sync_snapshot advanced the stored cursor to the snapshot's
+            # captured feed boundary (rc17 review F3). Adopting values from
+            # the STALE feed response here could move the cursor BACKWARD
+            # (probe: 9 -> 5), so read back what the snapshot actually wrote.
+            new_cursor = self.store.get_feed_cursor(remote_id) or {
                 "state_epoch": int(result.get("state_epoch") or 1),
                 "feed_epoch": int(result.get("feed_epoch") or 1),
                 "seq": int(result.get("high_water_seq") or 0),
             }
-            self.store.set_feed_cursor(remote_id, new_cursor)
             return {
                 "mode": "snapshot",
                 "snapshot": totals,
@@ -612,7 +615,7 @@ class RemoteControl:
                         suppressed += 1
                     else:
                         raise VanthRemoteProtocolError("INVALID_REQUEST", f"unknown feed change kind: {kind!r}")
-                self.store.set_feed_cursor(remote_id, {
+                self._advance_feed_cursor(remote_id, {
                     "state_epoch": epoch,
                     "feed_epoch": int(result.get("feed_epoch") or 1),
                     "seq": int(next_cursor.get("seq") or 0),
@@ -635,6 +638,26 @@ class RemoteControl:
             "state_epoch": epoch,
             "feed_epoch": int(result.get("feed_epoch") or 1),
         }
+
+    def _advance_feed_cursor(self, remote_id: str, incoming: dict[str, Any], *,
+                             commit: bool = False) -> dict[str, Any]:
+        """CAS-style cursor update (rc17 review F3): on the SAME timeline a
+        cursor never moves backward. A snapshot boundary reflects every feed
+        event up to it, and feed batches apply in order — so an older seq on
+        the same epochs means the stored cursor is already ahead."""
+        stored = self.store.get_feed_cursor(remote_id)
+        if stored:
+            try:
+                same_timeline = (
+                    int(stored.get("state_epoch", -1)) == int(incoming["state_epoch"])
+                    and int(stored.get("feed_epoch", -1)) == int(incoming["feed_epoch"])
+                )
+                if same_timeline and int(stored.get("seq") or 0) > int(incoming["seq"]):
+                    return stored
+            except (TypeError, ValueError):
+                pass
+        self.store.set_feed_cursor(remote_id, incoming, commit=commit)
+        return incoming
 
     @staticmethod
     def _cursor_is_gapped(remote_id: str, cursor: dict[str, Any] | None,

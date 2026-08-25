@@ -149,3 +149,97 @@ def test_snapshot_pages_carry_consistent_feed_boundary(tmp_path):
     page2 = remote.handle_snapshot_request({"payload": {"cursor": page["cursor"]}})["result"]
     assert page2["feed_boundary_seq"] == page["feed_boundary_seq"]
     assert page2["feed_epoch"] == page["feed_epoch"]
+
+
+def _stop_world(tmp_path, job_rows):
+    """World with ONE shared sqlite db for jobs + remote ops (as in prod)."""
+    import sqlite3 as _sq
+
+    from vanth.remote.remote import RemoteJobManager
+    from vanth.remote.store import RemoteOperationStore
+
+    db_path = tmp_path / "shared.sqlite"
+    db = _sq.connect(db_path, check_same_thread=False)
+    db.row_factory = _sq.Row
+    db.executescript(JOBS_SCHEMA)
+    stamp = "2026-01-01T00:00:00Z"
+    for job_id, status in job_rows:
+        db.execute(
+            "INSERT INTO jobs(job_id, name, command, status, exit_code, created_at, updated_at,"
+            " stdout_path, stderr_path, events_path) VALUES (?, ?, 'echo hi', ?, 0, ?, ?, 'o', 'e', 'ev')",
+            (job_id, "n-" + job_id, status, stamp, stamp),
+        )
+    db.commit()
+
+    rstore = RemoteOperationStore(db)
+    rstore.db.execute("UPDATE remote_state SET instance_id='test-instance' WHERE id=1")
+    rstore.db.commit()
+    manager = FakeManager(logs_dir=tmp_path, events_dir=tmp_path / "events", db=db)
+    remote = RemoteJobManager(rstore, manager, home=tmp_path)
+    return rstore, remote
+
+
+def test_transient_stop_failure_stays_retryable(tmp_path):
+    """rc17 F1: a transient stop_sync exception leaves the op nonterminal so
+    the dispatcher retries; only validation failures are terminal."""
+    rstore, remote = _stop_world(tmp_path, [("job_a", "running")])
+
+    class BoomManager:
+        db_lock = threading.Lock()
+
+        def __init__(self, db):
+            self.logs = tmp_path
+            self.db = db
+
+        def stop_sync(self, job_id):
+            raise RuntimeError("transient manager failure")
+
+    remote.manager = BoomManager(rstore.db)
+    resp = remote.handle_request(request_frame(method="job.stop", payload={"job_id": "job_a"}, key="key-stop-0001"))
+    assert resp["kind"] == "response"
+    assert resp["result"]["retrying"] is True
+    op_status = rstore.db.execute(
+        "SELECT status FROM remote_operations WHERE idempotency_key='key-stop-0001'"
+    ).fetchone()["status"]
+    assert op_status == "accepted", "transient failure must stay retryable"
+
+    # Recovery: the same key re-drives the stop and completes it.
+    class OkManager(BoomManager):
+        def stop_sync(self, job_id):
+            self.db.execute("UPDATE jobs SET status='completed' WHERE job_id=?", (job_id,))
+            self.db.commit()
+            return {"status": "completed"}
+
+    remote.manager = OkManager(rstore.db)
+    resp2 = remote.handle_request(request_frame(method="job.stop", payload={"job_id": "job_a"}, key="key-stop-0001"))
+    assert resp2["kind"] == "response", resp2
+    assert resp2["result"]["status"] == "completed"
+    op_status2 = rstore.db.execute(
+        "SELECT status FROM remote_operations WHERE idempotency_key='key-stop-0001'"
+    ).fetchone()["status"]
+    assert op_status2 == "completed"
+
+
+def test_unknown_stop_target_is_terminal(tmp_path):
+    rstore, remote = _stop_world(tmp_path, [])
+    resp = remote.handle_request(request_frame(method="job.stop", payload={"job_id": "ghost"}, key="key-stop-0002"))
+    assert resp["kind"] == "response", resp
+    assert resp["result"]["status"] == "error"
+    status = rstore.db.execute(
+        "SELECT status FROM remote_operations WHERE idempotency_key='key-stop-0002'"
+    ).fetchone()["status"]
+    assert status == "failed"
+
+
+def test_feed_cursor_never_moves_backward(tmp_path):
+    """rc17 F3: on one timeline a cursor update with an OLDER seq is a no-op."""
+    cstore, rstore, remote, control, row, jobs_db, logs = make_world(tmp_path)
+    rid = row["remote_id"]
+    cstore.set_feed_cursor(rid, {"state_epoch": 1, "feed_epoch": 1, "seq": 9})
+    out = control._advance_feed_cursor(rid, {"state_epoch": 1, "feed_epoch": 1, "seq": 5})
+    assert int(out["seq"]) == 9
+    stored = cstore.get_feed_cursor(rid)
+    assert int(stored["seq"]) == 9
+    # A NEW timeline may reset freely.
+    out2 = control._advance_feed_cursor(rid, {"state_epoch": 2, "feed_epoch": 2, "seq": 0})
+    assert int(out2["seq"]) == 0

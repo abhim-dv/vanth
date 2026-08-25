@@ -85,6 +85,7 @@ class RemoteJobManager:
             epoch_fn=self._remote_state_epoch,
             ops_factory=self._remote_artifact_ops,
             staging_dir=(Path(home) / "remote-transfers") if home else None,
+            epoch_lock=self.store.epoch_lock,
         )
         self.dispatcher_stop = threading.Event()
         self.dispatcher_thread: threading.Thread | None = None
@@ -266,44 +267,52 @@ class RemoteJobManager:
             return self._response_frame(frame, {**op["result"], "replayed": True})
         job_id = payload["job_id"]
         stopped_status = None
-        error = None
+        permanent_error = None
+        transient_error = None
         try:
             row = self.store.db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
-                error = f"unknown job on remote: {job_id}"
+                permanent_error = f"unknown job on remote: {job_id}"
             elif row["status"] in TERMINAL_STATUSES:
                 stopped_status = row["status"]
             else:
                 stop_result = self.manager.stop_sync(job_id)
                 stopped_status = stop_result.get("status")
         except Exception as exc:
-            error = str(exc)
-        # A FAILED stop is recorded as a failed op (Sol review): marking it
-        # completed made the durable replay report a stop that never happened.
-        result_status = "error" if error else (stopped_status or "stopping")
+            # Transient execution failure: the op STAYS nonterminal so the
+            # dispatcher retries it on the next tick (rc17 review F1). Only
+            # validation failures are terminal here.
+            transient_error = str(exc)
+        error = permanent_error
+        result_status = "error" if error else ("stopping" if transient_error else (stopped_status or "stopping"))
         result = {
             "op_id": op["op_id"],
             "job_id": job_id,
             "status": result_status,
+            "retrying": bool(transient_error),
         }
         if error:
             result["error"] = error
-        # Force-complete/failed the stop op with its durable result (the
-        # generic operation machine models job launches, not management
-        # intents), so a lost response replays THIS outcome instead of
-        # re-executing. A successful terminal stop emits a TERMINAL UPSERT —
-        # not a tombstone — so controller shadows learn the final status
-        # (Sol review).
+        elif transient_error:
+            result["transient_error"] = transient_error
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
-            self.store.db.execute(
-                "UPDATE remote_operations SET status=?, result_json=?, updated_at=? WHERE op_id=?",
-                (
-                    "failed" if error else "completed",
-                    json.dumps(result, separators=(",", ":")), now_iso(), op["op_id"],
-                ),
-            )
-            if not error and stopped_status in TERMINAL_STATUSES:
+            if error is None and transient_error is not None:
+                # Leave the intent for _reconcile_stop_intent; no durable
+                # terminal result, so a retry with this key re-drives the stop.
+                self.store.db.execute(
+                    "UPDATE remote_operations SET updated_at=? WHERE op_id=?",
+                    (now_iso(), op["op_id"]),
+                )
+            else:
+                self.store.db.execute(
+                    "UPDATE remote_operations SET status=?, result_json=?, updated_at=? WHERE op_id=?",
+                    (
+                        "failed" if error else "completed",
+                        json.dumps(result, separators=(",", ":")), now_iso(), op["op_id"],
+                    ),
+                )
+            if not error and not transient_error and stopped_status in TERMINAL_STATUSES:
                 payload_row = self.store.db.execute(
                     "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
                     "FROM jobs WHERE job_id=?",
@@ -543,6 +552,41 @@ class RemoteJobManager:
             self.store.db.execute(
                 "UPDATE remote_operations SET status='failed', error='stop intent missing job_id' WHERE op_id=?",
                 (row["op_id"],),
+            )
+            self.store.db.commit()
+            return
+        # Permanent validation failure: unknown target can never succeed.
+        job_row = self.store.db.execute(
+            "SELECT status FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if job_row is None:
+            self.store.db.execute(
+                "UPDATE remote_operations SET status='failed', error=?, updated_at=? WHERE op_id=?",
+                (f"unknown job on remote: {job_id}", now_iso(), row["op_id"]),
+            )
+            self.store.db.commit()
+            return
+        if job_row["status"] in TERMINAL_STATUSES:
+            status = job_row["status"]
+            self.store.db.execute(
+                "UPDATE remote_operations SET status='completed', result_json=?, updated_at=? WHERE op_id=?",
+                (
+                    json.dumps({"op_id": row["op_id"], "job_id": job_id, "status": status},
+                               separators=(",", ":")),
+                    now_iso(), row["op_id"],
+                ),
+            )
+            payload_full = self.store.db.execute(
+                "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                "FROM jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            upsert_payload = dict(payload_full) if payload_full else {
+                "job_id": job_id, "status": status,
+            }
+            self.feed.append_in_tx(
+                "job.upsert", job_id=job_id,
+                payload=upsert_payload,
             )
             self.store.db.commit()
             return

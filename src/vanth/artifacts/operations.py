@@ -939,29 +939,44 @@ class ArtifactOperations:
                           src_dir_fd: int | None = None) -> None:
         """Atomically publish without replacing an object that raced in.
 
-        Linux uses ``renameat2(RENAME_NOREPLACE)``. Every other POSIX
-        platform (macOS, BSDs — Sol review) falls back to a hardlink
-        publication for files (``link(2)`` is itself no-replace) and a
-        checked rename otherwise."""
+        Linux uses ``renameat2(RENAME_NOREPLACE)``; macOS uses
+        ``renameatx_np(RENAME_EXCL)`` (rc17 review F7). Any other platform —
+        or a kernel missing the syscall — degrades to the hardlink/checked
+        portable path."""
         if os.name == "nt":
             os.rename(src, dst)
             return
+        at_fdcwd = -100
+        old_fd = at_fdcwd if src_dir_fd is None else src_dir_fd
+        new_fd = at_fdcwd if dst_dir_fd is None else dst_dir_fd
+        old_name = os.fsencode(src)
+        new_name = os.fsencode(dst)
         if sys.platform.startswith("linux"):
             import ctypes
 
             libc = ctypes.CDLL(None, use_errno=True)
             renameat2 = getattr(libc, "renameat2", None)
-            if renameat2 is None:
-                raise OSError(errno.ENOTSUP, "renameat2 is unavailable")
-            at_fdcwd = -100
-            old_fd = at_fdcwd if src_dir_fd is None else src_dir_fd
-            new_fd = at_fdcwd if dst_dir_fd is None else dst_dir_fd
-            old_name = os.fsencode(src)
-            new_name = os.fsencode(dst)
-            if renameat2(old_fd, old_name, new_fd, new_name, 1) != 0:  # RENAME_NOREPLACE
+            if renameat2 is not None:
+                if renameat2(old_fd, old_name, new_fd, new_name, 1) == 0:  # RENAME_NOREPLACE
+                    return
                 code = ctypes.get_errno()
-                raise OSError(code, os.strerror(code), os.fsdecode(dst))
-            return
+                if code not in (errno.ENOSYS, errno.EINVAL, errno.ENOTTY):
+                    raise OSError(code, os.strerror(code), os.fsdecode(dst))
+            # renameat2 unavailable: degrade to the portable path.
+        elif sys.platform == "darwin":
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameatx_np = getattr(libc, "renameatx_np", None)
+            if renameatx_np is not None:
+                # Darwin flag values: RENAME_EXCL = 0x4.
+                renameatx_np.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                         ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                if renameatx_np(old_fd, old_name, new_fd, new_name, 0x4) == 0:
+                    return
+                code = ctypes.get_errno()
+                if code not in (errno.ENOSYS, errno.ENOTSUP):
+                    raise OSError(code, os.strerror(code), os.fsdecode(dst))
         cls._rename_noreplace_portable(src, dst, dst_dir_fd=dst_dir_fd, src_dir_fd=src_dir_fd)
 
     @classmethod
@@ -1128,14 +1143,19 @@ class ArtifactOperations:
         else:
             parent_fd = self._open_parent_fd(dest.parent)
             os.mkdir(staging_name, dir_fd=parent_fd)
-            fd_root = Path(f"/proc/self/fd/{parent_fd}")
-            if sys.platform.startswith("linux") and fd_root.exists():
-                # Linux: keep the whole tree build descriptor-bound.
-                staging = fd_root / staging_name
+            # Keep construction DESCRIPTOR-RELATIVE wherever the OS exposes a
+            # descriptor path: /proc/self/fd on Linux, /dev/fd on macOS
+            # (rc17 review F7). Otherwise fall back to the plain path with a
+            # dev/inode cross-check of the opened parent.
+            proc_root = None
+            if sys.platform.startswith("linux"):
+                proc_root = "/proc/self/fd"
+            elif sys.platform == "darwin":
+                proc_root = "/dev/fd"
+            fd_dir = Path(proc_root, str(parent_fd)) if proc_root else None
+            if fd_dir is not None and fd_dir.exists():
+                staging = fd_dir / staging_name
             else:
-                # macOS/BSD have no /proc/self/fd (Sol review): use the plain
-                # path, but prove the parent we are about to traverse is still
-                # the directory the descriptor was opened for.
                 parent_stat = os.stat(dest.parent)
                 fd_stat = os.fstat(parent_fd)
                 if (parent_stat.st_dev, parent_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):

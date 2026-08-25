@@ -4,6 +4,43 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### RC17 adversarial review fixes
+
+- **P1 stop retry semantics**: a transient `stop_sync` failure leaves the
+  stop intent NONTERMINAL (`retrying: true` in the response) so the
+  dispatcher re-drives it after recovery; only permanent validation failures
+  (unknown target) are terminal. The dispatcher's reconciliation gained the
+  same unknown-job fast-fail and already-terminal shortcut.
+- **P1 pairing cleanup**: the exact wrapper path is persisted on the remote
+  row at pair time; compensation and removal always target THAT per-remote
+  file (legacy shared-name cleanup is best-effort). When remote revocation
+  fails, local credentials and the DB row are RETAINED — `force=True`
+  deletes anyway.
+- **P1 cursor regression**: feed-cursor updates on one timeline are now
+  compare-and-set forward-only (`_advance_feed_cursor`); gap recovery adopts
+  the boundary the snapshot actually wrote instead of overwriting it with
+  values from the stale feed response.
+- **P1 staging containment**: pull staging lives exclusively under
+  `<home>/remote-pull-staging/<transfer_id>.part` (never beside an arbitrary
+  destination), opened no-follow via fd; remote push staging opens are
+  leaf-symlink-proof (`O_NOFOLLOW`) across chunk receive, serve, hashing,
+  and init zeroing.
+- **P1 pull resume**: resume uses the controller's durable ledger offset;
+  a staging file missing or truncated below it resets BOTH to zero rather
+  than extending a zero-filled prefix that could never verify.
+- **P1 atomic epoch fence**: publication holds the store's new epoch-rotation
+  lock across put_file, whose `publish_guard` re-checks the epoch INSIDE the
+  catalog transaction right before commit — a concurrent timeline rotation
+  cannot land between check and publish.
+- **P1 POSIX publication**: macOS uses `renameatx_np(RENAME_EXCL)` for
+  atomic no-replace renames; Linux degrades to the portable hardlink/checked
+  path when renameat2 is unavailable; directory tree construction stays
+  descriptor-relative via `/dev/fd` on macOS.
+- **P2**: completion responses must carry state_epoch/sha256/total_bytes/
+  version_id (+root/manifest identity echoes added to both directions);
+  unbound error frames are rejected like unbound responses; the protocol
+  spec's transfer_init/transfer_complete payload definitions now match the
+  runtime validators.
 ### Sol review fixes (second re-review)
 
 - **P0**: replayed mutations keep the epoch binding SQLite stored — the

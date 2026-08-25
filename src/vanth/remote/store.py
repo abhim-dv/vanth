@@ -158,6 +158,7 @@ class RemoteStore:
             ("remotes", "snapshot_cursor_json", "TEXT"),
             ("remotes", "instance_id", "TEXT"),
             ("remotes", "installed_authorization", "TEXT"),
+            ("remotes", "wrapper_path", "TEXT"),
             ("remotes", "feed_cursor_json", "TEXT"),
             ("remote_requests", "expected_state_epoch", "INTEGER"),
             ("remote_requests", "expected_instance_id", "TEXT"),
@@ -658,6 +659,9 @@ class RemoteOperationStore:
 
     def __init__(self, db) -> None:
         self.db_lock = threading.RLock()
+        # Serializes state-epoch rotation against transfer publication so the
+        # publication fence is atomic in-process (rc17 review F6).
+        self.epoch_lock = threading.RLock()
         self.db = db
         self.db.executescript(REMOTE_OPERATION_DDL)
         self._ensure_columns()
@@ -847,35 +851,36 @@ class RemoteOperationStore:
         """
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
             raise ValueError("epoch must be an integer >= 1")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            row = self.db.execute(
-                "SELECT state_epoch, feed_epoch FROM remote_state WHERE id=1"
-            ).fetchone()
-            current = int(row["state_epoch"]) if row else 1
-            feed_epoch = int(row["feed_epoch"]) if row and row["feed_epoch"] else 1
-            # Monotonic guard (review P1-1): rewinding to an OLDER timeline
-            # would let a stale cursor bind again, so it is refused. Setting
-            # the SAME value is not a restore — it is a no-op that keeps the
-            # feed epoch stable. Only a strictly greater value rotates.
-            if int(epoch) < current:
-                raise ValueError(
-                    f"state epoch must be strictly monotonic: current={current}, requested={epoch}"
-                )
-            if int(epoch) == current:
+        with self.epoch_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute(
+                    "SELECT state_epoch, feed_epoch FROM remote_state WHERE id=1"
+                ).fetchone()
+                current = int(row["state_epoch"]) if row else 1
+                feed_epoch = int(row["feed_epoch"]) if row and row["feed_epoch"] else 1
+                # Monotonic guard (review P1-1): rewinding to an OLDER timeline
+                # would let a stale cursor bind again, so it is refused. Setting
+                # the SAME value is not a restore — it is a no-op that keeps the
+                # feed epoch stable. Only a strictly greater value rotates.
+                if int(epoch) < current:
+                    raise ValueError(
+                        f"state epoch must be strictly monotonic: current={current}, requested={epoch}"
+                    )
+                if int(epoch) == current:
+                    self.db.commit()
+                    return
+                feed_epoch += 1
+                updated = self.db.execute(
+                    "UPDATE remote_state SET state_epoch=?, feed_epoch=? WHERE id=1 AND state_epoch=?",
+                    (int(epoch), feed_epoch, current),
+                ).rowcount
+                if not updated:
+                    raise ValueError("state epoch moved concurrently; retry with the new value")
                 self.db.commit()
-                return
-            feed_epoch += 1
-            updated = self.db.execute(
-                "UPDATE remote_state SET state_epoch=?, feed_epoch=? WHERE id=1 AND state_epoch=?",
-                (int(epoch), feed_epoch, current),
-            ).rowcount
-            if not updated:
-                raise ValueError("state epoch moved concurrently; retry with the new value")
-            self.db.commit()
-        except BaseException:
-            self.db.rollback()
-            raise
+            except BaseException:
+                self.db.rollback()
+                raise
 
     def get_feed_epoch(self) -> int:
         """The remote's feed epoch (bumped on every restore alongside state_epoch)."""

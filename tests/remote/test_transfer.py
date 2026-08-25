@@ -514,3 +514,128 @@ def test_init_result_must_name_the_transfer(world):
     world.transport.handler = anonymous_init
     with pytest.raises(Exception, match="bind"):
         world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0100")
+
+
+def test_pull_resume_downloads_only_missing_bytes(world, tmp_path):
+    """rc17 F5: pull resume starts from the controller's durable offset, not
+    the remote's (always-zero) serve offset, and an inconsistent staging file
+    resets BOTH to zero instead of extending a zero-filled prefix."""
+    put = publish_source(world)
+    pushed = world.broker.push_blob(world.remote_row["remote_id"], put["version_id"],
+                                    idempotency_key="push-key-0011")
+    rid = world.remote_row["remote_id"]
+    dest = tmp_path / "out" / "resume.bin"
+
+    state = {"chunks": 0}
+
+    def fail_on_second_chunk(frame):
+        if frame["method"] == "artifact.blob_chunk":
+            state["chunks"] += 1
+            return state["chunks"] == 2
+        return False
+
+    world.transport.fail_once_on(fail_on_second_chunk)
+    with pytest.raises(ConnectionError):
+        world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0011")
+
+    row = world.controller_ops.catalog.db.execute(
+        "SELECT acked_offset FROM controller_transfers WHERE idempotency_key='pull-key-0011'"
+    ).fetchone()
+    assert row["acked_offset"] == 1024
+    staging_dir = tmp_path / "controller-home" / "remote-pull-staging"
+    parts = list(staging_dir.glob("*.part"))
+    assert len(parts) == 1 and parts[0].stat().st_size >= 1024
+
+    before = len([f for f in world.transport.frames if f["method"] == "artifact.blob_chunk"])
+    result = world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0011")
+    assert result["completed"] is True
+    new_offsets = [f["payload"]["offset"] for f in world.transport.frames
+                   if f["method"] == "artifact.blob_chunk"][before:]
+    assert new_offsets and min(new_offsets) == 1024, (
+        f"resume must start at the ledger offset 1024, got {new_offsets}"
+    )
+    assert dest.read_bytes() == SAMPLE_DATA
+
+
+def test_pull_inconsistent_staging_resets_to_zero(world, tmp_path):
+    put = publish_source(world)
+    pushed = world.broker.push_blob(world.remote_row["remote_id"], put["version_id"],
+                                    idempotency_key="push-key-0012")
+    rid = world.remote_row["remote_id"]
+    dest = tmp_path / "out" / "reset.bin"
+
+    state = {"chunks": 0}
+
+    def fail_on_second_chunk(frame):
+        if frame["method"] == "artifact.blob_chunk":
+            state["chunks"] += 1
+            return state["chunks"] == 2
+        return False
+
+    world.transport.fail_once_on(fail_on_second_chunk)
+    with pytest.raises(ConnectionError):
+        world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0012")
+    row = world.controller_ops.catalog.db.execute(
+        "SELECT acked_offset FROM controller_transfers WHERE idempotency_key='pull-key-0012'"
+    ).fetchone()
+    assert row["acked_offset"] == 1024
+    # Corrupt the staging prefix: truncate BELOW the ledger offset.
+    part = next((tmp_path / "controller-home" / "remote-pull-staging").glob("*.part"))
+    with open(part, "r+b") as fh:
+        fh.truncate(10)
+
+    result = world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0012")
+    assert result["completed"] is True
+    offsets = [f["payload"]["offset"] for f in world.transport.frames
+               if f["method"] == "artifact.blob_chunk"]
+    assert min(offsets) == 0, "inconsistent staging must restart from zero"
+    assert dest.read_bytes() == SAMPLE_DATA
+
+
+def test_pull_staging_never_touches_destination_parent(world, tmp_path):
+    """rc17 F4: pull staging lives in vanth-owned storage, not beside dest."""
+    put = publish_source(world)
+    pushed = world.broker.push_blob(world.remote_row["remote_id"], put["version_id"],
+                                    idempotency_key="push-key-0013")
+    dest = tmp_path / "elsewhere" / "model.bin"
+    result = world.broker.pull_blob(world.remote_row["remote_id"], pushed["version_id"], dest,
+                                    idempotency_key="pull-key-0013")
+    assert result["completed"] is True
+    assert list(dest.parent.glob(".*pulling*")) == []
+    assert (tmp_path / "controller-home" / "remote-pull-staging").is_dir()
+
+
+def test_completion_response_missing_fields_rejected(world, tmp_path):
+    """rc17 P2: completion answers with MISSING epoch/size fields are a
+    mismatch — never silently defaulted."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+    original_handler = world.transport.handler
+
+    def incomplete_complete(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "artifact.transfer_complete" and resp.get("kind") == "response":
+            resp["result"].pop("state_epoch", None)
+        return resp
+
+    world.transport.handler = incomplete_complete
+    with pytest.raises(Exception, match="missing"):
+        world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0014")
+
+
+def test_unbound_error_frames_rejected(world, tmp_path):
+    """rc17 P2: error frames must also bind to their request."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+    original_handler = world.transport.handler
+
+    def foreign_error(frame):
+        if frame.get("method") == "artifact.blob_chunk":
+            return {"version": "1", "kind": "error", "code": "INVALID_REQUEST",
+                    "message": "boom", "request_id": "req_" + "1" * 32,
+                    "method": "artifact.blob_chunk"}
+        return original_handler(frame)
+
+    world.transport.handler = foreign_error
+    with pytest.raises(ConnectionError, match="does not bind"):
+        world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0015")

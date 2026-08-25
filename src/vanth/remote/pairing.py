@@ -29,7 +29,7 @@ import os
 import shlex
 import shutil
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import ssh
@@ -314,9 +314,12 @@ def pair_remote(
             config_dir=remote_dir,
             target_argv=argv,
         )
+        # Persist the EXACT wrapper path/command used (rc17 review F2): remote
+        # cleanup must target this file without re-parsing the authorization
+        # line (which misparses quoted paths containing spaces).
         store.db.execute(
-            "UPDATE remotes SET installed_authorization=?, updated_at=? WHERE remote_id=?",
-            (installed_line, now_iso(), remote_id),
+            "UPDATE remotes SET installed_authorization=?, wrapper_path=?, updated_at=? WHERE remote_id=?",
+            (installed_line, wrapper_command, now_iso(), remote_id),
         )
         store.db.commit()
 
@@ -363,10 +366,12 @@ def pair_remote(
             "state_epoch": state_epoch,
         }
     except ssh.VanthRemoteError:
-        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv, remote_home=remote_home)
+        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv,
+                    remote_home=remote_home)
         raise
     except Exception as exc:
-        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv, remote_home=remote_home)
+        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv,
+                    remote_home=remote_home)
         raise ssh.VanthRemoteError(f"pairing failed: {exc}") from exc
 
 
@@ -380,10 +385,12 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
     except Exception:
         pass
     if installed_line and bootstrap_config and argv:
+        wrapper_name = ssh._wrapper_filename(remote_id)
         try:
             transport.remove_authorized_key(
                 remove_script=ssh.remote_wrapper_remove_script(
-                    remote_home_expr=shlex.quote(remote_home) if remote_home else '${HOME:-}/.vanth'
+                    remote_home_expr=shlex.quote(remote_home) if remote_home else '${HOME:-}/.vanth',
+                    remote_id=remote_id,
                 ),
                 bootstrap_config=bootstrap_config,
                 config_dir=remote_dir,
@@ -400,6 +407,18 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
             )
         except Exception:
             pass
+        # Best-effort legacy shared-name cleanup (older pairings).
+        if remote_home:
+            try:
+                transport.remove_authorized_key(
+                    remove_script="set -eu\nrm -f "
+                                  + shlex.quote(f"{remote_home.rstrip('/')}/remote-wrapper.sh") + "\n",
+                    bootstrap_config=bootstrap_config,
+                    config_dir=remote_dir,
+                    target_argv=argv,
+                )
+            except Exception:
+                pass
     shutil.rmtree(remote_dir, ignore_errors=True)
 
 
@@ -443,11 +462,15 @@ def remove_remote(
     remote_id: str | None = None,
     store: RemoteStore | None = None,
     transport: Any | None = None,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Remove a remote: delete its local key/config/known-hosts and, when the
-    host is reachable, revoke ONLY the exact marker authorization we installed.
-    Unrelated authorizations are never touched (review P0-1).
-    """
+    """Remove a remote: revoke the exact marker authorization + wrapper we
+    installed, then delete local key/config/known-hosts.
+
+    When remote revocation FAILS, local revocation material (key, known
+    hosts, DB row) is RETAINED so cleanup can be retried — pass
+    ``force=True`` to delete anyway (rc17 review F2)."""
     home = canonical_home(home)
     store = store or _default_store(home)
     transport = transport or DefaultTransport()
@@ -456,8 +479,12 @@ def remove_remote(
     row = store.get_remote(remote_id)
     remote_dir = home / "remote" / remote_id
     revoked = False
+    last_error: str | None = None
+    needs_revocation = False
     installed = row.get("installed_authorization") if isinstance(row, dict) else None
+    persisted_wrapper = row.get("wrapper_path") if isinstance(row, dict) else None
     if installed and remote_dir.exists():
+        needs_revocation = True
         try:
             target_info = ssh.parse_target(row["target"])
             marker = marker_comment(remote_id)
@@ -467,30 +494,54 @@ def remove_remote(
                 known_hosts=str(remote_dir / "known_hosts"),
                 include_identity=False,
             )
-            forced = (ssh.parse_authorized_keys(installed).get("command") or "").strip('"')
-            # The forced command may be single-quote-wrapped (spaces) — strip
-            # that too before extracting the wrapper home (Sol review).
-            if len(forced) >= 2 and forced.startswith("'") and forced.endswith("'"):
-                forced = forced[1:-1]
-            suffix = "/remote-wrapper.sh"
-            per_remote_suffix = None
-            if remote_id:
-                per_remote_suffix = "/" + ssh._wrapper_filename(remote_id)
-            if per_remote_suffix and forced.endswith(per_remote_suffix) and not forced.startswith("$"):
-                wrapper_home = forced[:-len(per_remote_suffix)]
-            elif forced.endswith(suffix) and not forced.startswith("$"):
-                wrapper_home = forced[:-len(suffix)]  # legacy shared name
+            # Prefer the persisted wrapper command; fall back to parsing the
+            # stored authorization line for rows paired before persistence
+            # (rc17 review F2).
+            wrapper_expr = None
+            if isinstance(persisted_wrapper, str) and persisted_wrapper.strip():
+                wrapper_expr = persisted_wrapper.strip()
             else:
-                wrapper_home = None
-            transport.remove_authorized_key(
-                remove_script=ssh.remote_wrapper_remove_script(
-                    remote_home_expr=shlex.quote(wrapper_home) if wrapper_home else '${HOME:-}/.vanth',
-                    remote_id=remote_id,
-                ),
-                bootstrap_config=bootstrap,
-                config_dir=remote_dir,
-                target_argv=_target_argv(target_info),
-            )
+                forced = (ssh.parse_authorized_keys(installed).get("command") or "").strip('"')
+                if len(forced) >= 2 and forced.startswith("'") and forced.endswith("'"):
+                    forced = forced[1:-1]
+                suffix = "/remote-wrapper.sh"
+                if (forced.endswith("/" + ssh._wrapper_filename(remote_id)) or forced.endswith(suffix)) \
+                        and not forced.startswith("$"):
+                    wrapper_expr = forced
+            wrapper_home_literal: str | None = None
+            if wrapper_expr and not wrapper_expr.startswith("$"):
+                literal = wrapper_expr
+                if len(literal) >= 2 and literal.startswith("'") and literal.endswith("'"):
+                    literal = literal[1:-1]
+                wrapper_home_literal = str(PurePosixPath(literal).parent)
+            if wrapper_home_literal:
+                transport.remove_authorized_key(
+                    remove_script=ssh.remote_wrapper_remove_script(
+                        remote_home_expr=shlex.quote(wrapper_home_literal),
+                        remote_id=remote_id,
+                    ),
+                    bootstrap_config=bootstrap,
+                    config_dir=remote_dir,
+                    target_argv=_target_argv(target_info),
+                )
+                # Best-effort legacy shared-name cleanup for upgraded rows.
+                try:
+                    transport.remove_authorized_key(
+                        remove_script="set -eu\nrm -f "
+                                      + shlex.quote(f"{wrapper_home_literal}/remote-wrapper.sh") + "\n",
+                        bootstrap_config=bootstrap,
+                        config_dir=remote_dir,
+                        target_argv=_target_argv(target_info),
+                    )
+                except Exception:
+                    pass
+            else:
+                transport.remove_authorized_key(
+                    remove_script=ssh.remote_wrapper_remove_script(remote_id=remote_id),
+                    bootstrap_config=bootstrap,
+                    config_dir=remote_dir,
+                    target_argv=_target_argv(target_info),
+                )
             transport.remove_authorized_key(
                 remove_script=ssh.authorized_keys_remove_script(installed, marker),
                 bootstrap_config=bootstrap,
@@ -498,8 +549,18 @@ def remove_remote(
                 target_argv=_target_argv(target_info),
             )
             revoked = True
-        except Exception:
+        except Exception as exc:
             revoked = False
+            last_error = str(exc)
+    if needs_revocation and not revoked and not force:
+        return {
+            "result": "error",
+            "error": ("remote revocation failed; local credentials retained "
+                      "(retry removal, or pass force=True to delete anyway)"
+                      + (f": {last_error}" if last_error else "")),
+            "remote_id": remote_id,
+            "revoked_remote_authorization": False,
+        }
     if remote_dir.exists():
         shutil.rmtree(remote_dir, ignore_errors=True)
     store.db.execute("DELETE FROM remotes WHERE remote_id=?", (remote_id,))

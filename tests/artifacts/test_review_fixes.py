@@ -125,3 +125,48 @@ def test_restore_temp_db_name_is_collision_free(tmp_path):
         lifecycle_mod.shutil.copyfile = real_copyfile
     name = captured.get("name", "")
     assert re.match(r"restore-prepared-\d+-[0-9a-f]{12}\.sqlite", name), name
+
+
+def test_publish_guard_aborts_before_commit(tmp_path):
+    """rc17 F6: a publication fence that flips false inside the catalog
+    transaction rolls back — no version row, no root pointer move."""
+    ops = make_ops(tmp_path)
+    put = ops.put_file("fence.bin", data=b"v1", idempotency_key="key-fence-0001")
+    root_row = ops.catalog.db.execute("SELECT latest_version_id FROM roots WHERE name='fence.bin'").fetchone()
+    before = root_row["latest_version_id"]
+
+    def flipped_guard():
+        return False
+
+    with pytest.raises(ValueError, match="publication fence"):
+        ops.put_file("fence.bin", data=b"v2", idempotency_key="key-fence-0002",
+                     publish_guard=flipped_guard)
+    rows = ops.catalog.db.execute("SELECT COUNT(*) AS c FROM versions").fetchone()["c"]
+    assert rows == 1
+    root_row = ops.catalog.db.execute("SELECT latest_version_id FROM roots WHERE name='fence.bin'").fetchone()
+    assert root_row["latest_version_id"] == before
+
+
+def test_linux_renameat2_unavailable_degrades_to_portable(tmp_path, monkeypatch):
+    """rc17 F7: when renameat2 is missing on Linux the publish path falls
+    back to the portable no-replace implementation instead of failing."""
+    import ctypes as _ctypes
+    import sys as _sys
+
+    from vanth.artifacts import operations as ops_mod
+
+    if os.name != "nt":
+        monkeypatch.setattr(_sys, "platform", "linux")
+
+    class _FakeLibc:
+        renameat2 = None  # symbol unavailable
+
+        def __init__(self, *a, **kw):
+            pass
+
+    monkeypatch.setattr(_ctypes, "CDLL", lambda *a, **kw: _FakeLibc())
+    src = tmp_path / "s.bin"
+    src.write_bytes(b"x" * 4)
+    dst = tmp_path / "d.bin"
+    ArtifactOperations._rename_noreplace(str(src), str(dst))
+    assert dst.read_bytes() == b"x" * 4

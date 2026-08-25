@@ -299,6 +299,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["transfer_id", "direction"],
+      "allOf": [
+        {
+          "if": { "properties": { "direction": { "const": "push" } }, "required": ["direction"] },
+          "then": { "required": ["transfer_id", "direction", "root_name", "manifest_digest", "total_bytes", "sha256"] }
+        }
+      ],
+      "description": "For push the controller already knows the content identity, so root_name/manifest_digest/total_bytes/sha256 are required; for pull they are advisory placeholders resolved from the remote's own version row.",
       "properties": {
         "transfer_id": { "type": "string", "minLength": 1 },
         "direction": { "type": "string", "enum": ["push", "pull"] },
@@ -324,10 +331,17 @@
     "payload_artifact.transfer_complete": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["transfer_id", "sha256"],
+      "required": ["transfer_id", "root_name", "manifest_digest", "total_bytes", "sha256"],
       "properties": {
         "transfer_id": { "type": "string", "minLength": 1 },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        "root_name": { "type": "string" },
+        "manifest_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "version_id": {
+          "type": "string",
+          "description": "Pull completions name the remote version being confirmed."
+        }
       }
     }
   }
