@@ -946,7 +946,11 @@ TRANSITION_TABLES: dict[str, dict[str, dict[str, str]]] = {
     "request": {
         "creating": {"submitting": "submitting"},
         "submitting": {"accepted": "accepted"},
-        "accepted": {"completed": "completed", "failed": "failed", "lost": "lost"},
+        # accepted -> submitting allows RE-DRIVING a request whose outcome
+        # was retryable-pending (rc20 P1a); the remote's operation
+        # idempotency guarantees at most one acceptance per key.
+        "accepted": {"completed": "completed", "failed": "failed", "lost": "lost",
+                     "submitting": "submitting"},
         "completed": {},
         "failed": {},
         "lost": {},

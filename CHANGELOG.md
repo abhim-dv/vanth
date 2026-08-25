@@ -4,6 +4,31 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### RC20 adversarial review fixes
+
+- **P1 retryable stops end-to-end**: transient stop failures return the new
+  `OPERATION_RETRY_PENDING` error code; the controller keeps its request
+  PENDING (never failed, no replay tombstone), and `accepted -> submitting`
+  is now a legal request transition so same-key retries re-drive the stop
+  and observe the eventual remote success. Verified by a full
+  fail→pending→recover→complete controller cycle test.
+- **P1 portable directories**: the fallback inspects the SOURCE
+  descriptor-relatively (`lstat(dir_fd=...)`) before deciding, so directory
+  publication fails closed on every platform lacking atomic no-replace —
+  including the dir_fd-supplied call path used in production.
+- **P1 Windows staging**: `_BY_HANDLE_FILE_INFORMATION` uses the exact ABI
+  (FILETIME as two DWORDs — a c_uint64 misaligned every later field), and
+  the I/O handle is validated via `GetFinalPathNameByHandleW` against the
+  intended staging path, catching ancestor-junction redirects that leaf
+  identity comparison alone could not.
+- **P2 cleanup metadata ordering**: `wrapper_path` + `cleanup_pending=1`
+  are committed BEFORE the first remote mutation of a pairing, so a lost ACK
+  after a successful wrapper write always leaves a recorded obligation.
+- **P2 stale-feed result fields**: the stale-batch branch derives ALL
+  top-level epoch fields from the ACCEPTED durable cursor.
+- Snapshot sync fetches paginated pages OUTSIDE the global controller DB
+  lock; only the apply/publish transaction holds it.
+
 ### RC19 adversarial review fixes
 
 - **P1 cross-timeline feed batches**: the apply-path guard now rejects ANY

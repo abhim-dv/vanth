@@ -398,3 +398,55 @@ def test_shadow_upsert_never_regresses_epoch(tmp_path):
         "SELECT status FROM remote_shadows WHERE remote_id=? AND remote_job_id='j1'", (rid,)
     ).fetchone()
     assert row["status"] == "completed"
+
+
+def test_transient_stop_retry_cycle_via_controller(tmp_path):
+    """rc20 P1a: a retryable stop keeps the controller request PENDING (no
+    tombstone), and the same key re-drives the stop to completion."""
+    from vanth.remote.control import RemoteControl
+
+    rstore, remote = _stop_world(tmp_path, [("job_a", "running")])
+    cstore = __import__("sys").modules["test_snapshot"].RemoteStore(
+        __import__("sys").modules["test_snapshot"].connect(tmp_path / "controller.sqlite")
+    )
+    crow = cstore.create_remote(target="user@host", state="paired")
+    rid = crow["remote_id"]
+    control = RemoteControl(cstore,
+                            transport=__import__("sys").modules["test_snapshot"].FakeSessionTransport(
+                                remote.handle_request),
+                            home=tmp_path)
+
+    class BoomManager:
+        db_lock = threading.Lock()
+
+        def __init__(self):
+            self.logs = tmp_path
+            self.db = rstore.db
+
+        def stop_sync(self, job_id):
+            raise RuntimeError("transient manager failure")
+
+    remote.manager = BoomManager()
+    first = control.submit(rid, "job.stop", {"job_id": "job_a"},
+                           idempotency_key="key-stop-0100",
+                           expected_state_epoch=1, expected_instance_id="test-instance")
+    out = control.run_request(rid, first)
+    assert out.get("retry_pending") is True and out.get("status") == "pending"
+    # No tombstone: replay by key still resolves the DURABLE request.
+    replayed = control.replay(rid, "key-stop-0100")
+    assert replayed.get("request_id") == first["request_id"]
+    assert not replayed.get("tombstone")
+
+    class OkManager(BoomManager):
+        def stop_sync(self, job_id):
+            self.db.execute("UPDATE jobs SET status='completed' WHERE job_id=?", (job_id,))
+            self.db.commit()
+            return {"status": "completed"}
+
+    remote.manager = OkManager()
+    retried = control.run_request(rid, first)
+    assert retried.get("status") == "completed", retried
+
+    final = control.replay(rid, "key-stop-0100")
+    assert final.get("response", {}).get("result", {}).get("status") == "completed" or \
+           final.get("status") == "completed"

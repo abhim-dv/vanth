@@ -1002,11 +1002,16 @@ class ArtifactOperations:
                 errno.ENOSPC,
             ):
                 raise
-            # Fail closed for DIRECTORIES (rc19 review N7): link() refuses
-            # them (EPERM), and a lstat+rename fallback would reopen a
-            # clobber race. Atomic primitives or nothing.
+            # Fail closed for DIRECTORIES (rc19 review N7 / rc20 P1b):
+            # link() refuses them (EPERM), and a lstat+rename fallback would
+            # reopen a clobber race. Inspect the source DESCRIPTOR-RELATIVELY
+            # when an fd is supplied so the check cannot be misled.
             try:
-                src_is_dir = stat.S_ISDIR(os.lstat(src).st_mode) if src_dir_fd is None else False
+                if src_dir_fd is not None:
+                    src_info = os.lstat(src, dir_fd=src_dir_fd)
+                else:
+                    src_info = os.lstat(src)
+                src_is_dir = stat.S_ISDIR(src_info.st_mode)
             except OSError:
                 src_is_dir = False
             if src_is_dir:

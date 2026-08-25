@@ -274,6 +274,19 @@ class RemoteControl:
                 self.store.db.rollback()
                 return self._lost(remote_id, request)
         if response.get("kind") == "error":
+            # A RETRYABLE outcome (rc20 P1a): the remote intent is still
+            # queued. The controller request stays PENDING — never failed, no
+            # tombstone — so same-key retries re-drive it (accepted ->
+            # submitting is now a legal transition) and can observe the
+            # eventual remote success.
+            if response.get("code") == "OPERATION_RETRY_PENDING":
+                pending = self.store.get_request_by_key(remote_id, request["idempotency_key"])
+                return {
+                    **pending,
+                    "status": "pending",
+                    "retry_pending": True,
+                    "retry_error": str(response.get("message") or ""),
+                }
             return self._finish_error(remote_id, request, response)
         if response.get("kind") != "response":
             return self._lost(remote_id, request)
@@ -398,13 +411,14 @@ class RemoteControl:
         return result
 
     def sync_snapshot(self, remote_id: str) -> dict[str, Any]:
-        # Serialize the complete fetch+publish cycle against feed application
-        # on this store. A feed-created shadow cannot land between the
-        # snapshot boundary and absence reconciliation and be suppressed.
-        with self.store.db_lock:
-            return self._sync_snapshot_locked(remote_id)
+        """Fetch pages WITHOUT holding the global store lock (rc20 review:
+        paginated network access must not block every other controller
+        operation); only the apply/publish transaction runs under the lock.
+        The publish phase re-validates epoch/boundary consistency, so a feed
+        batch landing mid-fetch is still rejected by its own guards."""
+        return self._sync_snapshot(remote_id)
 
-    def _sync_snapshot_locked(self, remote_id: str) -> dict[str, Any]:
+    def _sync_snapshot(self, remote_id: str) -> dict[str, Any]:
         """Fetch + apply snapshots until has_more is false; returns totals.
 
         Every full sync starts from a FRESH keyset cursor (offset 0): resuming
@@ -624,6 +638,10 @@ class RemoteControl:
                         reject_reason = "fully superseded by durable progress"
                 if reject_reason is not None:
                     self.store.db.commit()
+                    # ALL top-level fields come from the ACCEPTED durable
+                    # cursor (rc20 review P2b) — never from the rejected
+                    # response's timeline.
+                    accepted = dict(stored_now) if stored_now is not None else {}
                     return {
                         "mode": "feed",
                         "applied": 0,
@@ -632,9 +650,9 @@ class RemoteControl:
                         "skip_reason": reject_reason,
                         "changes": len(changes),
                         "has_more": bool(result.get("has_more")),
-                        "cursor": dict(stored_now) if stored_now is not None else {},
-                        "state_epoch": epoch,
-                        "feed_epoch": int(result.get("feed_epoch") or 1),
+                        "cursor": accepted,
+                        "state_epoch": int(accepted.get("state_epoch", epoch)),
+                        "feed_epoch": int(accepted.get("feed_epoch", result.get("feed_epoch") or 1)),
                     }
                 for change in changes:
                     kind = change.get("kind")

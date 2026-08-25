@@ -284,6 +284,21 @@ def pair_remote(
         url_expr = ('sed -n \'s/.*"url"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' '
                     '"$HOME/.vanth/daemon.json" 2>/dev/null | head -1')
         remote_home_expr = shlex.quote(remote_home) if remote_home else '${HOME:-}/.vanth'
+        wrapper_name = ssh._wrapper_filename(remote_id)
+        if remote_home:
+            # Literal remote home: quote for the shell so paths containing
+            # spaces survive inside the forced command (Sol review).
+            wrapper_command = shlex.quote(f"{remote_home.rstrip('/')}/{wrapper_name}")
+        else:
+            wrapper_command = f"$HOME/.vanth/{wrapper_name}"
+        # Persist PROVISIONAL cleanup metadata BEFORE THE FIRST remote
+        # mutation (rc20 review P2a): a successful wrapper write followed by
+        # a lost ACK must still leave a recorded cleanup obligation.
+        store.db.execute(
+            "UPDATE remotes SET wrapper_path=?, cleanup_pending=1, updated_at=? WHERE remote_id=?",
+            (wrapper_command, now_iso(), remote_id),
+        )
+        store.db.commit()
         wrapper_script = ssh.remote_wrapper_setup_script(
             url_expr, helper_command=helper, remote_id=remote_id,
             remote_home_expr=remote_home_expr,
@@ -294,21 +309,6 @@ def pair_remote(
             config_dir=remote_dir,
             target_argv=argv,
         )
-        wrapper_name = ssh._wrapper_filename(remote_id)
-        if remote_home:
-            # Literal remote home: quote for the shell so paths containing
-            # spaces survive inside the forced command (Sol review).
-            wrapper_command = shlex.quote(f"{remote_home.rstrip('/')}/{wrapper_name}")
-        else:
-            wrapper_command = f"$HOME/.vanth/{wrapper_name}"
-        # Persist PROVISIONAL cleanup metadata BEFORE any remote mutation
-        # (rc19 review N4): if installation succeeds but persisting the line
-        # fails, removal still knows what to revoke.
-        store.db.execute(
-            "UPDATE remotes SET wrapper_path=?, cleanup_pending=1, updated_at=? WHERE remote_id=?",
-            (wrapper_command, now_iso(), remote_id),
-        )
-        store.db.commit()
         installed_line = ssh.authorized_keys_line(
             public_key_blob, "", marker_comment=marker, forced_command=wrapper_command
         )

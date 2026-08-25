@@ -232,12 +232,18 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
     FILE_ATTRIBUTE_REPARSE_POINT = 0x400
     INVALID = _ctypes.c_void_p(-1).value
 
+    class _FILETIME(_ctypes.Structure):
+        _fields_ = [("dwLowDateTime", _ctypes.c_uint32),
+                    ("dwHighDateTime", _ctypes.c_uint32)]
+
     class _BY_HANDLE_FILE_INFORMATION(_ctypes.Structure):
+        # Exact Windows ABI (rc20 review P1c): FILETIME is two DWORDs — a
+        # c_uint64 would misalign every field after it.
         _fields_ = [
             ("dwFileAttributes", _ctypes.c_uint32),
-            ("ftCreationTime", _ctypes.c_uint64),
-            ("ftLastAccessTime", _ctypes.c_uint64),
-            ("ftLastWriteTime", _ctypes.c_uint64),
+            ("ftCreationTime", _FILETIME),
+            ("ftLastAccessTime", _FILETIME),
+            ("ftLastWriteTime", _FILETIME),
             ("dwVolumeSerialNumber", _ctypes.c_uint32),
             ("nFileSizeHigh", _ctypes.c_uint32),
             ("nFileSizeLow", _ctypes.c_uint32),
@@ -254,6 +260,10 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
     kernel32.GetFileInformationByHandle.argtypes = [
         _ctypes.c_void_p, _ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
     ]
+    kernel32.GetFinalPathNameByHandleW.restype = _ctypes.c_uint32
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        _ctypes.c_void_p, _ctypes.c_wchar_p, _ctypes.c_uint32, _ctypes.c_uint32,
+    ]
 
     def _identity(handle):
         info = _BY_HANDLE_FILE_INFORMATION()
@@ -262,6 +272,20 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
             return None
         return (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
                 info.dwFileAttributes)
+
+    def _final_path(handle):
+        """Resolved path of an open handle; None when unavailable."""
+        size = 1024
+        buf = _ctypes.create_unicode_buffer(size)
+        # FILE_NAME_NORMALIZED = 0
+        written = kernel32.GetFinalPathNameByHandleW(_ctypes.c_void_p(handle), buf, size, 0)
+        if written == 0 or written > size:
+            return None
+        final = buf.value
+        # Strip the \\?\ prefix and normalize case for comparison.
+        if final.startswith("\\\\?\\"):
+            final = final[4:]
+        return _os.path.normcase(final)
 
     access = (GENERIC_READ | GENERIC_WRITE) if write else GENERIC_READ
     creation = OPEN_ALWAYS if create else OPEN_EXISTING
@@ -286,6 +310,16 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
     if not handle or handle == INVALID:
         err = _ctypes.GetLastError()
         raise OSError(err, f"staging open failed: {path}")
+    # Parent-bind validation (rc20 review P1c): both handles could have been
+    # consistently redirected by a swapped ancestor junction — resolve the
+    # FINAL path of the I/O handle and require it to be the intended file.
+    intended = _os.path.normcase(_os.path.abspath(str(path)))
+    resolved = _final_path(handle)
+    if resolved is not None and resolved != intended:
+        kernel32.CloseHandle(_ctypes.c_void_p(handle))
+        raise TransferAborted(
+            f"staging leaf resolved outside the intended path; refused: {path} -> {resolved}"
+        )
     real_identity = _identity(handle)
     if identity is not None and real_identity is not None \
             and real_identity[:3] != identity[:3]:

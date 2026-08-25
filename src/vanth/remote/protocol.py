@@ -77,6 +77,7 @@ ERROR_REGISTRY: dict[str, tuple[int, str]] = {
     "PROTOCOL_DUPLICATE_KEY": (400, "object contains a duplicate key"),
     "PROTOCOL_UNKNOWN_FIELD": (400, "object contains an unknown field"),
     "PROTOCOL_REPLAY_MISMATCH": (409, "idempotency key was reused with a different request"),
+    "OPERATION_RETRY_PENDING": (503, "outcome not yet terminal; retry with the same idempotency key"),
     "STATE_EPOCH_MISMATCH": (409, "request was bound to a stale remote state epoch"),
     "UNSUPPORTED_FEATURE": (501, "requested feature is not supported"),
     "AUTH_FAILED": (401, "authentication failed"),
