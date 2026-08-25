@@ -4,6 +4,39 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### RC19 adversarial review fixes
+
+- **P1 cross-timeline feed batches**: the apply-path guard now rejects ANY
+  divergence between the durable cursor and the request/response timeline
+  before touching shadows — foreign-epoch responses are additionally caught
+  upstream by gap-recovery (snapshot resync), and `upsert_shadow` itself
+  refuses writes bound to an older epoch than the shadow already carries.
+  `feed_sync` reports the cursor DURABLY ACCEPTED, not the response's.
+- **P1 zero-progress pull chunks**: an empty served window aborts the
+  transfer (`no progress`) instead of spinning on the same offset forever.
+- **P1 staging TOCTOU**: staging opens are now descriptor-relative on POSIX
+  (`openat` walk with O_NOFOLLOW per component + leaf regular-file fstat);
+  Windows uses a reparse-safe probe handle plus a second I/O handle compared
+  BY FILE IDENTITY, so a synchronized parent/leaf swap aborts instead of
+  redirecting access. The check-then-open pattern is gone from both
+  controller pull and remote push staging.
+- **P1 pairing orphan risk**: cleanup metadata is persisted BEFORE any
+  remote mutation (`remotes.cleanup_pending=1` + wrapper path), cleared only
+  after provable installation; removal attempts revocation for pending rows
+  even without a stored authorization line, and refuses to delete records
+  with live remote state unless forced.
+- **P2 schema**: transfer_init requires `version_id` only under the pull
+  conditional — canonical push frames validate against the JSON Schema too.
+- **P2 remote push corruption**: a whole-content hash mismatch at completion
+  resets the remote ledger offset AND truncates its staging file, returning
+  `expected_offset=0` so the controller's classifier retransmits from zero
+  instead of wedging at EOF forever.
+- **P2 portable publication**: directory trees no longer fall back to
+  lstat+rename when atomic primitives are missing — they fail closed with
+  ENOSYS instead of racing a clobber.
+- Transient stop failures now surface as ERROR frames so controllers never
+  mark a still-queued stop as completed.
+
 ### RC18 adversarial review fixes
 
 - **P1 deadlock**: the separate epoch lock is gone — state-epoch rotation

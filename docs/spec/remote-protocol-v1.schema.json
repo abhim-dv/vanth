@@ -298,14 +298,18 @@
     "payload_artifact.transfer_init": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["transfer_id", "direction", "version_id"],
+      "required": ["transfer_id", "direction"],
       "allOf": [
         {
           "if": { "properties": { "direction": { "const": "push" } }, "required": ["direction"] },
-          "then": { "required": ["transfer_id", "direction", "version_id", "root_name", "manifest_digest", "total_bytes", "sha256"] }
+          "then": { "required": ["transfer_id", "direction", "root_name", "manifest_digest", "total_bytes", "sha256"] }
+        },
+        {
+          "if": { "properties": { "direction": { "const": "pull" } }, "required": ["direction"] },
+          "then": { "required": ["transfer_id", "direction", "version_id"] }
         }
       ],
-      "description": "Pull MUST name version_id. For push the controller already knows the content identity, so root_name/manifest_digest/total_bytes/sha256 are additionally required; for pull they are advisory placeholders resolved from the remote's own version row.",
+      "description": "Pull MUST name version_id; push MUST NOT need one (its version is created by completion). For push the controller already knows the content identity, so root_name/manifest_digest/total_bytes/sha256 are additionally required; for pull they are advisory placeholders resolved from the remote's own version row.",
       "properties": {
         "transfer_id": { "type": "string", "minLength": 1 },
         "direction": { "type": "string", "enum": ["push", "pull"] },

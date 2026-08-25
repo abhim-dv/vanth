@@ -1002,6 +1002,19 @@ class ArtifactOperations:
                 errno.ENOSPC,
             ):
                 raise
+            # Fail closed for DIRECTORIES (rc19 review N7): link() refuses
+            # them (EPERM), and a lstat+rename fallback would reopen a
+            # clobber race. Atomic primitives or nothing.
+            try:
+                src_is_dir = stat.S_ISDIR(os.lstat(src).st_mode) if src_dir_fd is None else False
+            except OSError:
+                src_is_dir = False
+            if src_is_dir:
+                raise OSError(
+                    errno.ENOSYS,
+                    "atomic no-replace directory publication is unsupported on this platform",
+                    os.fsdecode(dst),
+                ) from None
             try:
                 existing = os.lstat(dst, dir_fd=dst_dir_fd) if dst_dir_fd is not None else os.lstat(dst)
             except FileNotFoundError:

@@ -159,23 +159,168 @@ EPOCH_STOP_MESSAGE = "epoch changed; transfer stopped rather than rebound"
 DEFAULT_CHUNK_BYTES = 256 * 1024
 
 
-def _open_local_nofollow(path: Path):
-    """Controller-side no-follow open of a pull staging file (rc18 R3/R4)."""
+def _walk_parent_dirfd(parent: Path) -> int:
+    """POSIX: open the staging parent DESCRIPTOR-RELATIVELY (rc19 review N3).
+
+    Every component is opened O_NOFOLLOW|O_DIRECTORY from the filesystem
+    root, so a component swapped for a symlink after inspection cannot
+    redirect the leaf open. The caller owns the returned fd."""
     import os as _os
 
-    flags = _os.O_RDONLY
-    if hasattr(_os, "O_BINARY"):
-        flags |= getattr(_os, "O_BINARY")
+    flags = _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0)
     if hasattr(_os, "O_NOFOLLOW"):
         flags |= _os.O_NOFOLLOW
-    _verify_staging_chain(path.parent)
-    _reject_windows_reparse_leaf(path)
-    fd = _os.open(path, flags)
+    absolute = Path(_os.path.abspath(str(parent)))
+    fd = _os.open(absolute.anchor, flags)
     try:
-        return _os.fdopen(fd, "rb", closefd=True)
+        for component in absolute.parts[1:]:
+            next_fd = _os.open(component, flags, dir_fd=fd)
+            _os.close(fd)
+            fd = next_fd
+        return fd
     except BaseException:
         _os.close(fd)
         raise
+
+
+def _stage_leaf_fd(path: Path, *, write: bool, create: bool) -> int:
+    """Resolve the staging leaf against the walked parent descriptor and
+    return a raw fd (rc19 review N3). POSIX path."""
+    import os as _os
+    import stat as _stat
+
+    parent_fd = _walk_parent_dirfd(path.parent)
+    try:
+        flags = _os.O_RDWR if write else _os.O_RDONLY
+        if create:
+            flags |= _os.O_CREAT
+        if hasattr(_os, "O_BINARY"):
+            flags |= getattr(_os, "O_BINARY")
+        if hasattr(_os, "O_NOFOLLOW"):
+            flags |= _os.O_NOFOLLOW
+        fd = _os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+    finally:
+        _os.close(parent_fd)
+    info = _os.fstat(fd)
+    if not _stat.S_ISREG(info.st_mode):
+        _os.close(fd)
+        raise TransferAborted(f"staging leaf is not a regular file; refused: {path}")
+    return fd
+
+
+def _windows_stage_file(path: Path, *, write: bool, create: bool):
+    """Windows staging open with reparse-safe validation (rc19 review N3).
+
+    A first probe handle opened WITH FILE_FLAG_OPEN_REPARSE_POINT inspects
+    the LEAF itself (never its target); anything carrying
+    FILE_ATTRIBUTE_REPARSE_POINT aborts. The real I/O handle is then opened
+    and compared BY FILE IDENTITY against the probe — a swap between the two
+    opens aborts."""
+    import ctypes as _ctypes
+    import msvcrt as _msvcrt
+
+    import os as _os
+
+    kernel32 = _ctypes.windll.kernel32  # type: ignore[attr-defined]
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    CREATE_NEW = 1
+    OPEN_ALWAYS = 4
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    INVALID = _ctypes.c_void_p(-1).value
+
+    class _BY_HANDLE_FILE_INFORMATION(_ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", _ctypes.c_uint32),
+            ("ftCreationTime", _ctypes.c_uint64),
+            ("ftLastAccessTime", _ctypes.c_uint64),
+            ("ftLastWriteTime", _ctypes.c_uint64),
+            ("dwVolumeSerialNumber", _ctypes.c_uint32),
+            ("nFileSizeHigh", _ctypes.c_uint32),
+            ("nFileSizeLow", _ctypes.c_uint32),
+            ("nNumberOfLinks", _ctypes.c_uint32),
+            ("nFileIndexHigh", _ctypes.c_uint32),
+            ("nFileIndexLow", _ctypes.c_uint32),
+        ]
+
+    kernel32.CreateFileW.restype = _ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [
+        _ctypes.c_wchar_p, _ctypes.c_uint32, _ctypes.c_uint32, _ctypes.c_void_p,
+        _ctypes.c_uint32, _ctypes.c_uint32, _ctypes.c_void_p,
+    ]
+    kernel32.GetFileInformationByHandle.argtypes = [
+        _ctypes.c_void_p, _ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
+    ]
+
+    def _identity(handle):
+        info = _BY_HANDLE_FILE_INFORMATION()
+        if not kernel32.GetFileInformationByHandle(_ctypes.c_void_p(handle),
+                                                   _ctypes.byref(info)):
+            return None
+        return (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
+                info.dwFileAttributes)
+
+    access = (GENERIC_READ | GENERIC_WRITE) if write else GENERIC_READ
+    creation = OPEN_ALWAYS if create else OPEN_EXISTING
+
+    # Probe the leaf WITHOUT following it.
+    probe = kernel32.CreateFileW(str(path), GENERIC_READ, 0, None, OPEN_EXISTING,
+                                 FILE_FLAG_OPEN_REPARSE_POINT, None)
+    exists = bool(probe) and probe != INVALID
+    identity = None
+    if exists:
+        try:
+            identity = _identity(probe)
+            if identity is not None and (identity[3] & FILE_ATTRIBUTE_REPARSE_POINT):
+                raise TransferAborted(f"staging leaf is a reparse point; refused: {path}")
+        finally:
+            kernel32.CloseHandle(_ctypes.c_void_p(probe))
+    elif create:
+        creation = CREATE_NEW  # exclusive create cannot follow any link
+
+    handle = kernel32.CreateFileW(str(path), access, 0, None, creation,
+                                  FILE_ATTRIBUTE_NORMAL, None)
+    if not handle or handle == INVALID:
+        err = _ctypes.GetLastError()
+        raise OSError(err, f"staging open failed: {path}")
+    real_identity = _identity(handle)
+    if identity is not None and real_identity is not None \
+            and real_identity[:3] != identity[:3]:
+        kernel32.CloseHandle(_ctypes.c_void_p(handle))
+        raise TransferAborted(f"staging leaf was swapped during open; refused: {path}")
+    flags = getattr(_os, "O_NOINHERIT", 0)
+    fd = _msvcrt.open_osfhandle(handle, flags)
+    try:
+        mode = "r+b" if write else "rb"
+        return _os.fdopen(fd, mode, closefd=True)
+    except BaseException:
+        _os.close(fd)
+        raise
+
+
+def _stage_open_file(path: Path, *, write: bool, create: bool):
+    """Platform-dispatching validated staging open (rc19 review N3)."""
+    import os as _os
+
+    if os.name == "nt":
+        return _windows_stage_file(path, write=write, create=create)
+    fd = _stage_leaf_fd(path, write=write, create=create)
+    try:
+        return _os.fdopen(fd, "r+b" if write else "rb", closefd=True)
+    except BaseException:
+        _os.close(fd)
+        raise
+
+
+def _open_local_nofollow(path: Path):
+    """Controller-side validated read of a pull staging file (rc18 R3/R4,
+    rc19 N3): descriptor-relative on POSIX, validated-handle on Windows."""
+    import os as _os
+
+    return _stage_open_file(path, write=False, create=False)
 
 
 def _verify_staging_chain(base: Path) -> None:
@@ -200,47 +345,6 @@ def _verify_staging_chain(base: Path) -> None:
         if _stat.S_ISLNK(info.st_mode):
             raise TransferAborted(f"staging parent is a symlink; refused: {ancestor}")
 
-
-def _reject_windows_reparse_leaf(path: Path) -> None:
-    """Windows has no O_NOFOLLOW (rc18 review R4): check the leaf's
-    attributes WITHOUT following it via FILE_FLAG_OPEN_REPARSE_POINT, and
-    refuse anything carrying FILE_ATTRIBUTE_REPARSE_POINT."""
-    if os.name != "nt":
-        return
-    import ctypes as _ctypes
-
-    kernel32 = _ctypes.windll.kernel32  # type: ignore[attr-defined]
-    GENERIC_READ = 0x80000000
-    OPEN_EXISTING = 3
-    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-    FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-    kernel32.CreateFileW.restype = _ctypes.c_void_p
-    kernel32.CreateFileW.argtypes = [
-        _ctypes.c_wchar_p, _ctypes.c_uint32, _ctypes.c_uint32, _ctypes.c_void_p,
-        _ctypes.c_uint32, _ctypes.c_uint32, _ctypes.c_void_p,
-    ]
-    kernel32.GetFileAttributesW.restype = _ctypes.c_uint32
-    kernel32.GetFileAttributesW.argtypes = [_ctypes.c_wchar_p]
-    handle = kernel32.CreateFileW(
-        str(path),
-        GENERIC_READ,
-        0,
-        None,
-        OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-        None,
-    )
-    if not handle or handle == _ctypes.c_void_p(-1).value:
-        return  # open will fail with the real error
-    try:
-        attrs = kernel32.GetFileAttributesW(str(path))
-        if attrs == 0xFFFFFFFF:
-            return  # stat error; the real open surfaces it
-        if attrs & FILE_ATTRIBUTE_REPARSE_POINT:
-            raise TransferAborted(f"staging leaf is a reparse point; refused: {path}")
-    finally:
-        kernel32.CloseHandle(_ctypes.c_void_p(handle))
 
 _EXPECTED_OFFSET_RE = re.compile(r"expected_offset=(\d+)")
 
@@ -314,24 +418,11 @@ class TransferRegistry:
 
     @staticmethod
     def _open_staging(path: Path, *, write: bool, create: bool = False):
-        """No-follow open of a staging file (rc17 review F4): a leaf swapped
-        for a symlink makes the open FAIL instead of writing through it.
-        Ancestors are swept first (rc18 review R4)."""
-        _verify_staging_chain(path.parent)
-        _reject_windows_reparse_leaf(path)
-        flags = os.O_RDWR if write else os.O_RDONLY
-        if create:
-            flags |= os.O_CREAT
-        if hasattr(os, "O_BINARY"):
-            flags |= getattr(os, "O_BINARY")
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags, 0o600)
-        try:
-            return os.fdopen(fd, "r+b" if write else "rb", closefd=True)
-        except BaseException:
-            os.close(fd)
-            raise
+        """Validated staging open (rc17 F4 / rc18 R4 / rc19 N3): the parent
+        chain is traversed descriptor-relative on POSIX and the Windows leaf
+        is reparse-checked with identity comparison — a swap during open
+        aborts instead of redirecting I/O."""
+        return _stage_open_file(path, write=write, create=create)
 
     # ------------------------------------------------------------------
     # Handlers (called from RemoteJobManager routing)
@@ -606,9 +697,29 @@ class TransferRegistry:
         actual_sha = hashlib.sha256(data).hexdigest()
         expected_sha = str(payload.get("sha256") or row["sha256"])
         if actual_sha != expected_sha or actual_sha != row["sha256"]:
+            # Same-length corruption wedged resume forever otherwise (rc19
+            # N6): reset the remote ledger + staging so the controller
+            # retransmits from zero; the expected_offset hint makes its
+            # classify() treat this as a retry-offset instead of an abort.
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "UPDATE remote_transfers SET acked_offset=0, updated_at=? WHERE transfer_id=?",
+                    (now_iso(), transfer_id),
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+            try:
+                with self._open_staging(staged, write=True, create=False) as zero:
+                    zero.truncate(0)
+            except OSError:
+                pass
             raise VanthRemoteProtocolError(
                 "INVALID_REQUEST",
-                f"whole-content sha256 mismatch: expected {row['sha256']}, remote hashed {actual_sha}",
+                f"whole-content sha256 mismatch: expected {row['sha256']}, remote hashed {actual_sha}; "
+                f"transfer reset for retransmission (expected_offset=0)",
             )
         if row["direction"] == "pull":
             version_id = payload.get("version_id")
@@ -997,21 +1108,13 @@ class RemoteArtifactBroker:
 
         # Stage EXCLUSIVELY inside a Vanth-owned directory (rc17 review F4):
         # writing `.pulling-*` next to an arbitrary destination let a swapped
-        # parent redirect the write through a symlink. Ancestors are swept
-        # and Windows reparse leaves rejected (rc18 R4).
+        # parent redirect the write through a symlink. Ancestors are swept at
+        # creation and the leaf open is fully validated (rc18 R4/rc19 N3).
         staging = self._pull_staging_path(transfer_id)
+        _verify_staging_chain(staging.parent)
         staging.parent.mkdir(parents=True, exist_ok=True)
         _verify_staging_chain(staging.parent)
-        _reject_windows_reparse_leaf(staging)
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(staging, flags, 0o600)
-        try:
-            out = os.fdopen(fd, "r+b", closefd=True)
-        except BaseException:
-            os.close(fd)
-            raise
+        out = _stage_open_file(staging, write=True, create=True)
         try:
             out.truncate(offset)
             # On resume the prefix was already verified chunk-by-chunk;
@@ -1069,7 +1172,12 @@ class RemoteArtifactBroker:
                 # served window; the remote's durable offset does not
                 # move on serve (review P1-14).
                 served_to = int(result["served_to"])
-                if served_to < offset or served_to > total or served_to != offset + len(data):
+                if len(data) == 0 or served_to <= offset:
+                    # Zero-length windows loop forever otherwise (rc19 N2).
+                    self._mark_failed(transfer_id, record["op_claim_token"],
+                                      f"pull chunk made no progress at offset {offset}")
+                    raise TransferAborted(f"pull chunk made no progress at offset {offset}")
+                if served_to > total or served_to != offset + len(data):
                     raise TransferInterrupted(transfer_id, offset, "served window out of range")
                 offset = served_to
                 self._persist_progress(transfer_id, record["op_claim_token"], acked_offset=offset)

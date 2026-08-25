@@ -301,6 +301,14 @@ def pair_remote(
             wrapper_command = shlex.quote(f"{remote_home.rstrip('/')}/{wrapper_name}")
         else:
             wrapper_command = f"$HOME/.vanth/{wrapper_name}"
+        # Persist PROVISIONAL cleanup metadata BEFORE any remote mutation
+        # (rc19 review N4): if installation succeeds but persisting the line
+        # fails, removal still knows what to revoke.
+        store.db.execute(
+            "UPDATE remotes SET wrapper_path=?, cleanup_pending=1, updated_at=? WHERE remote_id=?",
+            (wrapper_command, now_iso(), remote_id),
+        )
+        store.db.commit()
         installed_line = ssh.authorized_keys_line(
             public_key_blob, "", marker_comment=marker, forced_command=wrapper_command
         )
@@ -314,11 +322,12 @@ def pair_remote(
             config_dir=remote_dir,
             target_argv=argv,
         )
-        # Persist the EXACT wrapper path/command used (rc17 review F2): remote
-        # cleanup must target this file without re-parsing the authorization
-        # line (which misparses quoted paths containing spaces).
+        # Persist the EXACT wrapper path/command used (review rc14 P0-1.4 /
+        # rc19 N4) and clear the pending flag only now that installation
+        # provably succeeded.
         store.db.execute(
-            "UPDATE remotes SET installed_authorization=?, wrapper_path=?, updated_at=? WHERE remote_id=?",
+            "UPDATE remotes SET installed_authorization=?, wrapper_path=?, cleanup_pending=0, updated_at=? "
+            "WHERE remote_id=?",
             (installed_line, wrapper_command, now_iso(), remote_id),
         )
         store.db.commit()
@@ -420,9 +429,17 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
             except Exception:
                 pass
         if not cleanup_complete:
-            # Keep remote_dir + credentials so remove_remote can retry the
-            # revocation later (rc18 review R5).
+            # Keep remote_dir + credentials AND the cleanup_pending flag so
+            # remove_remote can retry the revocation later (rc18/19 reviews).
             return
+        try:
+            store.db.execute(
+                "UPDATE remotes SET cleanup_pending=0, updated_at=? WHERE remote_id=?",
+                (now_iso(), remote_id),
+            )
+            store.db.commit()
+        except Exception:
+            pass
     shutil.rmtree(remote_dir, ignore_errors=True)
 
 
@@ -486,10 +503,12 @@ def remove_remote(
     last_error: str | None = None
     installed = row.get("installed_authorization") if isinstance(row, dict) else None
     persisted_wrapper = row.get("wrapper_path") if isinstance(row, dict) else None
-    if installed and not remote_dir.exists() and not force:
+    cleanup_pending = bool(row.get("cleanup_pending")) if isinstance(row, dict) else False
+    needs_revocation = bool(installed) or cleanup_pending
+    if needs_revocation and not remote_dir.exists() and not force:
         # Local credentials are gone but the remote authorization may still
         # be live; deleting the row would destroy the last retry handle
-        # (rc18 review R5).
+        # (rc18 review R5 / rc19 N4).
         return {
             "result": "error",
             "error": ("local revocation material is missing while a remote "
@@ -498,7 +517,7 @@ def remove_remote(
             "remote_id": remote_id,
             "revoked_remote_authorization": False,
         }
-    if installed and remote_dir.exists():
+    if needs_revocation and remote_dir.exists():
         try:
             target_info = ssh.parse_target(row["target"])
             marker = marker_comment(remote_id)
@@ -510,11 +529,11 @@ def remove_remote(
             )
             # Prefer the persisted wrapper command; fall back to parsing the
             # stored authorization line for rows paired before persistence
-            # (rc17 review F2).
+            # (rc17 review F2). Pending rows may have no line at all.
             wrapper_expr = None
             if isinstance(persisted_wrapper, str) and persisted_wrapper.strip():
                 wrapper_expr = persisted_wrapper.strip()
-            else:
+            elif installed:
                 forced = (ssh.parse_authorized_keys(installed).get("command") or "").strip('"')
                 if len(forced) >= 2 and forced.startswith("'") and forced.endswith("'"):
                     forced = forced[1:-1]
@@ -557,7 +576,7 @@ def remove_remote(
                     target_argv=_target_argv(target_info),
                 )
             transport.remove_authorized_key(
-                remove_script=ssh.authorized_keys_remove_script(installed, marker),
+                remove_script=ssh.authorized_keys_remove_script(installed or "", marker),
                 bootstrap_config=bootstrap,
                 config_dir=remote_dir,
                 target_argv=_target_argv(target_info),
@@ -566,7 +585,7 @@ def remove_remote(
         except Exception as exc:
             revoked = False
             last_error = str(exc)
-    if installed and not revoked and not force:
+    if needs_revocation and not revoked and not force:
         return {
             "result": "error",
             "error": ("remote revocation failed; local credentials retained "

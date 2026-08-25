@@ -159,6 +159,7 @@ class RemoteStore:
             ("remotes", "instance_id", "TEXT"),
             ("remotes", "installed_authorization", "TEXT"),
             ("remotes", "wrapper_path", "TEXT"),
+            ("remotes", "cleanup_pending", "INTEGER NOT NULL DEFAULT 0"),
             ("remotes", "feed_cursor_json", "TEXT"),
             ("remote_requests", "expected_state_epoch", "INTEGER"),
             ("remote_requests", "expected_instance_id", "TEXT"),
@@ -499,7 +500,7 @@ class RemoteStore:
             self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
-                "SELECT shadow_id, suppressed_at FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
+                "SELECT shadow_id, suppressed_at, state_epoch FROM remote_shadows WHERE remote_id=? AND remote_job_id=?",
                 (remote_id, remote_job_id),
             ).fetchone()
             stamp = now_iso()
@@ -507,13 +508,20 @@ class RemoteStore:
             if existing and existing["suppressed_at"]:
                 result = None
             elif existing:
-                self.db.execute(
-                    "UPDATE remote_shadows SET status=?, payload_json=?, state_epoch=?, updated_at=? WHERE shadow_id=?",
-                    (status, payload_json, state_epoch, stamp, existing[0]),
-                )
-                result = self._shadow_dict(self.db.execute(
-                    "SELECT * FROM remote_shadows WHERE shadow_id=?", (existing[0],)
-                ).fetchone())
+                # Epoch guard (rc19 review N1): a write bound to an OLDER
+                # timeline than the shadow already carries must never regress
+                # it — defense in depth behind the feed-path rejection.
+                existing_epoch = int(existing["state_epoch"] or 0) if "state_epoch" in existing.keys() else 0
+                if existing_epoch > int(state_epoch):
+                    result = None
+                else:
+                    self.db.execute(
+                        "UPDATE remote_shadows SET status=?, payload_json=?, state_epoch=?, updated_at=? WHERE shadow_id=?",
+                        (status, payload_json, state_epoch, stamp, existing[0]),
+                    )
+                    result = self._shadow_dict(self.db.execute(
+                        "SELECT * FROM remote_shadows WHERE shadow_id=?", (existing[0],)
+                    ).fetchone())
             else:
                 self.db.execute(
                     """

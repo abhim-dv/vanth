@@ -196,8 +196,11 @@ def test_transient_stop_failure_stays_retryable(tmp_path):
 
     remote.manager = BoomManager(rstore.db)
     resp = remote.handle_request(request_frame(method="job.stop", payload={"job_id": "job_a"}, key="key-stop-0001"))
-    assert resp["kind"] == "response"
-    assert resp["result"]["retrying"] is True
+    # rc19 N8a: a transient failure surfaces as an ERROR frame — the
+    # controller's request must NOT be marked completed for a stop that is
+    # still queued.
+    assert resp["kind"] == "error"
+    assert "temporarily failed" in resp["message"]
     op_status = rstore.db.execute(
         "SELECT status FROM remote_operations WHERE idempotency_key='key-stop-0001'"
     ).fetchone()["status"]
@@ -334,3 +337,64 @@ def test_remove_remote_without_material_requires_force(tmp_path):
     assert store.get_remote(rid) is not None
     out2 = pairing_mod.remove_remote(home=home, remote_id=rid, store=store, force=True)
     assert out2["result"] == "ok"
+
+
+def test_cross_timeline_feed_batch_rejected(tmp_path):
+    """rc19 N1: a batch whose timeline diverged from durable progress
+    mid-flight is skipped before any shadow write. (Fully foreign timelines
+    are intercepted earlier by gap-recovery -> snapshot resync.)"""
+    cstore, rstore, remote, control, row, jobs_db, logs = make_world(
+        tmp_path, job_rows=[("job_a", "running")]
+    )
+    rid = row["remote_id"]
+    cstore.db.execute("UPDATE remotes SET state_epoch=2 WHERE remote_id=?", (rid,))
+    cstore.db.commit()
+    cstore.set_feed_cursor(rid, {"state_epoch": 2, "feed_epoch": 2, "seq": 9})
+    cstore.upsert_shadow(remote_id=rid, remote_job_id="job_a", status="completed",
+                         payload={"status": "completed"}, state_epoch=2)
+    original_handler = control.transport.handler
+
+    def diverging_batch(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "job.feed" and resp.get("kind") == "response":
+            # A snapshot sync lands BEFORE the batch is applied: durable
+            # progress moves under our feet, and the (simulated) response
+            # still speaks the same timeline.
+            cstore.upsert_shadow(remote_id=rid, remote_job_id="job_a", status="completed",
+                                 payload={"status": "completed"}, state_epoch=2)
+            cstore.set_feed_cursor(rid, {"state_epoch": 2, "feed_epoch": 2, "seq": 12})
+            resp["result"]["state_epoch"] = 2
+            resp["result"]["feed_epoch"] = 2
+            resp["result"]["changes"] = [{
+                "kind": "job.upsert", "job_id": "job_a",
+                "payload": {"job_id": "job_a", "status": "running"},
+            }]
+            resp["result"]["cursor"] = {"seq": 11}
+        return resp
+
+    control.transport.handler = diverging_batch
+    out = control.feed_sync(rid)
+    assert out.get("stale_batch_skipped") is True
+    shadow = next(s for s in control.shadows(rid) if s["remote_job_id"] == "job_a")
+    assert shadow["status"] == "completed"
+    cursor_after = cstore.get_feed_cursor(rid)
+    assert int(cursor_after["seq"]) == 12
+
+
+def test_shadow_upsert_never_regresses_epoch(tmp_path):
+    from vanth.remote.store import RemoteStore as _RS
+    db_path = tmp_path / "shadows.sqlite"
+    import sqlite3 as _sq
+
+    conn = _sq.connect(db_path)
+    conn.row_factory = _sq.Row
+    store = _RS(conn)
+    rid = store.create_remote(target="u@h", state="paired")["remote_id"]
+    first = store.upsert_shadow(remote_id=rid, remote_job_id="j1", status="completed",
+                                payload={"status": "completed"}, state_epoch=3)
+    stale = store.upsert_shadow(remote_id=rid, remote_job_id="j1", status="running",
+                                payload={"status": "running"}, state_epoch=1)
+    row = store.db.execute(
+        "SELECT status FROM remote_shadows WHERE remote_id=? AND remote_job_id='j1'", (rid,)
+    ).fetchone()
+    assert row["status"] == "completed"

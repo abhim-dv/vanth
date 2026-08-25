@@ -329,6 +329,14 @@ class RemoteJobManager:
         except BaseException:
             self.store.db.rollback()
             raise
+        if error is None and transient_error is not None:
+            # An ERROR frame (rc19 review): a response would mark the
+            # controller's request COMPLETED even though the stop intent is
+            # still queued; the failure must be visible and retryable.
+            return self._error_frame(
+                frame, code="INVALID_REQUEST",
+                message=f"stop temporarily failed; intent remains queued for retry: {transient_error}",
+            )
         return self._response_frame(frame, result)
 
     def _handle_start_or_rerun(self, frame, method, payload, idempotency_key, digest):

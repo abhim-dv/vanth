@@ -596,27 +596,43 @@ class RemoteControl:
             try:
                 applied = suppressed = 0
                 # Stale-batch rejection BEFORE any shadow write (rc18 review
-                # R2): a snapshot sync may have advanced the durable cursor
-                # while this batch was in flight; replaying its older changes
-                # used to overwrite fresher shadows permanently.
+                # R2, rc19 review N1): reject when the durable cursor no
+                # longer matches the request/response timeline AT ALL — an
+                # epoch-1 response arriving after an epoch-2 snapshot must
+                # never touch shadows or rewind the cursor. Also skip batches
+                # fully superseded on the same timeline.
                 stored_now = self.store.get_feed_cursor(remote_id)
                 batch_end_seq = int(next_cursor.get("seq") or 0)
-                if (
-                    stored_now is not None
-                    and int(stored_now.get("state_epoch", -1)) == epoch
-                    and int(stored_now.get("feed_epoch", -1)) == int(result.get("feed_epoch") or 1)
-                    and int(stored_now.get("seq") or 0) >= batch_end_seq
-                    and batch_end_seq > 0
-                ):
+                response_timeline = (epoch, int(result.get("feed_epoch") or 1))
+                reject_reason = None
+                if stored_now is not None:
+                    stored_timeline = (
+                        int(stored_now.get("state_epoch", -1)),
+                        int(stored_now.get("feed_epoch", -1)),
+                    )
+                    if stored_timeline != response_timeline:
+                        reject_reason = "timeline mismatch with durable cursor"
+                    elif stored_timeline != (
+                        int((cursor or {}).get("state_epoch", -1)),
+                        int((cursor or {}).get("feed_epoch", -1)),
+                    ) and cursor is not None:
+                        # The durable state moved mid-flight (a snapshot ran
+                        # between fetch and apply): this batch belongs to a
+                        # world that no longer exists.
+                        reject_reason = "durable cursor changed during flight"
+                    elif int(stored_now.get("seq") or 0) >= batch_end_seq and batch_end_seq > 0:
+                        reject_reason = "fully superseded by durable progress"
+                if reject_reason is not None:
                     self.store.db.commit()
                     return {
                         "mode": "feed",
                         "applied": 0,
                         "suppressed": 0,
                         "stale_batch_skipped": True,
+                        "skip_reason": reject_reason,
                         "changes": len(changes),
                         "has_more": bool(result.get("has_more")),
-                        "cursor": dict(stored_now),
+                        "cursor": dict(stored_now) if stored_now is not None else {},
                         "state_epoch": epoch,
                         "feed_epoch": int(result.get("feed_epoch") or 1),
                     }
@@ -649,6 +665,14 @@ class RemoteControl:
                     "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
                     (epoch, now_iso(), remote_id, epoch),
                 )
+                # Report the cursor DURABLY ACCEPTED, not the response's
+                # (rc19 review): the forward-only merge may have kept an
+                # older-response seq out.
+                accepted_cursor = self.store.get_feed_cursor(remote_id) or {
+                    "state_epoch": epoch,
+                    "feed_epoch": int(result.get("feed_epoch") or 1),
+                    "seq": int(next_cursor.get("seq") or 0),
+                }
                 self.store.db.commit()
             except BaseException:
                 self.store.db.rollback()
@@ -659,9 +683,9 @@ class RemoteControl:
             "suppressed": suppressed,
             "changes": len(changes),
             "has_more": bool(result.get("has_more")),
-            "cursor": next_cursor,
-            "state_epoch": epoch,
-            "feed_epoch": int(result.get("feed_epoch") or 1),
+            "cursor": dict(accepted_cursor),
+            "state_epoch": int(accepted_cursor.get("state_epoch", epoch)),
+            "feed_epoch": int(accepted_cursor.get("feed_epoch", result.get("feed_epoch") or 1)),
         }
 
     def _advance_feed_cursor(self, remote_id: str, incoming: dict[str, Any], *,

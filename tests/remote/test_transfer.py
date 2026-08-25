@@ -701,3 +701,79 @@ def test_pull_init_without_version_id_is_rejected():
     with pytest.raises(VanthRemoteProtocolError):
         validate_request("artifact.transfer_init", {
             "transfer_id": "xfr_" + "b" * 32, "direction": "pull"})
+
+
+def test_zero_length_pull_chunk_aborts_world(world, tmp_path):
+    global tmp_path_factory
+    tmp_path_factory = tmp_path.parent
+    # The fixture-based variant lives here to reuse `world`.
+    put = publish_source(world)
+    pushed = world.broker.push_blob(world.remote_row["remote_id"], put["version_id"],
+                                    idempotency_key="push-key-0032")
+    rid = world.remote_row["remote_id"]
+    dest = tmp_path / "out.bin"
+    original_handler = world.transport.handler
+
+    def empty_window(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "artifact.blob_chunk" and resp.get("kind") == "response":
+            if int(resp["result"]["offset"]) == 0:
+                resp["result"]["data_b64"] = ""
+                resp["result"]["sha256"] = hashlib.sha256(b"").hexdigest()
+                resp["result"]["served_to"] = 0
+                resp["result"]["size"] = 0
+        return resp
+
+    world.transport.handler = empty_window
+    with pytest.raises(Exception, match="no progress"):
+        world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0032")
+
+
+def test_remote_push_corruption_resets_and_recovers(world, tmp_path):
+    """rc19 N6: same-length corruption on the REMOTE staging is detected at
+    completion; the remote resets its ledger+staging with an expected_offset=0
+    hint so the next attempt retransmits from zero."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+
+    state = {"chunks": 0}
+
+    def corrupt_after_first(frame):
+        resp_state = {"chunks": 0}
+        return False
+
+    def tamper_remote_staging():
+        # Corrupt the REMOTE staging file in place (same length).
+        parts = list((world.tmp_path / "remote-home" / "remote-transfers").glob("*.part"))
+        if parts:
+            with open(parts[0], "r+b") as fh:
+                fh.seek(0)
+                fh.write(b"\x00" * 64)
+
+    original_handler = world.transport.handler
+
+    def corrupting_handler(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "artifact.blob_chunk":
+            state["chunks"] += 1
+            if state["chunks"] == 1:
+                tamper_remote_staging()
+        return resp
+
+    world.transport.handler = corrupting_handler
+    # Completion rejects the hash and hints offset 0; the broker's classify
+    # treats it as retry-offset only inside the chunk loop, so completion
+    # raises interrupted — but the REMOTE ledger must now be at 0.
+    with pytest.raises(Exception):
+        world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0033")
+    rrow = world.rstore.db.execute(
+        "SELECT acked_offset FROM remote_transfers WHERE direction='push'"
+    ).fetchone()
+    assert rrow is not None and int(rrow["acked_offset"]) == 0, (
+        "remote push corruption must reset the durable offset"
+    )
+
+    # Next attempt retransmits from zero and completes.
+    world.transport.handler = original_handler
+    result = world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0033")
+    assert result["completed"] is True
