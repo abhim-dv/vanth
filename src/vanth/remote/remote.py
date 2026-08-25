@@ -85,7 +85,7 @@ class RemoteJobManager:
             epoch_fn=self._remote_state_epoch,
             ops_factory=self._remote_artifact_ops,
             staging_dir=(Path(home) / "remote-transfers") if home else None,
-            epoch_lock=self.store.epoch_lock,
+            fence_lock=self.store.db_lock,
         )
         self.dispatcher_stop = threading.Event()
         self.dispatcher_thread: threading.Thread | None = None

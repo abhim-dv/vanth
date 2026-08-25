@@ -946,7 +946,8 @@ class ArtifactOperations:
         if os.name == "nt":
             os.rename(src, dst)
             return
-        at_fdcwd = -100
+        # AT_FDCWD differs per platform (rc18 review: Darwin uses -2).
+        at_fdcwd = -2 if sys.platform == "darwin" else -100
         old_fd = at_fdcwd if src_dir_fd is None else src_dir_fd
         new_fd = at_fdcwd if dst_dir_fd is None else dst_dir_fd
         old_name = os.fsencode(src)

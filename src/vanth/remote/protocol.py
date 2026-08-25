@@ -465,7 +465,9 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         # remote's own version row and are returned in the init response.
         direction = payload.get("direction")
         push_required = {"transfer_id", "direction", "root_name", "manifest_digest", "total_bytes", "sha256"}
-        pull_required = {"transfer_id", "direction"}
+        # Pull names the remote version to serve; without it the handler
+        # could not resolve any content (rc18 review R8).
+        pull_required = {"transfer_id", "direction", "version_id"}
         if direction not in TRANSFER_DIRECTIONS:
             raise VanthRemoteProtocolError(
                 "INVALID_REQUEST", f"direction must be one of {sorted(TRANSFER_DIRECTIONS)}"

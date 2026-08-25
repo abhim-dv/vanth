@@ -385,7 +385,7 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
     except Exception:
         pass
     if installed_line and bootstrap_config and argv:
-        wrapper_name = ssh._wrapper_filename(remote_id)
+        cleanup_complete = True
         try:
             transport.remove_authorized_key(
                 remove_script=ssh.remote_wrapper_remove_script(
@@ -397,7 +397,7 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
                 target_argv=argv,
             )
         except Exception:
-            pass
+            cleanup_complete = False
         try:
             transport.remove_authorized_key(
                 remove_script=ssh.authorized_keys_remove_script(installed_line, marker),
@@ -406,7 +406,7 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
                 target_argv=argv,
             )
         except Exception:
-            pass
+            cleanup_complete = False
         # Best-effort legacy shared-name cleanup (older pairings).
         if remote_home:
             try:
@@ -419,6 +419,10 @@ def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: 
                 )
             except Exception:
                 pass
+        if not cleanup_complete:
+            # Keep remote_dir + credentials so remove_remote can retry the
+            # revocation later (rc18 review R5).
+            return
     shutil.rmtree(remote_dir, ignore_errors=True)
 
 
@@ -480,11 +484,21 @@ def remove_remote(
     remote_dir = home / "remote" / remote_id
     revoked = False
     last_error: str | None = None
-    needs_revocation = False
     installed = row.get("installed_authorization") if isinstance(row, dict) else None
     persisted_wrapper = row.get("wrapper_path") if isinstance(row, dict) else None
+    if installed and not remote_dir.exists() and not force:
+        # Local credentials are gone but the remote authorization may still
+        # be live; deleting the row would destroy the last retry handle
+        # (rc18 review R5).
+        return {
+            "result": "error",
+            "error": ("local revocation material is missing while a remote "
+                      "authorization may still be installed; pass force=True "
+                      "to delete the record anyway"),
+            "remote_id": remote_id,
+            "revoked_remote_authorization": False,
+        }
     if installed and remote_dir.exists():
-        needs_revocation = True
         try:
             target_info = ssh.parse_target(row["target"])
             marker = marker_comment(remote_id)
@@ -552,7 +566,7 @@ def remove_remote(
         except Exception as exc:
             revoked = False
             last_error = str(exc)
-    if needs_revocation and not revoked and not force:
+    if installed and not revoked and not force:
         return {
             "result": "error",
             "error": ("remote revocation failed; local credentials retained "

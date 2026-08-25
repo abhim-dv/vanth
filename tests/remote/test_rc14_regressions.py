@@ -243,3 +243,94 @@ def test_feed_cursor_never_moves_backward(tmp_path):
     # A NEW timeline may reset freely.
     out2 = control._advance_feed_cursor(rid, {"state_epoch": 2, "feed_epoch": 2, "seq": 0})
     assert int(out2["seq"]) == 0
+
+
+def test_stale_feed_batch_cannot_regress_shadows(tmp_path):
+    """rc18 R2: a batch superseded by durable progress is skipped BEFORE any
+    shadow write — a stale 'running' can no longer overwrite fresher
+    'completed' state."""
+    cstore, rstore, remote, control, row, jobs_db, logs = make_world(
+        tmp_path, job_rows=[("job_a", "completed")]
+    )
+    rid = row["remote_id"]
+    # Durable progress already sits at seq 9.
+    cstore.set_feed_cursor(rid, {"state_epoch": 1, "feed_epoch": 1, "seq": 9})
+    before = {s["remote_job_id"]: s["status"] for s in control.shadows(rid)}
+    assert not before or before.get("job_a") == "completed"
+
+    original_handler = control.transport.handler
+
+    def stale_batch(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "job.feed" and resp.get("kind") == "response":
+            resp["result"]["changes"] = [{
+                "kind": "job.upsert", "job_id": "job_a",
+                "payload": {"job_id": "job_a", "status": "running"},
+            }]
+            resp["result"]["cursor"] = {"seq": 5}
+            resp["result"]["state_epoch"] = 1
+            resp["result"]["feed_epoch"] = 1
+        return resp
+
+    control.transport.handler = stale_batch
+    out = control.feed_sync(rid)
+    assert out.get("stale_batch_skipped") is True
+    after = {s["remote_job_id"]: s["status"] for s in control.shadows(rid)}
+    assert after == before, "stale batch must not touch shadows"
+    assert int(cstore.get_feed_cursor(rid)["seq"]) == 9
+
+
+def test_compensate_failure_preserves_local_credentials(tmp_path):
+    """rc18 R5: when remote cleanup fails, compensation keeps remote_dir so
+    remove_remote can retry revocation later."""
+    import sqlite3 as _sq
+
+    from vanth.remote import pairing as pairing_mod
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    conn = _sq.connect(home / "remote.sqlite")
+    conn.row_factory = _sq.Row
+    store = pairing_mod.RemoteStore(conn)
+    remote_id = "rmt_" + "c" * 32
+    store.create_remote(target="u@h", state="error", name="x")
+    # create_remote generates its own id; fetch it.
+    remote_id = store.list_remotes()[0]["remote_id"]
+    remote_dir = home / "remote" / remote_id
+    remote_dir.mkdir(parents=True)
+    (remote_dir / "id_ed25519").write_text("key")
+
+    class FailingTransport:
+        def remove_authorized_key(self, **kw):
+            raise ConnectionError("host unreachable")
+
+    pairing_mod._compensate(store, FailingTransport(), remote_id, remote_dir,
+                            "vanth-remote:" + remote_id, "ssh-ed25519 AAA line",
+                            "config", ["ssh"], remote_home=None)
+    assert remote_dir.exists(), "failed cleanup must preserve credentials"
+
+
+def test_remove_remote_without_material_requires_force(tmp_path):
+    """rc18 R5: no local dir + installed authorization -> refuse to delete
+    the record unless force=True."""
+    import sqlite3 as _sq
+
+    from vanth.remote import pairing as pairing_mod
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    conn = _sq.connect(home / "remote.sqlite")
+    conn.row_factory = _sq.Row
+    store = pairing_mod.RemoteStore(conn)
+    store.create_remote(target="u@h", state="paired", name="x")
+    rid = store.list_remotes()[0]["remote_id"]
+    store.db.execute(
+        "UPDATE remotes SET installed_authorization='command=\"x\" ssh-ed25519 AAA vanth-remote:' || ? "
+        "WHERE remote_id=?", (rid, rid))
+    store.db.commit()
+    out = pairing_mod.remove_remote(home=home, remote_id=rid, store=store,
+                                    transport=pairing_mod.DefaultTransport())
+    assert out["result"] == "error"
+    assert store.get_remote(rid) is not None
+    out2 = pairing_mod.remove_remote(home=home, remote_id=rid, store=store, force=True)
+    assert out2["result"] == "ok"

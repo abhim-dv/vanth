@@ -178,7 +178,8 @@ def test_transfer_methods_validate_via_protocol():
         "transfer_id": "xfr_" + "a" * 32, "direction": "push", "root_name": "r",
         "manifest_digest": "0" * 64, "total_bytes": 10, "sha256": "0" * 64,
     })
-    validate_request("artifact.transfer_init", {"transfer_id": "xfr_" + "b" * 32, "direction": "pull"})
+    validate_request("artifact.transfer_init", {"transfer_id": "xfr_" + "b" * 32, "direction": "pull",
+                                                "version_id": "ver_" + "b" * 32})
     validate_request("artifact.blob_chunk", {"transfer_id": "xfr_" + "d" * 32, "offset": 0})
     validate_request("artifact.transfer_complete", {
         "transfer_id": "xfr_" + "a" * 32,
@@ -639,3 +640,64 @@ def test_unbound_error_frames_rejected(world, tmp_path):
     world.transport.handler = foreign_error
     with pytest.raises(ConnectionError, match="does not bind"):
         world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0015")
+
+
+def test_same_length_corruption_resets_resume(world, tmp_path):
+    """rc18 R7: staging corrupted WITHOUT changing its length must not wedge
+    resume at EOF — verification failure resets ledger + staging to zero."""
+    put = publish_source(world)
+    pushed = world.broker.push_blob(world.remote_row["remote_id"], put["version_id"],
+                                    idempotency_key="push-key-0021")
+    rid = world.remote_row["remote_id"]
+    dest = tmp_path / "out" / "corrupt.bin"
+
+    state = {"chunks": 0}
+
+    def fail_on_second_chunk(frame):
+        if frame["method"] == "artifact.blob_chunk":
+            state["chunks"] += 1
+            return state["chunks"] == 2
+        return False
+
+    world.transport.fail_once_on(fail_on_second_chunk)
+    with pytest.raises(ConnectionError):
+        world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0021")
+    part = next((tmp_path / "controller-home" / "remote-pull-staging").glob("*.part"))
+    assert part.stat().st_size >= 1024
+    # Corrupt IN PLACE: same length, wrong bytes.
+    with open(part, "r+b") as fh:
+        fh.seek(0)
+        fh.write(b"\xff" * 64)
+
+    result = world.broker.pull_blob(rid, pushed["version_id"], dest, idempotency_key="pull-key-0021")
+    assert result["completed"] is True
+    offsets = [f["payload"]["offset"] for f in world.transport.frames
+               if f["method"] == "artifact.blob_chunk"]
+    assert min(offsets) == 0, "same-length corruption must restart from zero"
+    assert dest.read_bytes() == SAMPLE_DATA
+
+
+def test_push_ack_must_cover_exact_window(world):
+    """rc18 R8: a push ack claiming MORE than the just-sent window is a
+    protocol violation, not an opportunity to skip data."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+    original_handler = world.transport.handler
+
+    def overzealous_ack(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "artifact.blob_chunk" and resp.get("kind") == "response":
+            resp["result"]["acked_offset"] = 999999
+        return resp
+
+    world.transport.handler = overzealous_ack
+    with pytest.raises(Exception, match="sent window end"):
+        world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0022")
+
+
+def test_pull_init_without_version_id_is_rejected():
+    from vanth.remote.protocol import validate_request, VanthRemoteProtocolError
+
+    with pytest.raises(VanthRemoteProtocolError):
+        validate_request("artifact.transfer_init", {
+            "transfer_id": "xfr_" + "b" * 32, "direction": "pull"})

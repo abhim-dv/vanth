@@ -298,14 +298,14 @@
     "payload_artifact.transfer_init": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["transfer_id", "direction"],
+      "required": ["transfer_id", "direction", "version_id"],
       "allOf": [
         {
           "if": { "properties": { "direction": { "const": "push" } }, "required": ["direction"] },
-          "then": { "required": ["transfer_id", "direction", "root_name", "manifest_digest", "total_bytes", "sha256"] }
+          "then": { "required": ["transfer_id", "direction", "version_id", "root_name", "manifest_digest", "total_bytes", "sha256"] }
         }
       ],
-      "description": "For push the controller already knows the content identity, so root_name/manifest_digest/total_bytes/sha256 are required; for pull they are advisory placeholders resolved from the remote's own version row.",
+      "description": "Pull MUST name version_id. For push the controller already knows the content identity, so root_name/manifest_digest/total_bytes/sha256 are additionally required; for pull they are advisory placeholders resolved from the remote's own version row.",
       "properties": {
         "transfer_id": { "type": "string", "minLength": 1 },
         "direction": { "type": "string", "enum": ["push", "pull"] },
@@ -340,7 +340,7 @@
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "version_id": {
           "type": "string",
-          "description": "Pull completions name the remote version being confirmed."
+          "description": "REQUIRED for pull completions (names the remote version being confirmed); push completions create a new version, so the field is absent there. The server rejects a pull completion without it with INVALID_REQUEST."
         }
       }
     }

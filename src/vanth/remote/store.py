@@ -658,10 +658,12 @@ class RemoteOperationStore:
     """Remote-side durable store for accepted operations and tombstones."""
 
     def __init__(self, db) -> None:
+        # db_lock is THE serialization point: state-epoch rotation AND
+        # transfer publication both hold it (rc18 review R1). Two separate
+        # locks invited a db_lock->epoch_lock vs epoch_lock->db_lock
+        # deadlock; a single RLock makes the publication fence atomic and
+        # ordering deadlock-free (handle_request already runs under it).
         self.db_lock = threading.RLock()
-        # Serializes state-epoch rotation against transfer publication so the
-        # publication fence is atomic in-process (rc17 review F6).
-        self.epoch_lock = threading.RLock()
         self.db = db
         self.db.executescript(REMOTE_OPERATION_DDL)
         self._ensure_columns()
@@ -851,7 +853,7 @@ class RemoteOperationStore:
         """
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
             raise ValueError("epoch must be an integer >= 1")
-        with self.epoch_lock:
+        with self.db_lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 row = self.db.execute(

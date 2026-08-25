@@ -4,6 +4,39 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### RC18 adversarial review fixes
+
+- **P1 deadlock**: the separate epoch lock is gone — state-epoch rotation
+  and transfer publication both serialize on the store's `db_lock`, so the
+  restore `db_lock→epoch_lock` vs publication `epoch_lock→db_lock` inversion
+  can no longer deadlock (single-lock ordering).
+- **P1 stale feed batches**: `feed_sync` now validates durable progress
+  BEFORE applying anything — a batch whose end seq is at or below the stored
+  cursor on the same timeline is skipped wholesale (`stale_batch_skipped`),
+  so a stale `running` can never overwrite fresher shadows again.
+- **P1 verified-bytes binding**: push completion and pull assembly each read
+  ONE buffer through the no-follow handle, hash THAT buffer, and publish it;
+  a same-size swap between verify-open and publish-reopen can no longer
+  publish unverified data.
+- **P1 staging containment**: every staging access sweeps its full ancestor
+  chain (symlink/junction/reparse ancestors abort), and Windows leaves are
+  checked for `FILE_ATTRIBUTE_REPARSE_POINT` via a
+  `FILE_FLAG_OPEN_REPARSE_POINT` handle before any open.
+- **P1 pairing cleanup handles**: `_compensate` only deletes local
+  credentials when BOTH remote cleanup steps succeeded; `remove_remote`
+  refuses to delete a record whose local revocation material is missing
+  unless `force=True`.
+- **P1 darwin AT_FDCWD**: `renameatx_np` gets Darwin's `-2`, not Linux's
+  `-100`; relative non-overwrite publication works on macOS.
+- **P2 resume wedge**: same-length staging corruption now fails whole-buffer
+  verification, resets ledger+staging to zero, and restarts once from zero
+  within the same call.
+- **P2 transfer bindings**: push acks must carry epoch/acked_offset and
+  acknowledge EXACTLY the sent window; pull serve responses require all
+  binding fields; pull init requires `version_id` (runtime + spec); pull
+  completion without `version_id` is an INVALID_REQUEST instead of a
+  KeyError.
+
 ### RC17 adversarial review fixes
 
 - **P1 stop retry semantics**: a transient `stop_sync` failure leaves the

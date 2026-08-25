@@ -595,6 +595,31 @@ class RemoteControl:
             self.store.db.execute("BEGIN IMMEDIATE")
             try:
                 applied = suppressed = 0
+                # Stale-batch rejection BEFORE any shadow write (rc18 review
+                # R2): a snapshot sync may have advanced the durable cursor
+                # while this batch was in flight; replaying its older changes
+                # used to overwrite fresher shadows permanently.
+                stored_now = self.store.get_feed_cursor(remote_id)
+                batch_end_seq = int(next_cursor.get("seq") or 0)
+                if (
+                    stored_now is not None
+                    and int(stored_now.get("state_epoch", -1)) == epoch
+                    and int(stored_now.get("feed_epoch", -1)) == int(result.get("feed_epoch") or 1)
+                    and int(stored_now.get("seq") or 0) >= batch_end_seq
+                    and batch_end_seq > 0
+                ):
+                    self.store.db.commit()
+                    return {
+                        "mode": "feed",
+                        "applied": 0,
+                        "suppressed": 0,
+                        "stale_batch_skipped": True,
+                        "changes": len(changes),
+                        "has_more": bool(result.get("has_more")),
+                        "cursor": dict(stored_now),
+                        "state_epoch": epoch,
+                        "feed_epoch": int(result.get("feed_epoch") or 1),
+                    }
                 for change in changes:
                     kind = change.get("kind")
                     job_id = str(change.get("job_id") or "")
