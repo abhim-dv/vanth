@@ -15,6 +15,9 @@ from vanth.remote.ssh import (
     generate_identity,
     is_unrestricted,
     parse_authorized_keys,
+    parse_target,
+    remote_wrapper_setup_script,
+    fetch_host_keys,
     require_binaries,
     resolve_target,
     run_ssh,
@@ -51,12 +54,51 @@ def test_allowlist_config_contains_hardened_directives():
     assert "ForwardX11 no" in cfg
     assert "RequestTTY no" in cfg
     assert "ProxyCommand none" in cfg
-    # Single-target dedicated file: Host * covers every invocation made with
-    # -F, so directives can never be skipped by targeting the raw hostname
-    # (review P0-1).
     assert "Host *" in cfg
     assert "IdentityFile /tmp/id" in cfg
     assert "IdentitiesOnly yes" in cfg
+
+
+@pytest.mark.parametrize("target, expected", [
+    ("alice@[2001:db8::1]:2200", {"user": "alice", "hostname": "2001:db8::1", "port": 2200}),
+    ("[::1]", {"user": None, "hostname": "::1", "port": None}),
+])
+def test_parse_target_ipv6_preserves_user_and_validates_port(target, expected):
+    assert parse_target(target) == expected
+    with pytest.raises(VanthRemoteError):
+        parse_target("alice@[2001:db8::1]:65536")
+
+
+def test_wrapper_setup_is_posix_and_does_not_embed_token(tmp_path):
+    script = remote_wrapper_setup_script(
+        '"http://127.0.0.1:1"', helper_command="/opt/vanth/helper",
+        remote_id="rmt_test", remote_home_expr="/tmp/vanth-user",
+    )
+    assert "VANTH_REMOTE_HELPER_TOKEN=$TOKEN" in script
+    assert "secret-token" not in script
+    assert script.count("REMOTE_HOME=/tmp/vanth-user") == 2
+    assert 'VANTH_DIR="$REMOTE_HOME"' in script
+    assert 'VANTH_DIR="$REMOTE_HOME/.vanth"' not in script
+    sh = __import__("shutil").which("sh")
+    if sh:
+        result = subprocess.run([sh, "-n"], input=script, text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr
+
+
+def test_keyscan_fallback_requires_explicit_tofu_consent(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(argv, *args, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("vanth.remote.ssh.subprocess.run", fake_run)
+    with pytest.raises(VanthRemoteError, match="explicit host-key approval"):
+        fetch_host_keys(
+            "example.com", 22, known_hosts_path=str(tmp_path / "known_hosts"),
+            fallback_config="Host *\n  HostName example.com\n", config_dir=tmp_path,
+        )
+    assert len(calls) == 1 and calls[0][0] == "ssh-keyscan"
 
 
 def test_authorized_keys_line_is_forced_command():

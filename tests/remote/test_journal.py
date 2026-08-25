@@ -52,6 +52,7 @@ def make_world(tmp_path, job_rows=None):
     remote_row = cstore.create_remote(target="user@host", state="paired")
 
     rstore = RemoteOperationStore(connect(tmp_path / "remote.sqlite"))
+    cstore.set_instance_id(remote_row["remote_id"], rstore.get_instance_id())
     # The remote-side jobs/events tables live in the SAME database as the
     # operation store (as on a real remote daemon).
     rstore.db.executescript(
@@ -95,6 +96,14 @@ def make_world(tmp_path, job_rows=None):
     return cstore, rstore, remote, control, remote_row, transport
 
 
+def submit_mutation(control, remote_id, payload, key):
+    return control.submit(
+        remote_id, "job.start", payload, idempotency_key=key,
+        expected_state_epoch=1,
+        expected_instance_id=control.store.get_remote(remote_id)["instance_id"],
+    )
+
+
 def make_journal(tmp_path) -> RequestJournal:
     return RequestJournal(tmp_path / "client-requests.sqlite")
 
@@ -110,7 +119,7 @@ def test_submit_journals_pending_and_completed_run_resolves(tmp_path):
     journal = make_journal(tmp_path)
     control = RemoteControl(cstore, transport=transport, home=tmp_path, journal=journal)
 
-    request = control.submit(rid, "job.start", {"command": "echo hi"}, idempotency_key="key-jr-0001")
+    request = submit_mutation(control, rid, {"command": "echo hi"}, "key-jr-0001")
     pending = journal.pending()
     assert len(pending) == 1
     assert pending[0]["request_id"] == request["request_id"]
@@ -132,7 +141,7 @@ def test_transport_failure_leaves_pending(tmp_path):
     control = RemoteControl(cstore, transport=transport, home=tmp_path, journal=journal)
 
     transport.fail = True
-    request = control.submit(rid, "job.start", {"command": "echo hi"}, idempotency_key="key-lost-jr1")
+    request = submit_mutation(control, rid, {"command": "echo hi"}, "key-lost-jr1")
     result = control.run_request(rid, request)
     assert result["status"] == "submitting"
     pending = journal.pending()
@@ -157,7 +166,7 @@ def test_failed_error_frame_resolves_entry(tmp_path):
         }).decode("utf-8").rstrip("\n"))
 
     transport.handler = bad_handler
-    request = control.submit(rid, "job.start", {"command": "echo hi"}, idempotency_key="key-err-jr1")
+    request = submit_mutation(control, rid, {"command": "echo hi"}, "key-err-jr1")
     result = control.run_request(rid, request)
     assert result["status"] == "failed"
     assert journal.pending() == []
@@ -189,7 +198,7 @@ def test_unique_remote_idempotency_key_enforced(tmp_path):
 def test_no_journal_keeps_existing_call_sites_working(tmp_path):
     cstore, rstore, remote, control, row, transport = make_world(tmp_path)
     rid = row["remote_id"]
-    request = control.submit(rid, "job.start", {"command": "echo hi"}, idempotency_key="key-nojr-001")
+    request = submit_mutation(control, rid, {"command": "echo hi"}, "key-nojr-001")
     result = control.run_request(rid, request)
     assert result["status"] == "completed"
 
@@ -206,7 +215,7 @@ def test_retry_reruns_original_request_with_original_key(tmp_path):
     journalled_control = RemoteControl(cstore, transport=transport, home=tmp_path, journal=journal)
 
     payload = {"command": "echo hi"}
-    first = journalled_control.submit(rid, "job.start", payload, idempotency_key="key-retry-001")
+    first = submit_mutation(journalled_control, rid, payload, "key-retry-001")
     transport.fail = True
     result = journalled_control.run_request(rid, first)
     assert result["status"] == "submitting"
@@ -215,7 +224,9 @@ def test_retry_reruns_original_request_with_original_key(tmp_path):
     # Retry path (as `vanth remote retry` does): re-submit with the ORIGINAL
     # key/payload — replay returns the SAME durable request — then run it.
     retried = control.submit(rid, first["method"], first["payload"],
-                             idempotency_key=first["idempotency_key"])
+                             idempotency_key=first["idempotency_key"],
+                             expected_state_epoch=first["expected_state_epoch"],
+                             expected_instance_id=first["expected_instance_id"])
     assert retried["request_id"] == first["request_id"]
     final = journalled_control.run_request(rid, retried)
     assert final["status"] == "completed"

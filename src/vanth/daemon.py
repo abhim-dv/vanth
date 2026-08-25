@@ -196,10 +196,20 @@ def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict
     control = get_remote_control()
     key = payload.pop("idempotency_key", None)
     if key is None:
-        key = "ctr-" + secrets.token_hex(16)[:12]
+        from .remote.protocol import VanthRemoteProtocolError
+        raise VanthRemoteProtocolError(
+            "INVALID_REQUEST", "remote mutations require caller-supplied idempotency_key"
+        )
     expected = _remote_epoch(remote_id)
+    remote_row = get_remote_store().get_remote(remote_id)
+    expected_instance = remote_row.get("instance_id")
+    if not expected_instance:
+        from .remote.protocol import VanthRemoteProtocolError
+        raise VanthRemoteProtocolError(
+            "INVALID_REQUEST", "remote is not paired with a verified instance identity"
+        )
     if method == "job.start":
-        request = control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected)
+        request = control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
         if request["status"] != "creating":
             return request
         return control.run_request(remote_id, request, expected_state_epoch=expected)
@@ -208,12 +218,12 @@ def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict
             remote_id, payload["job_id"],
             signal=payload.get("signal", "terminate"),
             kill_after_seconds=payload.get("kill_after_seconds", 10),
-            idempotency_key=key, expected_state_epoch=expected,
+            idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance,
         )
     if method == "job.rerun":
         overrides = {k: v for k, v in payload.items() if k != "job_id"}
-        return control.rerun(remote_id, payload["job_id"], overrides, idempotency_key=key, expected_state_epoch=expected)
-    return control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected)
+        return control.rerun(remote_id, payload["job_id"], overrides, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
+    return control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
 
 
 def _remote_wait(remote_id: str, remote_job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -233,17 +243,20 @@ def _remote_wait(remote_id: str, remote_job_id: str, payload: dict[str, Any]) ->
                 remote_id, remote_job_id,
                 idempotency_key="wait-" + secrets.token_hex(16)[:12],
                 expected_state_epoch=_remote_epoch(remote_id),
+                expected_instance_id=get_remote_store().get_remote(remote_id).get("instance_id"),
             )
         except Exception as exc:
-            # Hard failures must surface immediately, not masquerade as a
-            # transient empty poll and burn the whole hour (review P2-3).
             text = str(exc)
-            if any(marker in text for marker in (
-                "Unauthorized", "Unknown remote", "state epoch", "epoch",
-                "PROTOCOL_", "not paired", "recovery_required",
-            )):
-                return {"result": "error", "job_id": remote_job_id, "error": text}
-            result = {}
+            return {
+                "result": "error", "job_id": remote_job_id,
+                "error": {"code": getattr(exc, "code", "REMOTE_WAIT_ERROR"), "message": text},
+            }
+        if isinstance(result, dict) and (result.get("status") in {"failed", "lost"} or result.get("error")):
+            detail = result.get("error") or "remote status request failed"
+            return {
+                "result": "error", "job_id": remote_job_id,
+                "error": {"code": "REMOTE_STATUS_ERROR", "message": str(detail)},
+            }
         status = None
         if isinstance(result, dict):
             response = result.get("response") or {}
@@ -485,7 +498,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Loopback-only identity probe for the remote helper sentinel
                 # (review rc14 P0-1.4): proves daemon reachability and returns
                 # the live state_epoch for hello binding.
-                ok(self, {"state_epoch": _remote_job_manager().store.get_state_epoch()})
+                remote_store = _remote_job_manager().store
+                ok(self, {"state_epoch": remote_store.get_state_epoch(), "instance_id": remote_store.get_instance_id()})
             elif parsed.path == "/ready":
                 report = get_manager().doctor()
                 ok(self, report, 200 if report["ok"] else 503)
@@ -634,7 +648,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger"}
+                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "remote_id", "idempotency_key"}
                 if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)
@@ -642,10 +656,10 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/jobs":
                 remote_id = payload.pop("remote_id", None)
-                payload.pop("idempotency_key", None)
                 if remote_id:
                     ok(self, _remote_submit(remote_id, "job.start", _remote_payload(payload)))
                 else:
+                    payload.pop("idempotency_key", None)
                     ok(self, asyncio.run(get_manager().start(**payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/rerun"):
                 remote_id = payload.pop("remote_id", None)
@@ -685,6 +699,8 @@ class Handler(BaseHTTPRequestHandler):
                     allow_root=bool(payload.get("allow_root", False)),
                     accept_host_key=bool(payload.get("accept_host_key", False)),
                     host_fingerprint=payload.get("host_fingerprint"),
+                    helper_command=payload.get("helper_command"),
+                    remote_home=payload.get("remote_home"),
                     store=get_remote_store(),
                 ))
             elif parsed.path == "/remotes/remove":
@@ -694,7 +710,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/remote/identity":
                 # Loopback-only identity probe used by the remote helper's
                 # sentinel hello (review rc14 P0-1.4).
-                ok(self, {"state_epoch": _remote_job_manager().store.get_state_epoch()})
+                remote_store = _remote_job_manager().store
+                ok(self, {"state_epoch": remote_store.get_state_epoch(), "instance_id": remote_store.get_instance_id()})
             elif parsed.path == "/remote/helper":
                 frame = payload.get("frame", payload)
                 remote = _remote_job_manager()
@@ -800,7 +817,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_artifact_storage_profiles().probe(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/artifacts/storage-profiles/") and parsed.path.endswith("/update"):
                 ok(self, get_artifact_storage_profiles().update(
-                    parsed.path.split("/")[2], payload.get("config") or {}))
+                    parsed.path.split("/")[2], payload.get("config") or {},
+                    idempotency_key=payload.get("idempotency_key")))
             elif parsed.path == "/artifacts/push-remote":
                 ok(self, get_artifact_broker().push_blob(
                     payload["remote_id"], payload["version_id"],

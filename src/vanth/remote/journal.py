@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS client_requests (
   digest TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   expected_state_epoch INTEGER,
+  expected_instance_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(remote_id, idempotency_key)
@@ -65,6 +66,8 @@ class RequestJournal:
         existing = {row[1] for row in self.db.execute("PRAGMA table_info(client_requests)").fetchall()}
         if "expected_state_epoch" not in existing:
             self.db.execute("ALTER TABLE client_requests ADD COLUMN expected_state_epoch INTEGER")
+        if "expected_instance_id" not in existing:
+            self.db.execute("ALTER TABLE client_requests ADD COLUMN expected_instance_id TEXT")
 
     # -- writes (called by RemoteControl; failures must never break requests) --
 
@@ -72,19 +75,20 @@ class RequestJournal:
         """Journal one durable request as pending (idempotent on replay)."""
         stamp = now_iso()
         epoch = request.get("expected_state_epoch")
+        instance_id = request.get("expected_instance_id")
         with self._lock:
             self.db.execute(
                 """
                 INSERT INTO client_requests(request_id, remote_id, idempotency_key, method,
-                  payload_json, digest, status, expected_state_epoch, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                  payload_json, digest, status, expected_state_epoch, expected_instance_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                 ON CONFLICT(request_id) DO NOTHING
                 """,
                 (
                     request["request_id"], request["remote_id"], request["idempotency_key"],
                     request["method"],
                     json.dumps(request.get("payload"), separators=(",", ":")),
-                    request["digest"], epoch, stamp, stamp,
+                    request["digest"], epoch, instance_id, stamp, stamp,
                 ),
             )
             self.db.commit()

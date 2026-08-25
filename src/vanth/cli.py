@@ -716,6 +716,8 @@ def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         request = control.submit(
             entry["remote_id"], entry["method"], entry["payload"] or {},
             idempotency_key=entry["idempotency_key"],
+            expected_state_epoch=entry.get("expected_state_epoch"),
+            expected_instance_id=entry.get("expected_instance_id"),
         )
         result = control.run_request(entry["remote_id"], request)
         if json_out:
@@ -737,6 +739,16 @@ def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
             i = args.index("--name")
             if i + 1 < len(args):
                 name = args[i + 1]
+        helper_command = None
+        if "--helper-command" in args:
+            i = args.index("--helper-command")
+            if i + 1 < len(args):
+                helper_command = args[i + 1]
+        remote_home = None
+        if "--remote-home" in args:
+            i = args.index("--remote-home")
+            if i + 1 < len(args):
+                remote_home = args[i + 1]
         targets = [a for a in args if not a.startswith("--")]
         if not targets:
             print("vanth remote pair: missing target (user@host[:port])", file=sys.stderr)
@@ -748,6 +760,8 @@ def cmd_remote(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                 "target": target, "name": name, "allow_root": allow_root,
                 "accept_host_key": accept_host_key,
                 "host_fingerprint": host_fingerprint,
+                "helper_command": helper_command,
+                "remote_home": remote_home,
             })
         except Exception as exc:
             print(f"vanth remote pair: failed to reach daemon: {exc}", file=sys.stderr)

@@ -58,6 +58,17 @@ def test_update_inserts_new_revision_and_old_stays_queryable(profiles):
     assert profiles.get(created["profile_id"])["config"] == {"bucket": "new-bucket"}
 
 
+def test_update_idempotency_replays_and_rejects_digest_mismatch(profiles):
+    created = profiles.create("s3", {"bucket": "old-bucket"})
+    first = profiles.update(created["profile_id"], {"bucket": "new-bucket"}, idempotency_key="sp-update-001")
+    replay = profiles.update(created["profile_id"], {"bucket": "new-bucket"}, idempotency_key="sp-update-001")
+    assert replay["replayed"] is True
+    assert replay["revision"] == first["revision"] == 2
+    with pytest.raises(ValueError, match="PROTOCOL_REPLAY_MISMATCH"):
+        profiles.update(created["profile_id"], {"bucket": "other-bucket"}, idempotency_key="sp-update-001")
+    assert [r["revision"] for r in profiles.revisions(created["profile_id"])] == [1, 2]
+
+
 def test_profile_rows_are_never_updated_in_place_on_config_change(profiles):
     created = profiles.create("s3", {"bucket": "one"})
     stamp = created["created_at"]

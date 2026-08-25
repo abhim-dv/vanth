@@ -4,40 +4,75 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Sol review fixes (second re-review)
+
+- **P0**: replayed mutations keep the epoch binding SQLite stored — the
+  controller no longer overwrites `expected_state_epoch` in memory, so a
+  retry can never silently rebind while the durable row and journal keep the
+  original.
+- **P1 materialization ordering**: the fail-closed parent sweep now runs
+  BEFORE any `mkdir` — file materialization, directory materialization, and
+  pull staging never create directories through a symlink/reparse ancestor
+  that the sweep is about to reject.
+- **P1 stop semantics**: a failed stop records the op as FAILED (replays its
+  failure durably) instead of completed; successful terminal stops emit
+  full terminal UPSERTS (name/command/status/exit_code) instead of
+  tombstones, so controller shadows learn the final status.
+- **P1 wrapper isolation**: every pairing installs its OWN
+  `remote-wrapper-<remote_id>.sh`; multiple remotes no longer overwrite or
+  delete each other's forced-command target; literal remote-home paths with
+  spaces are shell-quoted inside the forced command.
+- **P1 snapshot feed boundary**: snapshot pages carry the feed boundary
+  (`MAX(remote_feed.seq)` + feed_epoch) captured at page 1; the controller
+  fail-fasts on missing/drifting boundaries and advances its stored feed
+  cursor to that boundary at finalize — stale feed events can no longer
+  regress fresher snapshot state.
+- **P1 macOS support restored**: atomic publication falls back to
+  hardlink-based no-replace publish for files (checked rename otherwise)
+  outside Linux's renameat2; directory staging uses plain paths with a
+  dev/inode cross-check of the opened parent where `/proc/self/fd` does not
+  exist.
+- **P2 transfer binding**: response frames must echo request_id+method;
+  init/chunk/completion results must name the transfer, stay in range, and
+  agree on epoch/content identity before bytes are adopted.
+- **P2 restore temp names**: prepared restore databases include a random
+  suffix so concurrent restores in one process cannot collide.
+
 ### Re-review fixes (remote-artifacts-rc14-rereview.md)
 
-- **P0-1 pairing**: `ssh-keyscan` failure now falls back to a real OpenSSH
-  accept-new connection against the dedicated known-hosts file (Ubuntu
-  hybrid-KEX servers no longer break pinning); fingerprinting preserves the
-  real key type; the install script takes the key blob explicitly and uses
-  awk END semantics (unrestricted-duplicate detection actually fires);
-  pairing installs a restricted wrapper binding
-  VANTH_REMOTE_HELPER_URL/TOKEN from the REMOTE user's own daemon.json/token,
-  and the sentinel hello must carry a live state_epoch fetched from the
-  remote daemon (`/remote/identity` route added) — a bare protocol string is
-  a false positive and fails.
-- **P0-2 snapshots**: every page carries a fixed rowid high-water boundary;
-  the controller fail-fasts on any malformed/lost page or boundary change —
-  failed syncs suppress nothing and advance nothing.
-- **P1-1 concurrency**: the whole request handler and dispatcher iterations
-  run under one store lock; a 30-thread concurrent-start stress test passes
-  deterministically.
-- **P1-2 durable fencing**: mutations REQUIRE an epoch (auto-bound from the
-  stored remote); expected epoch persisted with requests + journal; replay
-  re-binds the stored epoch; response id/method matching is mandatory.
+- **P0-1 pairing**: host-key fallback writes and uses a real OpenSSH config
+  and cannot authenticate unless the caller explicitly selected TOFU;
+  fingerprinting preserves the real key type. The forced-command wrapper is
+  a syntax-checked literal POSIX script, reads daemon URL/token only at exec
+  time, honors an explicitly configured Vanth home and helper path, and is
+  removed during compensation/removal. Sentinel hello is bound to the paired
+  remote ID plus authenticated daemon instance ID and state epoch.
+- **P0-2 snapshots**: the remote materializes one immutable job/event view and
+  serves every page from it. The controller verifies snapshot ID, epoch and
+  high-water, stages every page, then publishes/reconciles in one transaction;
+  failed or expired syncs leave shadows, epoch and cursor unchanged.
+- **P1-1 concurrency**: remote and controller multi-statement transactions run
+  under their store locks; 30-thread remote-start and controller-submit stress
+  tests pass deterministically.
+- **P1-2 durable fencing**: mutations require both expected epoch and stable
+  daemon instance ID. Both are persisted with requests and journal retries;
+  replay requires the original binding and never rebinds it. Response
+  request-ID/method matching is mandatory.
 - **P1-3 caller keys preserved** through HTTP → payload → submit.
 - **P1-4 stop intents recoverable + trigger validation**: accepted stops are
   reconciled by the dispatcher after crashes; malformed/unknown triggers
   cancel instead of launching; already-terminal stop is an idempotent no-op
   (fixes the reproducible full-suite red).
-- **P1-5**: journal connection is thread-safe; production DefaultConfig wires
+- **P1-5/P1-6**: journal connection is thread-safe; queued, terminal, stop and
+  tombstone feed records commit with their state transitions; production DefaultConfig wires
   RemoteDBPath so monitor shadow merging works without manual config.
 - **P1-7 put_dir fence encloses catalog commit** (GC can no longer delete
   blobs between publish and version commit).
-- **P1-10 transfers**: pull staging retained for resume; old-epoch transfers
-  refused at init; pull completion validates epoch/sha/bytes; push epoch
-  fence moved BEFORE publication; manifest-digest binding covers v0+v1;
-  same-digest cross-root lookups scoped by root name.
+- **P1-10 transfers**: pull staging is retained and re-hashed for resume;
+  missing/truncated staging resets to zero. Completion requires and validates
+  epoch, bytes, whole-content SHA, root, manifest and exact version ID. Push
+  publication checks the epoch inside the catalog commit; same-digest versions
+  cannot substitute across roots.
 - **P1-10b controller ledger**: `controller_transfers` no longer
   global-unique-keys idempotency (transfer ids bind context); existing
   databases are migrated automatically; takeover verifies the ledger row
@@ -46,10 +81,12 @@ All notable changes to Vanth are documented here.
   shared caller keys across destinations cannot collide.
 - **P2-5**: transfer protocol tests use direct `pytest.raises` again (the
   NameError-swallowing helper is gone).
-- P2: structured remote-wait errors; IPv6 bracket targets; dir-version dedup
-  verifies all blobs; lease renewal in dir publication; collection append
-  returns persisted timestamp; StorageProfiles.update exposed as guarded
-  route+tool.
+- P2: descriptor-bound/no-follow log reads; recovery-marked catalog restore;
+  atomic POSIX no-replace artifact publication; structured remote-wait errors;
+  IPv6 bracket targets; dir-version dedup verifies/repairs all blobs; leases
+  renew during long artifact loops; collection append returns its persisted
+  timestamp; StorageProfiles.update has durable idempotency and is exposed as
+  a guarded route/tool.
 
 ### Earlier rc14 items (monitor wiring, sweeps, transfer binding)
 
@@ -57,10 +94,10 @@ All notable changes to Vanth are documented here.
   `Config.RemoteDBPath` makes `Refresh` merge current-timeline shadow
   projections into the job list (failures are non-fatal warnings), with an
   end-to-end refresh test proving `job_live` arrives flagged as a remote.
-- **P1-11**: materialization sweeps every existing ancestor of the
-  destination fail-closed (any metadata error is fatal; symlink/reparse
-  parents abort) for BOTH file and directory roots, revalidating immediately
-  before bytes move. Full openat-level TOCTOU immunity remains future work.
+- **P1-11**: materialization rejects symlink/reparse ancestors on every
+  platform. POSIX final publication additionally traverses parents with
+  descriptor-relative `O_NOFOLLOW` opens and uses atomic no-replace rename;
+  directory publication can no longer replace a raced-in empty directory.
 - **P2-5 transfer completion binding**: push completion validates the
   published version against the registered identity on sha256, total_bytes,
   manifest digest, AND root name, and re-checks the epoch immediately before

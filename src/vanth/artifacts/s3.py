@@ -48,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from .catalog import Catalog, new_id, now_iso
+from ..remote.protocol import IDEMPOTENCY_KEY_RE, request_digest
 
 __all__ = [
     "ProviderError",
@@ -740,6 +741,11 @@ class StorageProfiles:
             );
             CREATE INDEX IF NOT EXISTS idx_cap_obs_profile
               ON capability_observations(profile_id, revision, observed_at);
+            CREATE TABLE IF NOT EXISTS storage_profile_updates (
+              idempotency_key TEXT PRIMARY KEY,
+              request_digest TEXT NOT NULL,
+              result_json TEXT NOT NULL
+            );
             """
         )
         self.catalog.db.commit()
@@ -832,17 +838,36 @@ class StorageProfiles:
                 raise
         return self.get(profile_id)
 
-    def update(self, profile_id: str, config: dict[str, Any]) -> dict[str, Any]:
+    def update(self, profile_id: str, config: dict[str, Any], *, idempotency_key: str | None = None) -> dict[str, Any]:
         """Insert the NEXT immutable revision; old revisions stay queryable."""
         from .catalog import is_recovery_required
 
         if is_recovery_required(self.catalog.db):
             raise ValueError("recovery_required: complete restore first")
         config = config or {}
+        if idempotency_key is not None and not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+            raise ValueError("idempotency_key must be 8..128 chars in [A-Za-z0-9_-]")
+        digest = request_digest(
+            "artifact.storage_profile_update",
+            {"profile_id": profile_id, "config": config},
+            idempotency_key,
+        ) if idempotency_key else None
         db = self.catalog.db
         with self.catalog.lock:
             db.execute("BEGIN IMMEDIATE")
             try:
+                if idempotency_key:
+                    prior = db.execute(
+                        "SELECT request_digest, result_json FROM storage_profile_updates WHERE idempotency_key=?",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if prior:
+                        if prior["request_digest"] != digest:
+                            raise ValueError(
+                                "PROTOCOL_REPLAY_MISMATCH: idempotency key was reused with a different request"
+                            )
+                        db.commit()
+                        return {**json.loads(prior["result_json"]), "replayed": True}
                 row = db.execute(
                     "SELECT kind FROM storage_profiles WHERE profile_id=? "
                     "ORDER BY revision DESC LIMIT 1",
@@ -857,6 +882,7 @@ class StorageProfiles:
                     "SELECT COALESCE(MAX(revision), 0) + 1 FROM storage_profiles WHERE profile_id=?",
                     (profile_id,),
                 ).fetchone()[0]
+                stamp = now_iso()
                 db.execute(
                     """
                     INSERT INTO storage_profiles(profile_id, revision, kind, config_json,
@@ -868,9 +894,22 @@ class StorageProfiles:
                         int(next_rev),
                         kind,
                         json.dumps(config, separators=(",", ":"), sort_keys=True),
-                        now_iso(),
+                         stamp,
                     ),
                 )
+                result = {
+                    "profile_id": profile_id,
+                    "revision": int(next_rev),
+                    "kind": kind,
+                    "config": config,
+                    "capabilities": {},
+                    "created_at": stamp,
+                }
+                if idempotency_key:
+                    db.execute(
+                        "INSERT INTO storage_profile_updates(idempotency_key, request_digest, result_json) VALUES (?, ?, ?)",
+                        (idempotency_key, digest, json.dumps(result, separators=(",", ":"))),
+                    )
                 db.commit()
             except BaseException:
                 db.rollback()

@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS remotes (
   target TEXT NOT NULL,
   state TEXT NOT NULL,
   state_epoch INTEGER NOT NULL DEFAULT 1,
+  instance_id TEXT,
   controller_id TEXT,
   credential_state TEXT,
   pairing_state TEXT,
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS remote_requests (
   digest TEXT NOT NULL,
   status TEXT NOT NULL,
   expected_state_epoch INTEGER,
+  expected_instance_id TEXT,
   response_json TEXT,
   error_json TEXT,
   created_at TEXT NOT NULL,
@@ -132,9 +134,10 @@ CREATE TABLE IF NOT EXISTS remote_replay_tombstones (
 );
 CREATE TABLE IF NOT EXISTS remote_state (
   id INTEGER PRIMARY KEY CHECK (id=1),
-  state_epoch INTEGER NOT NULL DEFAULT 1
+  state_epoch INTEGER NOT NULL DEFAULT 1,
+  instance_id TEXT NOT NULL
 );
-INSERT OR IGNORE INTO remote_state(id, state_epoch) VALUES (1, 1);
+INSERT OR IGNORE INTO remote_state(id, state_epoch, instance_id) VALUES (1, 1, '');
 """
 
 
@@ -153,9 +156,11 @@ class RemoteStore:
         """Add columns introduced after the initial DDL to existing databases."""
         for table, column, definition in (
             ("remotes", "snapshot_cursor_json", "TEXT"),
+            ("remotes", "instance_id", "TEXT"),
             ("remotes", "installed_authorization", "TEXT"),
             ("remotes", "feed_cursor_json", "TEXT"),
             ("remote_requests", "expected_state_epoch", "INTEGER"),
+            ("remote_requests", "expected_instance_id", "TEXT"),
             ("remote_shadows", "state_epoch", "INTEGER NOT NULL DEFAULT 1"),
             ("remote_shadows", "suppressed_at", "TEXT"),
             ("remote_shadows", "superseded_at", "TEXT"),
@@ -163,7 +168,6 @@ class RemoteStore:
             existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in existing:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
     # ------------------------------------------------------------------
     # Remotes
     # ------------------------------------------------------------------
@@ -175,6 +179,7 @@ class RemoteStore:
         target: str,
         state: str = "unpaired",
         state_epoch: int = 1,
+        instance_id: str | None = None,
         controller_id: str | None = None,
         credential_state: str | None = None,
         pairing_state: str = "idle",
@@ -188,12 +193,12 @@ class RemoteStore:
         stamp = now_iso()
         self.db.execute(
             """
-            INSERT INTO remotes(remote_id, name, target, state, state_epoch, controller_id,
+            INSERT INTO remotes(remote_id, name, target, state, state_epoch, instance_id, controller_id,
               credential_state, pairing_state, key_path, known_hosts_path, installed_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                remote_id, name, target, state, state_epoch, controller_id,
+                remote_id, name, target, state, state_epoch, instance_id, controller_id,
                 credential_state, pairing_state, key_path, known_hosts_path, installed_at, stamp, stamp,
             ),
         )
@@ -260,6 +265,18 @@ class RemoteStore:
         self.db.commit()
         return self.get_remote(remote_id)
 
+    def set_instance_id(self, remote_id: str, instance_id: str) -> dict[str, Any]:
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            raise ValueError("instance_id must be a non-empty string")
+        changed = self.db.execute(
+            "UPDATE remotes SET instance_id=?, updated_at=? WHERE remote_id=?",
+            (instance_id, now_iso(), remote_id),
+        ).rowcount
+        if not changed:
+            raise ValueError(f"Unknown remote_id: {remote_id}")
+        self.db.commit()
+        return self.get_remote(remote_id)
+
     @staticmethod
     def _remote_dict(row) -> dict[str, Any]:
         return dict(row)
@@ -277,6 +294,7 @@ class RemoteStore:
         payload: dict[str, Any],
         digest: str,
         expected_state_epoch: int | None = None,
+        expected_instance_id: str | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         if not self.db.execute("SELECT remote_id FROM remotes WHERE remote_id=?", (remote_id,)).fetchone():
@@ -305,14 +323,14 @@ class RemoteStore:
             self.db.execute(
                 """
                 INSERT INTO remote_requests(request_id, remote_id, idempotency_key, method, payload_json,
-                  digest, status, expected_state_epoch, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?)
+                  digest, status, expected_state_epoch, expected_instance_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'creating', ?, ?, ?, ?)
                 """,
                 (
                     request_id, remote_id, idempotency_key, method,
                     json.dumps(payload, separators=(",", ":")), digest,
                     int(expected_state_epoch) if expected_state_epoch is not None else None,
-                    stamp, stamp,
+                    expected_instance_id, stamp, stamp,
                 ),
             )
             result = self._request_dict(self.db.execute(
@@ -650,12 +668,19 @@ class RemoteOperationStore:
         """Add columns introduced after the initial DDL to existing databases."""
         for table, column, definition in (
             ("remote_state", "feed_epoch", "INTEGER NOT NULL DEFAULT 1"),
+            ("remote_state", "instance_id", "TEXT"),
             ("remote_operations", "result_json", "TEXT"),
             ("remote_operations", "error", "TEXT"),
         ):
             existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in existing:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        row = self.db.execute("SELECT instance_id FROM remote_state WHERE id=1").fetchone()
+        if row is not None and not row[0]:
+            self.db.execute(
+                "UPDATE remote_state SET instance_id=? WHERE id=1",
+                ("vri_" + secrets.token_hex(16),),
+            )
 
     def record_operation(
         self, *, idempotency_key: str, method: str, payload: dict[str, Any], digest: str,
@@ -805,6 +830,12 @@ class RemoteOperationStore:
         """The remote's own state epoch (bumped when its database is restored)."""
         row = self.db.execute("SELECT state_epoch FROM remote_state WHERE id=1").fetchone()
         return int(row["state_epoch"]) if row else 1
+
+    def get_instance_id(self) -> str:
+        row = self.db.execute("SELECT instance_id FROM remote_state WHERE id=1").fetchone()
+        if not row or not row["instance_id"]:
+            raise ValueError("remote instance identity is not initialized")
+        return str(row["instance_id"])
 
     def set_state_epoch(self, epoch: int) -> None:
         """Set the remote's state epoch (a database restore).

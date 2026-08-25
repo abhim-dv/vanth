@@ -27,6 +27,16 @@
     "agent": { "type": "string" },
     "remote_id": { "type": "string", "pattern": "^rmt_[0-9a-f]{32}$" },
     "state_epoch": { "type": "integer", "minimum": 1 },
+    "feed_epoch": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Feed generation on snapshot frames; lets controllers build a consistent resume cursor."
+    },
+    "feed_boundary_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "MAX(remote_feed.seq) captured with the snapshot; feed events at or below it are already reflected by the snapshot and must be skipped."
+    },
     "request_id": { "type": "string", "pattern": "^req_[0-9a-f]{32}$" },
     "idempotency_key": {
       "type": "string",

@@ -277,6 +277,22 @@ class TransferRegistry:
                 # rc14 P1-10).
                 if int(existing["state_epoch"]) != epoch:
                     raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
+                # A crash can leave the ledger ahead of a lost staging file.
+                # Reset the acknowledged prefix so the controller safely
+                # retransmits from zero instead of skipping missing bytes.
+                if direction == "push":
+                    staged_existing = Path(existing["staging_path"])
+                    if not staged_existing.is_file() or staged_existing.stat().st_size < int(existing["acked_offset"]):
+                        staged_existing.parent.mkdir(parents=True, exist_ok=True)
+                        with staged_existing.open("wb"):
+                            pass
+                        self.db.execute(
+                            "UPDATE remote_transfers SET acked_offset=0, updated_at=? WHERE transfer_id=?",
+                            (now, transfer_id),
+                        )
+                        existing = self.db.execute(
+                            "SELECT * FROM remote_transfers WHERE transfer_id=?", (transfer_id,)
+                        ).fetchone()
                 result = {
                     "transfer_id": transfer_id,
                     "direction": direction,
@@ -447,6 +463,11 @@ class TransferRegistry:
         current_epoch = int(self._epoch_fn())
         if current_epoch != int(row["state_epoch"]):
             raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
+        for field in ("root_name", "manifest_digest", "sha256"):
+            if str(payload.get(field)) != str(row[field]):
+                raise VanthRemoteProtocolError("INVALID_REQUEST", f"completion {field} does not match transfer")
+        if int(payload.get("total_bytes")) != int(row["total_bytes"]):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "completion total_bytes does not match transfer")
         staged = Path(row["staging_path"])
         if not staged.is_file():
             raise VanthRemoteProtocolError("INVALID_REQUEST", "staged content is missing")
@@ -468,12 +489,15 @@ class TransferRegistry:
                 f"whole-content sha256 mismatch: expected {row['sha256']}, remote hashed {actual_sha}",
             )
         if row["direction"] == "pull":
+            version_id = str(payload["version_id"])
             vrow = self.ops().catalog.db.execute(
-                "SELECT version_id FROM versions WHERE manifest_digest=?", (row["manifest_digest"],)
+                "SELECT v.version_id FROM versions v JOIN roots r ON r.root_id=v.root_id "
+                "WHERE v.version_id=? AND v.manifest_digest=? AND r.name=?",
+                (version_id, row["manifest_digest"], row["root_name"]),
             ).fetchone()
             if not vrow:
                 raise VanthRemoteProtocolError(
-                    "INVALID_REQUEST", f"no published remote version for digest {row['manifest_digest']}"
+                    "INVALID_REQUEST", "requested remote version/root/manifest binding changed"
                 )
             return {
                 "transfer_id": transfer_id,
@@ -494,9 +518,15 @@ class TransferRegistry:
         if now_epoch != current_epoch or now_epoch != int(row["state_epoch"]):
             raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
         data = staged.read_bytes()
-        result = self.ops().put_file(
-            row["root_name"], data=data, idempotency_key="xfer-" + transfer_id
-        )
+        try:
+            result = self.ops().put_file(
+                row["root_name"], data=data, idempotency_key="xfer-" + transfer_id,
+                publish_guard=lambda: int(self._epoch_fn()) == current_epoch,
+            )
+        except ValueError as exc:
+            if "publication fence changed" in str(exc):
+                raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE) from None
+            raise
         # Full binding at the fenced commit (review P2-5): the published
         # version must match the REGISTERED identity on every immutable
         # field — sha, size, manifest digest, root name — not just the sha.
@@ -526,6 +556,8 @@ class TransferRegistry:
             raise VanthRemoteProtocolError(
                 "INVALID_REQUEST", "published version binding mismatch: " + ", ".join(mismatches)
             )
+        if int(self._epoch_fn()) != current_epoch:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", EPOCH_STOP_MESSAGE)
         # The staged file is intentionally retained: a replayed completion
         # (crash after publish, before the controller's ack) must be able to
         # re-verify and collapse onto the same version. Reclaiming staging
@@ -670,13 +702,19 @@ class RemoteArtifactBroker:
                     self._mark_failed(transfer_id, record["op_claim_token"], message)
                     raise TransferAborted(message)
                 result = resp["result"]
+                # Strict binding (Sol review): the ack must name THIS
+                # transfer and cover exactly the bytes we sent.
+                if str(result.get("transfer_id") or "") != transfer_id:
+                    self._mark_failed(transfer_id, record["op_claim_token"],
+                                      "chunk ack does not bind to this transfer")
+                    raise TransferAborted("chunk ack does not bind to this transfer")
                 new_epoch = int(result.get("state_epoch", epoch))
                 if new_epoch != epoch:
                     self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
                     raise TransferAborted(EPOCH_STOP_MESSAGE)
                 acked = int(result["acked_offset"])
-                if acked <= offset:
-                    raise TransferInterrupted(transfer_id, offset, "remote ack did not advance")
+                if acked <= offset or acked > total:
+                    raise TransferInterrupted(transfer_id, offset, "remote ack out of range")
                 offset = acked
                 sent_this_attempt += 1
                 self._persist_progress(transfer_id, record["op_claim_token"], acked_offset=offset)
@@ -686,7 +724,8 @@ class RemoteArtifactBroker:
             raise TransferInterrupted(transfer_id, offset)
 
         complete_frame = self._frame("artifact.transfer_complete", {
-            "transfer_id": transfer_id, "sha256": sha256,
+            "transfer_id": transfer_id, "root_name": root_name,
+            "manifest_digest": mdigest, "total_bytes": total, "sha256": sha256,
         })
         resp = self._exchange(session, complete_frame)
         outcome = self._classify(resp, epoch, transfer_id)
@@ -695,7 +734,17 @@ class RemoteArtifactBroker:
             raise TransferAborted(EPOCH_STOP_MESSAGE)
         if resp.get("kind") != "response":
             raise TransferInterrupted(transfer_id, offset, str(resp.get("message") or "completion failed"))
-        remote_version_id = resp["result"]["version_id"]
+        cresp = resp["result"]
+        # Strict binding (Sol review): completion must answer THIS transfer
+        # with the SAME content identity and epoch we registered.
+        if str(cresp.get("transfer_id") or "") != transfer_id:
+            raise TransferInterrupted(transfer_id, offset, "completion response does not bind to this transfer")
+        if int(cresp.get("state_epoch", epoch)) != epoch:
+            self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
+            raise TransferAborted(EPOCH_STOP_MESSAGE)
+        if str(cresp.get("sha256")) != sha256 or int(cresp.get("total_bytes", total)) != total:
+            raise TransferInterrupted(transfer_id, offset, "completion response content identity mismatch")
+        remote_version_id = cresp["version_id"]
 
         # Source stability at the END: the content-addressed source blob must
         # be byte-for-byte unchanged after the transfer too.
@@ -760,7 +809,12 @@ class RemoteArtifactBroker:
                                manifest_digest=mdigest, total_bytes=total, sha256=sha256)
 
         staging = dest.parent / f".{dest.name}.pulling-{transfer_id[:12]}"
+        # Verify the ancestor chain BEFORE creating/writing anything through
+        # it (Sol review): pull staging must not travel through a
+        # symlink/reparse-point parent.
+        self.ops._verify_dest_parents(dest)
         staging.parent.mkdir(parents=True, exist_ok=True)
+        self.ops._verify_dest_parents(dest)
         try:
             with open(staging, "a+b") as out:
                 out.truncate(offset)
@@ -787,6 +841,17 @@ class RemoteArtifactBroker:
                     if resp.get("kind") != "response":
                         raise TransferInterrupted(transfer_id, offset, str(resp.get("message")))
                     result = resp["result"]
+                    # Strict binding (Sol review): the served window must
+                    # name THIS transfer, start at the offset we asked for,
+                    # and stay in range.
+                    if str(result.get("transfer_id") or "") != transfer_id:
+                        self._mark_failed(transfer_id, record["op_claim_token"],
+                                          "pull chunk does not bind to this transfer")
+                        raise TransferAborted("pull chunk does not bind to this transfer")
+                    if int(result.get("offset", offset)) != offset:
+                        self._mark_failed(transfer_id, record["op_claim_token"],
+                                          "pull chunk served a different offset than requested")
+                        raise TransferAborted("pull chunk served a different offset than requested")
                     new_epoch = int(result.get("state_epoch", epoch))
                     if new_epoch != epoch:
                         self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
@@ -802,7 +867,10 @@ class RemoteArtifactBroker:
                     # Pull chunks are replayable: advance locally by the
                     # served window; the remote's durable offset does not
                     # move on serve (review P1-14).
-                    offset = int(result.get("served_to", offset + len(data)))
+                    served_to = int(result.get("served_to", offset + len(data)))
+                    if served_to < offset or served_to > total or served_to != offset + len(data):
+                        raise TransferInterrupted(transfer_id, offset, "served window out of range")
+                    offset = served_to
                     self._persist_progress(transfer_id, record["op_claim_token"], acked_offset=offset)
             if offset != total or received_hash.hexdigest() != sha256:
                 raise TransferInterrupted(transfer_id, offset, "pull did not assemble the full content")
@@ -818,7 +886,9 @@ class RemoteArtifactBroker:
                     pass
 
         complete_frame = self._frame("artifact.transfer_complete", {
-            "transfer_id": transfer_id, "sha256": sha256,
+            "transfer_id": transfer_id, "root_name": root_name,
+            "manifest_digest": mdigest, "total_bytes": total, "sha256": sha256,
+            "version_id": remote_version_id,
         })
         resp = self._exchange(session, complete_frame)
         if resp.get("kind") != "response":
@@ -827,6 +897,9 @@ class RemoteArtifactBroker:
         # answer must agree on epoch, SHA, and byte count before local
         # publication. Drift means the source changed mid-transfer.
         cresult = resp.get("result") or {}
+        # Strict binding (Sol review): completion must answer THIS transfer.
+        if str(cresult.get("transfer_id") or "") != transfer_id:
+            raise TransferInterrupted(transfer_id, offset, "completion response does not bind to this transfer")
         if int(cresult.get("state_epoch", epoch)) != epoch:
             self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
             raise TransferAborted(EPOCH_STOP_MESSAGE)
@@ -884,6 +957,13 @@ class RemoteArtifactBroker:
                 self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
                 raise TransferAborted(EPOCH_STOP_MESSAGE)
             raise TransferInterrupted(transfer_id, int(record["acked_offset"]), message)
+        # Strict result binding (Sol review): the init answer must name THIS
+        # transfer and carry an epoch.
+        rresult = resp["result"]
+        if str(rresult.get("transfer_id") or "") != transfer_id:
+            self._mark_aborted(transfer_id, record["op_claim_token"],
+                               "transfer_init response does not bind to this transfer")
+            raise TransferAborted("transfer_init response does not bind to this transfer")
         if record["state_epoch"] is not None and int(resp["result"]["state_epoch"]) != int(record["state_epoch"]):
             self._mark_aborted(transfer_id, record["op_claim_token"], EPOCH_STOP_MESSAGE)
             raise TransferAborted(EPOCH_STOP_MESSAGE)
@@ -908,7 +988,17 @@ class RemoteArtifactBroker:
         line = session.exchange(encode_frame(frame))
         if not line:
             raise ConnectionError("transport returned no response frame")
-        return decode_frame(line)
+        resp = decode_frame(line)
+        # Strict response binding (Sol review): a response-kind frame MUST
+        # echo the request_id and method of the frame that produced it.
+        # Error frames keep their classify-first handling but are bound too
+        # when they carry the fields.
+        if resp.get("request_id") is not None or resp.get("method") is not None:
+            if resp.get("request_id") != frame.get("request_id") or resp.get("method") != frame.get("method"):
+                raise ConnectionError(
+                    "response does not bind to its request (request_id/method mismatch)"
+                )
+        return resp
 
     @staticmethod
     def _classify(resp: dict[str, Any], known_epoch: int, transfer_id: str) -> str:

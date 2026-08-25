@@ -55,6 +55,9 @@ def make_world(tmp_path, job_rows=None):
     remote_row = cstore.create_remote(target="user@host", state="paired")
 
     rstore = RemoteOperationStore(connect(tmp_path / "remote.sqlite"))
+    rstore.db.execute("UPDATE remote_state SET instance_id='test-instance' WHERE id=1")
+    rstore.db.commit()
+    cstore.set_instance_id(remote_row["remote_id"], "test-instance")
     # The remote-side jobs/events tables live in the SAME database as the
     # operation store (as on a real remote daemon).
     rstore.db.executescript(
@@ -102,6 +105,7 @@ def request_frame(method="job.start", payload=None, key="key-feed-0001"):
         "version": "1", "kind": "request", "request_id": "req_" + "0" * 32,
         "idempotency_key": key, "method": method, "payload": payload,
         "digest": request_digest(method, payload, key),
+        "expected_state_epoch": 1, "expected_instance_id": "test-instance",
         "sent_at": "2026-08-20T12:00:00Z",
     }
 
@@ -271,7 +275,8 @@ def test_job_feed_validates_via_protocol():
 def test_feed_sync_applies_upserts_and_tombstones_and_advances_cursor(tmp_path):
     cstore, rstore, remote, control, row, jobs_db = make_world(tmp_path)
     rid = row["remote_id"]
-    request = control.submit(rid, "job.start", {"command": "echo hi"}, idempotency_key="key-fs-00001")
+    request = control.submit(rid, "job.start", {"command": "echo hi"}, idempotency_key="key-fs-00001",
+                             expected_state_epoch=1, expected_instance_id="test-instance")
     completed = control.run_request(rid, request)
     assert completed["status"] == "completed"
     job_id = completed["response"]["job_id"]

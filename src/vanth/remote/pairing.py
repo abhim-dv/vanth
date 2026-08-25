@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 from pathlib import Path
@@ -83,6 +84,12 @@ def validate_hello_response(line: str | bytes | None) -> dict[str, Any]:
             "sentinel handshake failed: hello is not bound to a reachable remote daemon "
             "(missing state_epoch)"
         )
+    instance_id = frame.get("instance_id")
+    if not isinstance(instance_id, str) or not instance_id.strip():
+        raise ssh.VanthRemoteError(
+            "sentinel handshake failed: hello is not bound to an authenticated remote instance "
+            "(missing instance_id)"
+        )
     return frame
 
 
@@ -90,12 +97,14 @@ class DefaultTransport:
     """Real transport bound to OpenSSH binaries. Injectable for tests."""
 
     def fetch_host_keys(self, hostname: str, port: int | None, *, known_hosts_path: str | None = None,
-                        fallback_config: str | None = None, config_dir: Any = None) -> list[str]:
+                        fallback_config: str | None = None, config_dir: Any = None,
+                        allow_fallback_auth: bool = False) -> list[str]:
         return ssh.fetch_host_keys(
             hostname, port,
             known_hosts_path=known_hosts_path,
             fallback_config=fallback_config,
             config_dir=config_dir,
+            allow_fallback_auth=allow_fallback_auth,
         )
 
     def host_key_fingerprints(self, known_hosts_lines: list[str]) -> list[str]:
@@ -129,13 +138,18 @@ class DefaultTransport:
 
     def remove_authorized_key(self, *, remove_script: str, bootstrap_config: str, config_dir: Path,
                               target_argv: list[str], timeout: float = 60.0) -> None:
-        ssh.run_ssh(
+        result = ssh.run_ssh(
             [*target_argv, "sh", "-s"],
             config_dir=config_dir,
             config=bootstrap_config,
             timeout=timeout,
             stdin=remove_script.encode("utf-8"),
         )
+        if result.returncode != 0:
+            raise ssh.VanthRemoteError(
+                f"remote authorization cleanup failed (exit {result.returncode}): "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()[:300]}"
+            )
 
     def sentinel_probe(self, *, config: str, config_dir: Path, target_argv: list[str],
                        timeout: float = 30.0) -> dict[str, Any]:
@@ -161,10 +175,15 @@ def _remote_dir(home: Path, remote_id: str) -> Path:
 
 def _target_argv(target_info: dict[str, Any]) -> list[str]:
     argv: list[str] = []
+    hostname = target_info["hostname"]
+    # OpenSSH requires bracketed literals when an IPv6 address is supplied in
+    # the target operand (the port remains the separate -p argument).
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
     if target_info["user"]:
-        argv.append(f"{target_info['user']}@{target_info['hostname']}")
+        argv.append(f"{target_info['user']}@{hostname}")
     else:
-        argv.append(target_info["hostname"])
+        argv.append(hostname)
     if target_info["port"] and target_info["port"] != 22:
         argv = ["-p", str(target_info["port"]), *argv]
     # Port must also be encoded in known_hosts entries ([host]:port form).
@@ -182,6 +201,7 @@ def pair_remote(
     store: RemoteStore | None = None,
     transport: Any | None = None,
     helper_command: str | None = None,
+    remote_home: str | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
     """Pair a remote host. Returns the remote row; raises on hard errors."""
@@ -216,6 +236,11 @@ def pair_remote(
             known_hosts_path=str(known_hosts_path),
             fallback_config=bootstrap_probe_config,
             config_dir=remote_dir,
+            # A keyscan fallback must never authenticate merely because a
+            # fingerprint was supplied: without keyscan output there is no
+            # fingerprint to verify. Only explicit TOFU consent authorizes the
+            # accept-new authenticated probe.
+            allow_fallback_auth=bool(accept_host_key),
         )
         fingerprints = transport.host_key_fingerprints(host_keys)
         if host_fingerprint:
@@ -258,14 +283,24 @@ def pair_remote(
         # made the sentinel a false positive (review rc14 P0-1.4).
         url_expr = ('sed -n \'s/.*"url"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' '
                     '"$HOME/.vanth/daemon.json" 2>/dev/null | head -1')
-        wrapper_script = ssh.remote_wrapper_setup_script(url_expr)
+        remote_home_expr = shlex.quote(remote_home) if remote_home else '${HOME:-}/.vanth'
+        wrapper_script = ssh.remote_wrapper_setup_script(
+            url_expr, helper_command=helper, remote_id=remote_id,
+            remote_home_expr=remote_home_expr,
+        )
         transport.install_authorized_key(
             install_script=wrapper_script,
             bootstrap_config=bootstrap_config,
             config_dir=remote_dir,
             target_argv=argv,
         )
-        wrapper_command = "$HOME/.vanth/remote-wrapper.sh"
+        wrapper_name = ssh._wrapper_filename(remote_id)
+        if remote_home:
+            # Literal remote home: quote for the shell so paths containing
+            # spaces survive inside the forced command (Sol review).
+            wrapper_command = shlex.quote(f"{remote_home.rstrip('/')}/{wrapper_name}")
+        else:
+            wrapper_command = f"$HOME/.vanth/{wrapper_name}"
         installed_line = ssh.authorized_keys_line(
             public_key_blob, "", marker_comment=marker, forced_command=wrapper_command
         )
@@ -273,7 +308,7 @@ def pair_remote(
             install_script=ssh.authorized_keys_install_script(
                 installed_line, marker,
                 key_blob=public_key_blob,
-                wrapper_command="$HOME/.vanth/remote-wrapper.sh",
+                wrapper_command=wrapper_command,
             ),
             bootstrap_config=bootstrap_config,
             config_dir=remote_dir,
@@ -286,7 +321,33 @@ def pair_remote(
         store.db.commit()
 
         # --- 4. Sentinel hello over the DEDICATED identity ------------------
-        transport.sentinel_probe(config=dedicated_config, config_dir=remote_dir, target_argv=argv)
+        hello = transport.sentinel_probe(config=dedicated_config, config_dir=remote_dir, target_argv=argv)
+        if not isinstance(hello, dict):
+            raise ssh.VanthRemoteError("sentinel handshake failed: helper returned no identity")
+        instance_id = hello.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id.strip():
+            raise ssh.VanthRemoteError("sentinel handshake failed: missing authenticated instance_id")
+        hello_remote_id = hello.get("remote_id")
+        if hello_remote_id != remote_id:
+            raise ssh.VanthRemoteError(
+                "sentinel handshake failed: authenticated remote_id does not match paired remote"
+            )
+        state_epoch = hello.get("state_epoch")
+        if isinstance(state_epoch, bool) or not isinstance(state_epoch, int) or state_epoch < 1:
+            raise ssh.VanthRemoteError("sentinel handshake failed: missing authenticated state_epoch")
+        setter = getattr(store, "set_instance_id", None)
+        if callable(setter):
+            setter(remote_id, instance_id)
+        else:
+            columns = {row[1] for row in store.db.execute("PRAGMA table_info(remotes)").fetchall()}
+            if "instance_id" not in columns:
+                store.db.execute("ALTER TABLE remotes ADD COLUMN instance_id TEXT")
+            store.db.execute(
+                "UPDATE remotes SET instance_id=?, state_epoch=?, updated_at=? WHERE remote_id=?",
+                (instance_id, state_epoch, now_iso(), remote_id),
+            )
+            store.db.commit()
+        store.set_state_epoch(remote_id, state_epoch)
 
         store.update_remote_state(remote_id, "paired")
         row = store.get_remote(remote_id)
@@ -298,24 +359,38 @@ def pair_remote(
             "known_hosts_path": str(known_hosts_path),
             "host_key_fingerprints": fingerprints,
             "installed_authorization": installed_line,
+            "instance_id": instance_id,
+            "state_epoch": state_epoch,
         }
     except ssh.VanthRemoteError:
-        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv)
+        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv, remote_home=remote_home)
         raise
     except Exception as exc:
-        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv)
+        _compensate(store, transport, remote_id, remote_dir, marker, installed_line, bootstrap_config, argv, remote_home=remote_home)
         raise ssh.VanthRemoteError(f"pairing failed: {exc}") from exc
 
 
 def _compensate(store: RemoteStore, transport: Any, remote_id: str, remote_dir: Path,
                 marker: str, installed_line: str | None,
-                bootstrap_config: str | None, argv: list[str] | None) -> None:
+                bootstrap_config: str | None, argv: list[str] | None,
+                *, remote_home: str | None = None) -> None:
     """Mark error + remove ONLY our exact authorization + local cleanup."""
     try:
         store.update_remote_state(remote_id, "error")
     except Exception:
         pass
     if installed_line and bootstrap_config and argv:
+        try:
+            transport.remove_authorized_key(
+                remove_script=ssh.remote_wrapper_remove_script(
+                    remote_home_expr=shlex.quote(remote_home) if remote_home else '${HOME:-}/.vanth'
+                ),
+                bootstrap_config=bootstrap_config,
+                config_dir=remote_dir,
+                target_argv=argv,
+            )
+        except Exception:
+            pass
         try:
             transport.remove_authorized_key(
                 remove_script=ssh.authorized_keys_remove_script(installed_line, marker),
@@ -391,6 +466,30 @@ def remove_remote(
                 identity_file=str(remote_dir / "id_ed25519"),
                 known_hosts=str(remote_dir / "known_hosts"),
                 include_identity=False,
+            )
+            forced = (ssh.parse_authorized_keys(installed).get("command") or "").strip('"')
+            # The forced command may be single-quote-wrapped (spaces) — strip
+            # that too before extracting the wrapper home (Sol review).
+            if len(forced) >= 2 and forced.startswith("'") and forced.endswith("'"):
+                forced = forced[1:-1]
+            suffix = "/remote-wrapper.sh"
+            per_remote_suffix = None
+            if remote_id:
+                per_remote_suffix = "/" + ssh._wrapper_filename(remote_id)
+            if per_remote_suffix and forced.endswith(per_remote_suffix) and not forced.startswith("$"):
+                wrapper_home = forced[:-len(per_remote_suffix)]
+            elif forced.endswith(suffix) and not forced.startswith("$"):
+                wrapper_home = forced[:-len(suffix)]  # legacy shared name
+            else:
+                wrapper_home = None
+            transport.remove_authorized_key(
+                remove_script=ssh.remote_wrapper_remove_script(
+                    remote_home_expr=shlex.quote(wrapper_home) if wrapper_home else '${HOME:-}/.vanth',
+                    remote_id=remote_id,
+                ),
+                bootstrap_config=bootstrap,
+                config_dir=remote_dir,
+                target_argv=_target_argv(target_info),
             )
             transport.remove_authorized_key(
                 remove_script=ssh.authorized_keys_remove_script(installed, marker),

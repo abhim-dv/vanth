@@ -50,14 +50,37 @@ def test_empty_stdin_sentinel_probe_returns_zero():
     assert frames == []
 
 
-def test_hello_responds_with_hello():
-    code, frames = _run_helper([json.dumps(_hello_frame())])
+def test_hello_responds_with_authenticated_identity(monkeypatch):
+    class FakeResponse:
+        def read(self):
+            return json.dumps({"state_epoch": 3, "instance_id": "inst_test"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=None: FakeResponse())
+    code, frames = _run_helper([json.dumps(_hello_frame())], env={
+        "VANTH_REMOTE_HELPER_URL": "http://127.0.0.1:8765",
+        "VANTH_REMOTE_HELPER_TOKEN": "tok",
+    })
     assert code == 0
     assert len(frames) == 1
     frame = frames[0]
     assert frame["kind"] == "hello"
     assert frame["protocol"] == "vanth.remote"
     assert frame["version"] == "1"
+    assert frame["instance_id"] == "inst_test"
+    assert frame["state_epoch"] == 3
+
+
+def test_hello_fails_closed_without_authenticated_daemon():
+    code, frames = _run_helper([json.dumps(_hello_frame())])
+    assert code == 0
+    assert frames and frames[0]["kind"] == "error"
+    assert frames[0]["code"] == "AUTH_FAILED"
 
 
 def test_request_forwards_to_loopback_daemon(monkeypatch):

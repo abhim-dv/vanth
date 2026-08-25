@@ -158,12 +158,20 @@ def parse_target(target: str) -> dict[str, Any]:
             raise VanthRemoteError(f"invalid IPv6 literal in target: {target!r}") from None
         if suffix and not suffix.startswith(":"):
             raise VanthRemoteError(f"malformed text after IPv6 literal: {target!r}")
-        if pre and "@" in pre:
-            user = pre.rstrip("@")
+        user = None
+        if pre:
+            if not pre.endswith("@"):
+                raise VanthRemoteError(f"malformed user/host separator in target: {target!r}")
+            user = pre[:-1]
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9._-]*", user):
                 raise VanthRemoteError(f"invalid user in target: {target!r}")
-        return {"user": None, "hostname": host_part,
-                "port": int(suffix[1:]) if suffix.startswith(":") else None}
+        port = None
+        if suffix.startswith(":"):
+            port_text = suffix[1:]
+            if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
+                raise VanthRemoteError(f"port out of range: {target!r}")
+            port = int(port_text)
+        return {"user": user, "hostname": host_part, "port": port}
     if any(ord(ch) < 0x20 or ch in "\"'`$\\;|&<>!{}[]()#~*= " for ch in target):
         raise VanthRemoteError(f"target contains forbidden characters: {target!r}")
     match = _TARGET_RE.match(target)
@@ -188,6 +196,7 @@ def fetch_host_keys(
     known_hosts_path: str | None = None,
     fallback_config: str | None = None,
     config_dir: str | os.PathLike[str] | None = None,
+    allow_fallback_auth: bool = False,
 ) -> list[str]:
     """Fetch the host's public keys (TOFU material).
 
@@ -210,11 +219,20 @@ def fetch_host_keys(
     if lines:
         return lines
     if known_hosts_path and fallback_config and config_dir:
+        if not allow_fallback_auth:
+            raise VanthRemoteError(
+                f"host keyscan returned no host keys for {hostname}:{port or 22}; "
+                "refusing an authenticated fallback before explicit host-key approval"
+            )
+        # ``fallback_config`` is config *text*, not a directory.  Materialize
+        # it as a dedicated file before invoking ssh; passing the remote
+        # directory to ``-F`` silently makes OpenSSH ignore the allowlist.
+        config_path = _write_config(fallback_config, Path(config_dir) / "hostkey-probe")
         connect_args: list[str] = []
         if port and port != 22:
             connect_args += ["-p", str(port)]
         probe = subprocess.run(
-            ["ssh", "-F", str(config_dir), *connect_args, "-o", "StrictHostKeyChecking=accept-new",
+            ["ssh", "-F", str(config_path), *connect_args, "-o", "StrictHostKeyChecking=accept-new",
              "-o", "ConnectTimeout=%d" % int(max(1, timeout)), hostname, "true"],
             capture_output=True, text=True, timeout=timeout + 10,
         )
@@ -314,7 +332,23 @@ def authorized_keys_install_script(
     ]) + "\n"
 
 
-def remote_wrapper_setup_script(daemon_url_expr: str) -> str:
+def _wrapper_filename(remote_id: str | None) -> str:
+    """Per-remote wrapper filename (Sol review): a single shared
+    ``remote-wrapper.sh`` let multiple remotes overwrite/delete each other's
+    forced command target. Only filesystem-safe characters survive."""
+    if not remote_id:
+        return "remote-wrapper.sh"
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]", "_", str(remote_id))[:80]
+    return f"remote-wrapper-{sanitized}.sh"
+
+
+def remote_wrapper_setup_script(
+    daemon_url_expr: str,
+    *,
+    helper_command: str = "vanth-remote-helper",
+    remote_id: str | None = None,
+    remote_home_expr: str = '${HOME:-}/.vanth',
+) -> str:
     """POSIX shell snippet creating the restricted helper wrapper ON THE
     REMOTE (review rc14 P0-1.4).
 
@@ -323,19 +357,39 @@ def remote_wrapper_setup_script(daemon_url_expr: str) -> str:
     real daemon connectivity instead of passing on an unconfigured host. The
     token never travels from the controller — it is read remotely from the
     user's own $HOME/.vanth/token by their own shell."""
+    import shlex
+
+    if not helper_command or any(ch in helper_command for ch in "\r\n"):
+        raise ValueError("helper_command must be a non-empty single-line command")
+    helper_literal = shlex.quote(helper_command)
+    identity_line = (
+        f"VANTH_REMOTE_HELPER_REMOTE_ID={shlex.quote(remote_id)}; export VANTH_REMOTE_HELPER_REMOTE_ID"
+        if remote_id else "unset VANTH_REMOTE_HELPER_REMOTE_ID"
+    )
+    wrapper_name = _wrapper_filename(remote_id)
+    # The generated wrapper is a literal POSIX script. Sensitive values are
+    # read only when sshd executes the forced command, never embedded here.
     return "\n".join([
         "set -eu",
-        'mkdir -p "$HOME/.vanth"',
-        'URL=' + daemon_url_expr,
+        f"REMOTE_HOME={remote_home_expr}",
+        '[ -n "$REMOTE_HOME" ] || { echo "NO_REMOTE_HOME" >&2; exit 50; }',
+        'VANTH_DIR="$REMOTE_HOME"',
+        'mkdir -p "$VANTH_DIR"',
+        f'WRAPPER="$VANTH_DIR/{wrapper_name}"',
+        "cat > \"$WRAPPER\" <<'VANTH_WRAPPER'",
+        '#!/bin/sh',
+        'set -eu',
+        f'REMOTE_HOME={remote_home_expr}',
+        '[ -n "$REMOTE_HOME" ] || { echo "NO_REMOTE_HOME" >&2; exit 50; }',
+        'VANTH_DIR="$REMOTE_HOME"',
+        'URL=$(sed -n \'s/.*"url"[[:space:]]*:[[:space:]]*"\\([^"\\]*\\)".*/\\1/p\' "$VANTH_DIR/daemon.json" 2>/dev/null | head -1)',
         '[ -n "$URL" ] || { echo "NO_DAEMON_URL" >&2; exit 51; }',
-        '[ -f "$HOME/.vanth/token" ] || { echo "NO_REMOTE_TOKEN" >&2; exit 52; }',
-        'WRAPPER="$HOME/.vanth/remote-wrapper.sh"',
-        '{',
-        '  printf "#!/bin/sh\\n"',
-        '  printf "exec env VANTH_REMOTE_HELPER_URL=%q VANTH_REMOTE_HELPER_TOKEN=$(cat \\"$HOME/.vanth/token\\") vanth-remote-helper\\" "$URL" 2>/dev/null || {',
-        '    printf "exec env VANTH_REMOTE_HELPER_URL=\\"%s\\" VANTH_REMOTE_HELPER_TOKEN=\\"$(cat \\"$HOME/.vanth/token\\")\\" vanth-remote-helper\\n" "$URL"',
-        '  }',
-        '} > "$WRAPPER"',
+        '[ -r "$VANTH_DIR/token" ] || { echo "NO_REMOTE_TOKEN" >&2; exit 52; }',
+        'TOKEN=$(cat "$VANTH_DIR/token")',
+        '[ -n "$TOKEN" ] || { echo "NO_REMOTE_TOKEN" >&2; exit 52; }',
+        identity_line,
+        f'exec env "VANTH_REMOTE_HELPER_URL=$URL" "VANTH_REMOTE_HELPER_TOKEN=$TOKEN" {helper_literal} "$@"',
+        'VANTH_WRAPPER',
         'chmod 700 "$WRAPPER"',
         "echo 'WRAPPER_INSTALLED'",
     ]) + "\n"
@@ -355,6 +409,21 @@ def authorized_keys_remove_script(public_key_line: str, marker_comment: str) -> 
         f"mv \"$TMP\" \"$AK\"\n"
         "echo 'REMOVED'\n"
     )
+
+
+def remote_wrapper_remove_script(*, remote_home_expr: str = '${HOME:-}/.vanth',
+                                 remote_id: str | None = None) -> str:
+    """Remove only the Vanth wrapper created by ``remote_wrapper_setup_script``
+    for THIS remote (per-remote filename; Sol review)."""
+    wrapper_name = _wrapper_filename(remote_id)
+    return "\n".join([
+        "set -eu",
+        f"REMOTE_HOME={remote_home_expr}",
+        '[ -n "$REMOTE_HOME" ] || { echo "NO_REMOTE_HOME" >&2; exit 50; }',
+        f'WRAPPER="$REMOTE_HOME/{wrapper_name}"',
+        'if [ -f "$WRAPPER" ]; then rm -f "$WRAPPER"; fi',
+        "echo 'WRAPPER_REMOVED'",
+    ]) + "\n"
 
 
 def generate_identity(directory: Path, *, comment: str | None = None) -> dict[str, str]:

@@ -80,6 +80,23 @@ def test_put_file_new_key_same_content_deduplicates_version_and_blob(home):
     assert len([p for p in blobs_dir.rglob("*") if p.is_file()]) == 1
 
 
+def test_put_dir_dedup_repairs_when_one_referenced_blob_is_missing(home, tmp_path):
+    ops = make_ops(home)
+    source = tmp_path / "tree"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"a")
+    first = ops.put_dir(source, "tree", idempotency_key="dir-dedup-001")
+    manifest = json.loads(ops.catalog.db.execute(
+        "SELECT manifest_json FROM versions WHERE version_id=?", (first["version_id"],)
+    ).fetchone()[0])
+    blob = ops.blobs.blob_path(next(e["sha256"] for e in manifest["entries"] if e["kind"] == "file"))
+    blob.unlink()
+    second = ops.put_dir(source, "tree", idempotency_key="dir-dedup-002")
+    assert second["version_id"] == first["version_id"]
+    assert second["deduplicated"] is True
+    assert blob.is_file()
+
+
 def test_put_file_different_content_new_version_advances_latest(home):
     ops = make_ops(home)
     v1 = ops.put_file("c.bin", data=b"one", idempotency_key="multi-key-0001")
@@ -246,6 +263,23 @@ def test_materialize_atomic_and_refuses_existing_dest(home, tmp_path):
     again = ops.materialize(result["version_id"], dest, overwrite=True, idempotency_key="mat-write-003")
     assert again["overwritten"] is True
     assert dest.read_bytes() == data
+
+
+def test_materialize_refuses_symlink_destination(home, tmp_path):
+    if not hasattr(Path, "symlink_to"):
+        pytest.skip("symlinks unavailable")
+    ops = make_ops(home)
+    result = ops.put_file("link.bin", data=b"safe", idempotency_key="mat-link-001")
+    real = tmp_path / "real.bin"
+    real.write_bytes(b"keep")
+    link = tmp_path / "link.bin"
+    try:
+        link.symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ValueError, match="symlink"):
+        ops.materialize(result["version_id"], link, overwrite=True, idempotency_key="mat-link-002")
+    assert real.read_bytes() == b"keep"
 
 
 def test_verify_detects_tampered_blob_as_result(home):

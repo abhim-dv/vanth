@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 import re
 import shutil
 import sqlite3
@@ -393,19 +394,25 @@ class Lifecycle:
         home = Path(home) if home is not None else self.catalog.home
         from .migrations import ARTIFACTS_LATEST_SCHEMA_VERSION, migrate_artifacts
 
-        # --- validate into a temp database; the live db is untouched yet ----
-        tmp_db = home / "backups" / f"restore-validate-{os.getpid()}.sqlite"
-        tmp_db.parent.mkdir(parents=True, exist_ok=True)
-        if tmp_db.exists():
-            tmp_db.unlink()
-        shutil.copyfile(source_path, tmp_db)
+        # Prepare the complete replacement before touching the live catalog.
+        # The recovery marker and rotated identity live in this copy too.  If
+        # SQLite backup is interrupted after any page is copied, the target
+        # can therefore never briefly contain an unlocked restored catalog.
+        # PID alone collides when two restores run concurrently in ONE
+        # process (threads) — add a random suffix (Sol review P2).
+        prepared = home / "backups" / (
+            f"restore-prepared-{os.getpid()}-{uuid.uuid4().hex[:12]}.sqlite"
+        )
+        prepared.parent.mkdir(parents=True, exist_ok=True)
+        prepared.unlink(missing_ok=True)
+        shutil.copyfile(source_path, prepared)
         try:
-            probe = sqlite3.connect(tmp_db)
+            probe = sqlite3.connect(prepared)
             try:
                 check = probe.execute("PRAGMA integrity_check").fetchone()[0]
                 if check != "ok":
                     raise ValueError(f"backup failed integrity_check: {check}")
-                version = int(procedure_version := probe.execute("PRAGMA user_version").fetchone()[0])
+                version = int(probe.execute("PRAGMA user_version").fetchone()[0])
                 if version > ARTIFACTS_LATEST_SCHEMA_VERSION:
                     raise ValueError(
                         f"backup schema v{version} is newer than this binary supports "
@@ -413,52 +420,47 @@ class Lifecycle:
                     )
             finally:
                 probe.close()
-            trial = sqlite3.connect(tmp_db)
+            prepared_db = sqlite3.connect(prepared)
             try:
-                migrate_artifacts(trial, home)
-                trial.execute("SELECT 1 FROM catalog LIMIT 1").fetchone()
-            finally:
-                trial.close()
-        finally:
-            tmp_db.unlink(missing_ok=True)
+                prepared_db.row_factory = sqlite3.Row
+                migrate_artifacts(prepared_db, home)
+                prepared_db.execute("SELECT 1 FROM catalog LIMIT 1").fetchone()
+                from .catalog import set_recovery_required
 
-        # --- pre-lockout BEFORE any content moves --------------------------
-        db = self.catalog.db
-        with self.catalog.lock:
-            from .catalog import set_recovery_required
-
-            set_recovery_required(db, True)
-            db.commit()
-
-        with self.catalog.lock:
-            db.commit()
-            source = sqlite3.connect(source_path)
-            try:
-                source.backup(db)
-            finally:
-                source.close()
-            migrate_artifacts(db, home)
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                instance_id = new_id("cit")
-                db.execute(
-                    "UPDATE catalog SET instance_id=?, state_epoch=state_epoch+1, updated_at=?"
-                    " WHERE id=(SELECT id FROM catalog LIMIT 1)",
-                    (instance_id, now_iso()),
+                prepared_db.execute("BEGIN IMMEDIATE")
+                prepared_db.execute(
+                    "UPDATE catalog SET instance_id=?, state_epoch=state_epoch+1, updated_at=? "
+                    "WHERE id=(SELECT id FROM catalog LIMIT 1)",
+                    (new_id("cit"), now_iso()),
                 )
+                set_recovery_required(prepared_db, True)
+                prepared_db.commit()
+            finally:
+                prepared_db.close()
+
+            # --- pre-lockout BEFORE any content moves ----------------------
+            db = self.catalog.db
+            with self.catalog.lock:
+                from .catalog import set_recovery_required
+
                 set_recovery_required(db, True)
                 db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-            row = db.execute("SELECT * FROM catalog LIMIT 1").fetchone()
-            return {
-                "restored_from": str(source_path),
-                "catalog_id": row["id"],
-                "instance_id": row["instance_id"],
-                "state_epoch": int(row["state_epoch"]),
-                "recovery_required": True,
-            }
+                prepared_conn = sqlite3.connect(prepared)
+                try:
+                    prepared_conn.backup(db)
+                finally:
+                    prepared_conn.close()
+                db.commit()
+                row = db.execute("SELECT * FROM catalog LIMIT 1").fetchone()
+                return {
+                    "restored_from": str(source_path),
+                    "catalog_id": row["id"],
+                    "instance_id": row["instance_id"],
+                    "state_epoch": int(row["state_epoch"]),
+                    "recovery_required": True,
+                }
+        finally:
+            prepared.unlink(missing_ok=True)
 
     def complete_restore(self) -> dict[str, Any]:
         """Clear the recovery marker and re-bind the blob store ownership.

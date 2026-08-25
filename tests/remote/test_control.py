@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from vanth.remote.control import RemoteControl
+from vanth.remote.control import DefaultSessionTransport, RemoteControl
 from vanth.remote.protocol import VanthRemoteProtocolError, encode_frame, request_digest
 from vanth.remote.store import RemoteStore
 
@@ -70,8 +72,15 @@ class _FakeSession:
 
 def make_store(tmp_path):
     store = RemoteStore(connect(tmp_path / "ctrl.sqlite"))
-    remote = store.create_remote(target="user@host")
+    remote = store.create_remote(target="user@host", instance_id="test-instance")
     return store, remote["remote_id"]
+
+
+def submit(control, remote_id, method, payload, key):
+    return control.submit(
+        remote_id, method, payload, idempotency_key=key,
+        expected_state_epoch=1, expected_instance_id="test-instance",
+    )
 
 
 def response_frame(request_id, method, result):
@@ -104,7 +113,7 @@ def status_response(job_id, status="running"):
 def test_submit_creates_request_and_shadow_in_one_transaction(tmp_path):
     store, remote_id = make_store(tmp_path)
     control = RemoteControl(store, transport=FakeTransport())
-    request = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-submit-01")
+    request = submit(control, remote_id, "job.start", start_payload(), "key-submit-01")
     assert request["status"] == "creating"
     assert request["request_id"].startswith("req_")
     rows = store.db.execute("SELECT COUNT(*) FROM remote_requests").fetchone()[0]
@@ -114,11 +123,38 @@ def test_submit_creates_request_and_shadow_in_one_transaction(tmp_path):
     assert shadows[0]["status"] == "submitting"
 
 
+def test_default_transport_builds_real_ssh_session(tmp_path):
+    store, remote_id = make_store(tmp_path)
+    remote = store.get_remote(remote_id)
+    session = DefaultSessionTransport().open_session(remote, home=tmp_path)
+    assert session.remote_row["_argv"] == ["user@host"]
+
+
+def test_concurrent_controller_submits_share_one_connection_safely(tmp_path):
+    db = sqlite3.connect(tmp_path / "ctrl-shared.sqlite", check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=30000")
+    store = RemoteStore(db)
+    remote_id = store.create_remote(target="user@host", instance_id="test-instance")["remote_id"]
+    control = RemoteControl(store, transport=FakeTransport())
+    gate = threading.Barrier(30)
+
+    def create(index):
+        gate.wait(timeout=10)
+        return submit(control, remote_id, "job.start", start_payload(), f"key-controller-{index:04d}")
+
+    with ThreadPoolExecutor(max_workers=30) as pool:
+        rows = list(pool.map(create, range(30)))
+    assert len({row["request_id"] for row in rows}) == 30
+    assert store.db.execute("SELECT COUNT(*) FROM remote_requests").fetchone()[0] == 30
+
+
 def test_submit_replay_same_key_same_payload(tmp_path):
     store, remote_id = make_store(tmp_path)
     control = RemoteControl(store, transport=FakeTransport())
-    first = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-replay-01")
-    second = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-replay-01")
+    first = submit(control, remote_id, "job.start", start_payload(), "key-replay-01")
+    second = submit(control, remote_id, "job.start", start_payload(), "key-replay-01")
     assert first["request_id"] == second["request_id"]
     assert store.db.execute("SELECT COUNT(*) FROM remote_requests").fetchone()[0] == 1
     assert store.db.execute("SELECT COUNT(*) FROM remote_shadows").fetchone()[0] == 1
@@ -127,9 +163,9 @@ def test_submit_replay_same_key_same_payload(tmp_path):
 def test_submit_replay_same_key_different_payload_rejected(tmp_path):
     store, remote_id = make_store(tmp_path)
     control = RemoteControl(store, transport=FakeTransport())
-    control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-mismatch-01")
+    submit(control, remote_id, "job.start", start_payload(), "key-mismatch-01")
     with pytest.raises(VanthRemoteProtocolError) as exc:
-        control.submit(remote_id, "job.start", {"command": "echo DIFFERENT"}, idempotency_key="key-mismatch-01")
+        submit(control, remote_id, "job.start", {"command": "echo DIFFERENT"}, "key-mismatch-01")
     assert exc.value.code == "PROTOCOL_REPLAY_MISMATCH"
     assert store.db.execute("SELECT COUNT(*) FROM remote_requests").fetchone()[0] == 1
 
@@ -151,7 +187,7 @@ def test_run_request_response_frame_completes(tmp_path):
     store, remote_id = make_store(tmp_path)
     transport = FakeTransport(response=response_frame("req_x", "job.start", {"job_id": "job_x", "status": "running"}))
     control = RemoteControl(store, transport=transport)
-    request = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-run-0001")
+    request = submit(control, remote_id, "job.start", start_payload(), "key-run-0001")
     result = control.run_request(remote_id, request)
     assert result["status"] == "completed"
     assert result["response"] == {"job_id": "job_x", "status": "running"}
@@ -166,7 +202,7 @@ def test_run_request_error_frame_fails(tmp_path):
     store, remote_id = make_store(tmp_path)
     transport = FakeTransport(error=error_frame("req_x", "job.start", code="INVALID_REQUEST", message="bad payload"))
     control = RemoteControl(store, transport=transport)
-    request = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-error-01")
+    request = submit(control, remote_id, "job.start", start_payload(), "key-error-01")
     result = control.run_request(remote_id, request)
     assert result["status"] == "failed"
     assert result["error"] and "INVALID_REQUEST" in result["error"]
@@ -176,12 +212,12 @@ def test_run_request_error_frame_fails(tmp_path):
 def test_run_request_transport_failure_lost_and_replay_no_second_job(tmp_path):
     store, remote_id = make_store(tmp_path)
     control = RemoteControl(store, transport=FakeTransport(fail=True))
-    first = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-lost-01")
+    first = submit(control, remote_id, "job.start", start_payload(), "key-lost-01")
     result = control.run_request(remote_id, first)
     assert result["status"] == "submitting"
     replay = control.replay(remote_id, "key-lost-01")
     assert replay["request_id"] == first["request_id"]
-    again = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-lost-01")
+    again = submit(control, remote_id, "job.start", start_payload(), "key-lost-01")
     assert again["request_id"] == first["request_id"]
     assert store.db.execute("SELECT COUNT(*) FROM remote_requests").fetchone()[0] == 1
 
@@ -199,7 +235,7 @@ def test_state_epoch_mismatch_refused(tmp_path):
 
     with pytest.raises(VanthRemoteError, match="state_epoch"):
         control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-epoch-01",
-                       expected_state_epoch=5)
+                       expected_state_epoch=5, expected_instance_id="test-instance")
     assert store.db.execute("SELECT COUNT(*) FROM remote_requests").fetchone()[0] == 0
 
 
@@ -208,7 +244,7 @@ def test_state_epoch_match_allowed(tmp_path):
     control = RemoteControl(store, transport=FakeTransport())
     store.set_state_epoch(remote_id, 3)
     request = control.submit(remote_id, "job.start", start_payload(), idempotency_key="key-epoch-02",
-                             expected_state_epoch=3)
+                             expected_state_epoch=3, expected_instance_id="test-instance")
     assert request["request_id"].startswith("req_")
 
 
@@ -230,7 +266,8 @@ def test_stop_builds_job_stop_method(tmp_path):
     store, remote_id = make_store(tmp_path)
     transport = FakeTransport(response=response_frame("req_x", "job.stop", {"job_id": "job_remote_1", "status": "cancelled"}))
     control = RemoteControl(store, transport=transport)
-    result = control.stop(remote_id, "job_remote_1", idempotency_key="key-stop-001")
+    result = control.stop(remote_id, "job_remote_1", idempotency_key="key-stop-001",
+                          expected_state_epoch=1, expected_instance_id="test-instance")
     assert result["response"] == {"job_id": "job_remote_1", "status": "cancelled"}
     frame_line = transport.sent[0].decode("utf-8").rstrip("\n")
     import json as _json
@@ -245,7 +282,8 @@ def test_rerun_builds_job_rerun_method_with_overrides(tmp_path):
     store, remote_id = make_store(tmp_path)
     transport = FakeTransport(response=response_frame("req_x", "job.rerun", {"job_id": "job_remote_1", "status": "queued"}))
     control = RemoteControl(store, transport=transport)
-    result = control.rerun(remote_id, "job_remote_1", {"command": "echo again"}, idempotency_key="key-rerun-01")
+    result = control.rerun(remote_id, "job_remote_1", {"command": "echo again"}, idempotency_key="key-rerun-01",
+                           expected_state_epoch=1, expected_instance_id="test-instance")
     assert result["response"] == {"job_id": "job_remote_1", "status": "queued"}
     import json as _json
 

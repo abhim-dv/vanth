@@ -34,6 +34,7 @@ def request_frame(method="job.start", payload=None, key="key-ops-0001"):
         "version": "1", "kind": "request", "request_id": "req_" + "0" * 32,
         "idempotency_key": key, "method": method, "payload": payload,
         "digest": request_digest(method, payload, key),
+        "expected_state_epoch": 1, "expected_instance_id": "test-instance",
         "sent_at": "2026-08-20T12:00:00Z",
     }
 
@@ -121,6 +122,9 @@ def seed_job(db, job_id="job_snap1", status="running", seq=1):
 
 def make_remote(tmp_path, **kwargs):
     store = RemoteOperationStore(connect(tmp_path / "remote.sqlite"))
+    store.db.execute("UPDATE remote_state SET instance_id='test-instance' WHERE id=1")
+    store.db.commit()
+    kwargs.setdefault("db", store.db)
     fake = FakeManager(logs_dir=tmp_path, events_dir=tmp_path / "events", **kwargs)
     return RemoteJobManager(store, fake, home=tmp_path), store, fake
 
@@ -204,6 +208,8 @@ def test_handle_request_replay_same_key_different_digest_rejected(tmp_path):
 def test_handle_request_restart_between_acceptance_and_launch(tmp_path):
     path = tmp_path / "remote.sqlite"
     store = RemoteOperationStore(connect(path))
+    store.db.execute("UPDATE remote_state SET instance_id='test-instance' WHERE id=1")
+    store.db.commit()
     fake = FakeManager(logs_dir=tmp_path, events_dir=tmp_path / "events")
     remote = RemoteJobManager(store, fake, home=tmp_path)
     response = remote.handle_request(request_frame())
@@ -213,7 +219,7 @@ def test_handle_request_restart_between_acceptance_and_launch(tmp_path):
     # Simulate a daemon restart: close and reopen the shared sqlite.
     store.db.close()
     reopened = RemoteOperationStore(connect(path))
-    fake2 = FakeManager(logs_dir=tmp_path, events_dir=tmp_path / "events")
+    fake2 = FakeManager(logs_dir=tmp_path, events_dir=tmp_path / "events", db=reopened.db)
     remote2 = RemoteJobManager(reopened, fake2, home=tmp_path)
     remote2._dispatch_queued_ops()
 
@@ -389,6 +395,33 @@ def test_snapshot_and_log_range_serve_reads(tmp_path):
     assert logr["result"]["kind"] == "log_range"
 
 
+def test_snapshot_pages_are_immutable_after_first_page(tmp_path):
+    db = make_jobs_db()
+    seed_job(db, "job_a", "running")
+    seed_job(db, "job_b", "running")
+    remote, _store, _fake = make_remote(tmp_path, db=db)
+    remote.SNAPSHOT_PAGE_SIZE = 1
+
+    first = remote.handle_snapshot_request(request_frame(method="job.snapshot", payload={}))
+    assert first["result"]["jobs"][0]["job_id"] == "job_a"
+    cursor = first["result"]["cursor"]
+
+    db.execute("UPDATE jobs SET status='failed' WHERE job_id='job_b'")
+    db.execute("DELETE FROM jobs WHERE job_id='job_a'")
+    seed_job(db, "job_c", "running")
+
+    second = remote.handle_snapshot_request(
+        request_frame(method="job.snapshot", payload={"cursor": cursor}, key="key-snapshot-page-2")
+    )
+    assert second["result"]["jobs"] == [
+        {
+            "job_id": "job_b", "name": "n-job_b", "command": "echo hi", "status": "running",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "exit_code": None,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # daemon route wiring
 # ---------------------------------------------------------------------------
@@ -416,6 +449,8 @@ def test_daemon_helper_route_dispatches_handle_request(tmp_path, monkeypatch):
 
     migrate(db, tmp_path)
     store = RemoteOperationStore(db)
+    store.db.execute("UPDATE remote_state SET instance_id='test-instance' WHERE id=1")
+    store.db.commit()
     fake = FakeManager(logs_dir=tmp_path, events_dir=tmp_path / "events")
     remote = RemoteJobManager(store, fake, home=tmp_path)
     remote.start()

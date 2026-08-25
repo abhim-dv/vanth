@@ -30,7 +30,9 @@ TRANSFER_INIT_ALLOWED = {
     "sha256", "version_id",
 }
 BLOB_CHUNK_ALLOWED = {"transfer_id", "offset", "data_b64", "sha256", "size"}
-TRANSFER_COMPLETE_ALLOWED = {"transfer_id", "sha256"}
+TRANSFER_COMPLETE_ALLOWED = {
+    "transfer_id", "root_name", "manifest_digest", "total_bytes", "sha256", "version_id",
+}
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
@@ -243,16 +245,17 @@ def decode_frame(line: str, *, max_bytes: int | None = None, validate: bool = Tr
 # ---------------------------------------------------------------------------
 
 FRAME_SCHEMAS: dict[str, tuple[set[str], set[str]]] = {
-    "hello": ({"version", "kind", "protocol", "agent", "remote_id", "state_epoch", "sent_at"},
+    "hello": ({"version", "kind", "protocol", "agent", "remote_id", "state_epoch", "instance_id", "sent_at"},
               {"version", "kind", "protocol"}),
     "request": ({"version", "kind", "request_id", "idempotency_key", "method", "payload", "digest",
-                 "expected_state_epoch", "sent_at"},
+                  "expected_state_epoch", "expected_instance_id", "sent_at"},
               {"version", "kind", "method", "payload", "idempotency_key"}),
     "response": ({"version", "kind", "request_id", "method", "result", "sent_at"},
                  {"version", "kind", "method"}),
     "error": ({"version", "kind", "request_id", "method", "code", "message", "sent_at"},
               {"version", "kind", "code", "message"}),
-    "snapshot": ({"version", "kind", "state_epoch", "cursor", "jobs", "events", "has_more", "sent_at"},
+    "snapshot": ({"version", "kind", "state_epoch", "cursor", "jobs", "events", "has_more",
+                  "feed_epoch", "feed_boundary_seq", "sent_at"},
                  {"version", "kind", "state_epoch", "cursor", "jobs"}),
     "log_range": ({"version", "kind", "remote_job_id", "stream", "offset", "size", "content", "truncated", "sent_at"},
                   {"version", "kind", "remote_job_id", "stream", "offset", "content"}),
@@ -500,12 +503,21 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         _check_string_field(payload, "data_b64")
         _check_hex64_field(payload, "sha256")
     elif method == "artifact.transfer_complete":
-        _check_required_and_unknown(payload, TRANSFER_COMPLETE_ALLOWED, TRANSFER_COMPLETE_ALLOWED, "payload")
+        _check_required_and_unknown(
+            payload,
+            {"transfer_id", "root_name", "manifest_digest", "total_bytes", "sha256"},
+            TRANSFER_COMPLETE_ALLOWED,
+            "payload",
+        )
         _check_string_field(payload, "transfer_id")
         tid = payload.get("transfer_id")
         if isinstance(tid, str) and not re.fullmatch(r"xfr_[0-9a-f]{32}", tid):
             raise VanthRemoteProtocolError("INVALID_REQUEST", "transfer_id must be 'xfr_' + 32 hex chars")
         _check_hex64_field(payload, "sha256")
+        _check_string_field(payload, "root_name")
+        _check_string_field(payload, "manifest_digest")
+        _check_numeric_field(payload, "total_bytes", minimum=0)
+        _check_string_field(payload, "version_id")
 
 
 def validate_frame(frame: dict[str, Any]) -> dict[str, Any]:
@@ -536,11 +548,16 @@ def validate_frame(frame: dict[str, Any]) -> dict[str, Any]:
     sent_at = frame.get("sent_at")
     if sent_at is not None and not isinstance(sent_at, str):
         raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", "sent_at must be an ISO-8601 string")
-    for key in ("request_id", "remote_id", "agent", "stream", "remote_job_id"):
+    for key in ("request_id", "remote_id", "agent", "stream", "remote_job_id", "instance_id", "expected_instance_id"):
         if key in frame and not isinstance(frame[key], str):
             raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", f"{key} must be a string")
     if "state_epoch" in frame and (isinstance(frame["state_epoch"], bool) or not isinstance(frame["state_epoch"], int)):
         raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", "state_epoch must be an integer")
+    for int_field in ("feed_epoch", "feed_boundary_seq"):
+        if int_field in frame and (
+            isinstance(frame[int_field], bool) or not isinstance(frame[int_field], int)
+        ):
+            raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", f"{int_field} must be an integer")
     if "expected_state_epoch" in frame and (
         isinstance(frame["expected_state_epoch"], bool) or not isinstance(frame["expected_state_epoch"], int)
         or frame["expected_state_epoch"] < 1

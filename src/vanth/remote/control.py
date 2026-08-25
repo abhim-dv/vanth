@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ssh
+from .pairing import _target_argv
 from .protocol import (
     IDEMPOTENCY_KEY_RE,
     VanthRemoteProtocolError,
@@ -129,7 +130,7 @@ class RemoteControl:
     # submit / run_request / replay
     # ------------------------------------------------------------------
 
-    def submit(self, remote_id: str, method: str, payload: dict[str, Any], *, idempotency_key: str, expected_state_epoch: int | None = None) -> dict[str, Any]:
+    def submit(self, remote_id: str, method: str, payload: dict[str, Any], *, idempotency_key: str, expected_state_epoch: int | None = None, expected_instance_id: str | None = None) -> dict[str, Any]:
         """Record a durable request and (on first use) a ``submitting`` shadow.
 
         ``idempotency_key`` is required and validated by the protocol. Returns
@@ -144,44 +145,48 @@ class RemoteControl:
             )
         payload = self._validate_payload(method, payload)
         digest = request_digest(method, payload, idempotency_key)
-        # Mutations REQUIRE a durable epoch binding (review rc14 P1-2): a
-        # mutation submitted without knowing the remote's timeline can mutate
-        # a restored timeline after a lost response + restore.
-        if method in _MUTATION_METHODS:
-            if expected_state_epoch is None:
+        with self.store.db_lock:
+            # Keep identity reads under the same connection lock as the full
+            # submission transaction. Concurrent transactions on one SQLite
+            # connection otherwise made even this SELECT intermittently see
+            # no remote row.
+            if method in _MUTATION_METHODS:
+                if expected_state_epoch is None or not isinstance(expected_instance_id, str) or not expected_instance_id:
+                    raise VanthRemoteProtocolError(
+                        "INVALID_REQUEST", "remote mutations require expected_state_epoch and expected_instance_id"
+                    )
                 row = self.store.db.execute(
-                    "SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)
+                    "SELECT instance_id FROM remotes WHERE remote_id=?", (remote_id,)
                 ).fetchone()
                 if not row:
                     raise ValueError(f"Unknown remote_id: {remote_id}")
-                expected_state_epoch = int(row["state_epoch"])
-        self.store.check_state_epoch(remote_id, expected_state_epoch)
-        self.store.db.execute("BEGIN IMMEDIATE")
-        try:
-            request = self.store.record_request(
-                remote_id=remote_id,
-                idempotency_key=idempotency_key,
-                method=method,
-                payload=payload,
-                digest=digest,
-                expected_state_epoch=expected_state_epoch,
-                commit=False,
-            )
-            # Placeholder ``submitting`` shadows exist only for mutations —
-            # read methods (status/snapshot/feed/log_range/transfer) never
-            # produce a job, and their per-request placeholders used to linger
-            # forever as phantom ``submitting`` jobs (review P2-1).
-            if request["status"] == "creating" and method in _MUTATION_METHODS:
-                self.store.record_submitting_shadow(remote_id, request)
-            self.store.db.commit()
-        except BaseException:
-            self.store.db.rollback()
-            raise
-        # Durable epoch binding: stored with the request AND the journal so
-        # retries after a lost response reuse it (review rc14 P1-2).
-        request["expected_state_epoch"] = (
-            int(expected_state_epoch) if expected_state_epoch is not None else None
-        )
+                if row["instance_id"] and row["instance_id"] != expected_instance_id:
+                    from .ssh import VanthRemoteError
+                    raise VanthRemoteError("remote instance_id mismatch")
+            self.store.check_state_epoch(remote_id, expected_state_epoch)
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                request = self.store.record_request(
+                    remote_id=remote_id,
+                    idempotency_key=idempotency_key,
+                    method=method,
+                    payload=payload,
+                    digest=digest,
+                    expected_state_epoch=expected_state_epoch,
+                    expected_instance_id=expected_instance_id,
+                    commit=False,
+                )
+                if request["status"] == "creating" and method in _MUTATION_METHODS:
+                    self.store.record_submitting_shadow(remote_id, request)
+                self.store.db.commit()
+            except BaseException:
+                self.store.db.rollback()
+                raise
+        # Durable epoch binding (review rc14 P1-2, Sol review P0): the request
+        # dict returned by record_request reflects what SQLite stored — a
+        # replay carries the ORIGINAL binding. Never overwrite it here:
+        # rebinding in memory while the row (and journal) kept the original
+        # epoch made retries diverge from their durable identity.
         if self.journal is not None:
             try:
                 self.journal.record(request)
@@ -196,7 +201,8 @@ class RemoteControl:
         entry; a lost/``submitting`` request stays ``pending`` so the CLI can
         list and retry it with the original key.
         """
-        result = self._run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
+        result = self._run_request(remote_id, request, expected_state_epoch=expected_state_epoch,
+                                   expected_instance_id=request.get("expected_instance_id"))
         if self.journal is not None and result.get("status") in ("completed", "failed"):
             try:
                 self.journal.mark_resolved(request["request_id"])
@@ -204,7 +210,7 @@ class RemoteControl:
                 pass
         return result
 
-    def _run_request(self, remote_id: str, request: dict[str, Any], *, expected_state_epoch: int | None = None) -> dict[str, Any]:
+    def _run_request(self, remote_id: str, request: dict[str, Any], *, expected_state_epoch: int | None = None, expected_instance_id: str | None = None) -> dict[str, Any]:
         """Send one request over one SSH session and record the outcome.
 
         The request is durably transitioned ``creating -> submitting`` before
@@ -216,6 +222,15 @@ class RemoteControl:
         """
         remote_row = self.store.get_remote(remote_id)
         self.store.check_state_epoch(remote_id, expected_state_epoch)
+        if request.get("method") in _MUTATION_METHODS:
+            bound_instance = request.get("expected_instance_id") or expected_instance_id
+            if not bound_instance:
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST", "remote mutations require expected_instance_id"
+                )
+            if remote_row.get("instance_id") and remote_row["instance_id"] != bound_instance:
+                from .ssh import VanthRemoteError
+                raise VanthRemoteError("remote instance_id mismatch")
         try:
             self.store.update_request_status(request["request_id"], "submitting")
         except ValueError:
@@ -250,12 +265,14 @@ class RemoteControl:
         if response.get("method") != request["method"]:
             return self._lost(remote_id, request)
 
-        self.store.db.execute("BEGIN IMMEDIATE")
-        try:
-            self.store.update_request_status(request["request_id"], "accepted", commit=False)
-            self.store.db.commit()
-        except ValueError:
-            return self._lost(remote_id, request)
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.store.update_request_status(request["request_id"], "accepted", commit=False)
+                self.store.db.commit()
+            except ValueError:
+                self.store.db.rollback()
+                return self._lost(remote_id, request)
         if response.get("kind") == "error":
             return self._finish_error(remote_id, request, response)
         if response.get("kind") != "response":
@@ -311,38 +328,34 @@ class RemoteControl:
         epoch = int(snapshot.get("state_epoch") or 1)
         jobs = snapshot.get("jobs") or []
         cursor = snapshot.get("cursor") or {}
-        self.store.db.execute("BEGIN IMMEDIATE")
-        try:
-            applied = 0
-            for job in jobs:
-                result = self.store.upsert_shadow(
-                    remote_id=remote_id,
-                    remote_job_id=str(job.get("job_id")),
-                    status=str(job.get("status") or "unknown"),
-                    payload=job,
-                    state_epoch=epoch,
-                    commit=False,
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                applied = 0
+                for job in jobs:
+                    result = self.store.upsert_shadow(
+                        remote_id=remote_id,
+                        remote_job_id=str(job.get("job_id")),
+                        status=str(job.get("status") or "unknown"),
+                        payload=job,
+                        state_epoch=epoch,
+                        commit=False,
+                    )
+                    if result is not None:
+                        applied += 1
+                deleted = 0
+                superseded = self.store.supersede_old_epochs(remote_id, epoch, commit=False)
+                if final_page:
+                    finalize = self._finalize_snapshot_locked(remote_id, epoch, {str(j.get("job_id")) for j in jobs}, cursor)
+                    deleted = finalize["deleted"]
+                self.store.db.execute(
+                    "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                    (epoch, now_iso(), remote_id, epoch),
                 )
-                if result is not None:
-                    applied += 1
-            deleted = 0
-            superseded = self.store.supersede_old_epochs(remote_id, epoch, commit=False)
-            if final_page:
-                finalize = self._finalize_snapshot_locked(remote_id, epoch, {str(j.get("job_id")) for j in jobs}, cursor)
-                deleted = finalize["deleted"]
-            # Non-final pages do NOT advance the stored cursor: a failed later
-            # page must leave the cursor exactly where the last COMPLETE sync
-            # finished (review rc14 P0-2).
-            # Adopt the snapshot's epoch: the controller learns the remote's
-            # timeline version (e.g. after a remote restore) in the same tx.
-            self.store.db.execute(
-                "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
-                (epoch, now_iso(), remote_id, epoch),
-            )
-            self.store.db.commit()
-        except BaseException:
-            self.store.db.rollback()
-            raise
+                self.store.db.commit()
+            except BaseException:
+                self.store.db.rollback()
+                raise
         return {
             "applied": applied,
             "deleted": deleted,
@@ -368,22 +381,30 @@ class RemoteControl:
         absence meaningful; per-page suppression used to delete valid shadows
         that simply lived on a later page (review P0-4).
         """
-        self.store.db.execute("BEGIN IMMEDIATE")
-        try:
-            result = self._finalize_snapshot_locked(
-                remote_id, epoch, seen_ids, cursor or {}
-            )
-            self.store.db.execute(
-                "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
-                (epoch, now_iso(), remote_id, epoch),
-            )
-            self.store.db.commit()
-        except BaseException:
-            self.store.db.rollback()
-            raise
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._finalize_snapshot_locked(
+                    remote_id, epoch, seen_ids, cursor or {}
+                )
+                self.store.db.execute(
+                    "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                    (epoch, now_iso(), remote_id, epoch),
+                )
+                self.store.db.commit()
+            except BaseException:
+                self.store.db.rollback()
+                raise
         return result
 
     def sync_snapshot(self, remote_id: str) -> dict[str, Any]:
+        # Serialize the complete fetch+publish cycle against feed application
+        # on this store. A feed-created shadow cannot land between the
+        # snapshot boundary and absence reconciliation and be suppressed.
+        with self.store.db_lock:
+            return self._sync_snapshot_locked(remote_id)
+
+    def _sync_snapshot_locked(self, remote_id: str) -> dict[str, Any]:
         """Fetch + apply snapshots until has_more is false; returns totals.
 
         Every full sync starts from a FRESH keyset cursor (offset 0): resuming
@@ -395,8 +416,12 @@ class RemoteControl:
         totals = {"applied": 0, "deleted": 0, "superseded": 0, "pages": 0}
         seen_ids: set[str] = set()
         epoch = None
+        snapshot_id = None
         cursor = None
         high_water = None
+        feed_boundary_seq = None
+        feed_epoch = None
+        pages: list[dict[str, Any]] = []
         while True:
             snapshot = self.snapshot(remote_id, cursor=cursor)
             # Fail-fast (review rc14 P0-2): a lost/failed page returns {} —
@@ -421,17 +446,88 @@ class RemoteControl:
                     "INVALID_REQUEST",
                     "snapshot high-water boundary changed mid-sync; retry the sync",
                 )
-            result = self.apply_snapshot(remote_id, snapshot, final_page=False)
-            totals["applied"] += result["applied"]
-            totals["superseded"] += result["superseded"]
+            page_epoch = int(snapshot.get("state_epoch") or 0)
+            # Feed boundary (Sol review): every page carries the feed boundary
+            # captured with the snapshot; a missing or drifting boundary is a
+            # malformed sync and aborts before anything is suppressed.
+            if "feed_boundary_seq" not in snapshot or "feed_epoch" not in snapshot:
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST",
+                    f"snapshot page {totals['pages'] + 1} missing the feed boundary; "
+                    "shadows and cursor left unchanged",
+                )
+            page_boundary = int(snapshot["feed_boundary_seq"])
+            page_feed_epoch = int(snapshot["feed_epoch"])
+            if feed_boundary_seq is None:
+                feed_boundary_seq = page_boundary
+                feed_epoch = page_feed_epoch
+            elif page_boundary != feed_boundary_seq or page_feed_epoch != feed_epoch:
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST", "snapshot feed boundary changed mid-sync; retry the sync"
+                )
+            page_snapshot_id = (snapshot.get("cursor") or {}).get("snapshot_id") or snapshot.get("snapshot_id")
+            if not page_snapshot_id:
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "snapshot page missing snapshot_id")
+            if epoch is None:
+                epoch = page_epoch
+                snapshot_id = str(page_snapshot_id)
+            elif page_epoch != epoch or str(page_snapshot_id) != snapshot_id:
+                raise VanthRemoteProtocolError(
+                    "INVALID_REQUEST", "snapshot identity changed mid-sync; retry the sync"
+                )
+            jobs = snapshot.get("jobs")
+            if not isinstance(jobs, list):
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "snapshot jobs must be a list")
+            for job in jobs:
+                if not isinstance(job, dict) or not isinstance(job.get("job_id"), str) or not job["job_id"]:
+                    raise VanthRemoteProtocolError("INVALID_REQUEST", "snapshot contains an invalid job")
+            pages.append(snapshot)
+            totals["applied"] += len(jobs)
             totals["pages"] += 1
-            epoch = int(snapshot.get("state_epoch") or 1)
-            seen_ids |= {str(j.get("job_id")) for j in (snapshot.get("jobs") or [])}
+            seen_ids |= {j["job_id"] for j in jobs}
             cursor = snapshot.get("cursor")
             if not snapshot.get("has_more"):
                 break
-        finalize = self.finalize_snapshot(remote_id, epoch=epoch, seen_ids=seen_ids, cursor=cursor)
-        totals["deleted"] = finalize["deleted"]
+        # Stage all pages in memory, then publish shadows, epoch, cursor and
+        # deletion reconciliation in one controller transaction. A lost or
+        # malformed later page therefore leaves the prior read model untouched.
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                applied = 0
+                for page in pages:
+                    for job in page["jobs"]:
+                        if self.store.upsert_shadow(
+                            remote_id=remote_id,
+                            remote_job_id=job["job_id"],
+                            status=str(job.get("status") or "unknown"),
+                            payload=job,
+                            state_epoch=epoch,
+                            commit=False,
+                        ) is not None:
+                            applied += 1
+                totals["applied"] = applied
+                totals["superseded"] = self.store.supersede_old_epochs(remote_id, epoch, commit=False)
+                finalize = self._finalize_snapshot_locked(remote_id, epoch, seen_ids, cursor or {})
+                totals["deleted"] = finalize["deleted"]
+                # Advance the feed cursor to the snapshot's captured boundary
+                # (Sol review): every feed event at or below it is already
+                # reflected by the applied pages, so resuming from the stale
+                # stored cursor would replay OLD statuses over FRESHER
+                # snapshot shadows.
+                self.store.set_feed_cursor(remote_id, {
+                    "state_epoch": epoch,
+                    "feed_epoch": int(feed_epoch),
+                    "seq": int(feed_boundary_seq),
+                }, commit=False)
+                self.store.db.execute(
+                    "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                    (epoch, now_iso(), remote_id, epoch),
+                )
+                self.store.db.commit()
+            except BaseException:
+                self.store.db.rollback()
+                raise
         return totals
 
     # ------------------------------------------------------------------
@@ -492,41 +588,43 @@ class RemoteControl:
         changes = result.get("changes") or []
         epoch = int(result.get("state_epoch") or 1)
         next_cursor = result.get("cursor") or {}
-        self.store.db.execute("BEGIN IMMEDIATE")
-        try:
-            applied = suppressed = 0
-            for change in changes:
-                kind = change.get("kind")
-                job_id = str(change.get("job_id") or "")
-                feed_change = change.get("payload") or {}
-                if kind == "job.upsert":
-                    shadow = self.store.upsert_shadow(
-                        remote_id=remote_id,
-                        remote_job_id=job_id,
-                        status=str(feed_change.get("status") or "unknown"),
-                        payload=feed_change,
-                        state_epoch=epoch,
-                        commit=False,
-                    )
-                    if shadow is not None:
-                        applied += 1
-                elif kind == "job.tombstone":
-                    self.store.suppress_shadow(remote_id, job_id, commit=False)
-                    suppressed += 1
-            self.store.set_feed_cursor(remote_id, {
-                "state_epoch": epoch,
-                "feed_epoch": int(result.get("feed_epoch") or 1),
-                "seq": int(next_cursor.get("seq") or 0),
-            }, commit=False)
-            # Adopt a newer remote timeline in the same tx (mirrors apply_snapshot).
-            self.store.db.execute(
-                "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
-                (epoch, now_iso(), remote_id, epoch),
-            )
-            self.store.db.commit()
-        except BaseException:
-            self.store.db.rollback()
-            raise
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                applied = suppressed = 0
+                for change in changes:
+                    kind = change.get("kind")
+                    job_id = str(change.get("job_id") or "")
+                    feed_change = change.get("payload") or {}
+                    if kind == "job.upsert":
+                        shadow = self.store.upsert_shadow(
+                            remote_id=remote_id,
+                            remote_job_id=job_id,
+                            status=str(feed_change.get("status") or "unknown"),
+                            payload=feed_change,
+                            state_epoch=epoch,
+                            commit=False,
+                        )
+                        if shadow is not None:
+                            applied += 1
+                    elif kind == "job.tombstone":
+                        self.store.suppress_shadow(remote_id, job_id, commit=False)
+                        suppressed += 1
+                    else:
+                        raise VanthRemoteProtocolError("INVALID_REQUEST", f"unknown feed change kind: {kind!r}")
+                self.store.set_feed_cursor(remote_id, {
+                    "state_epoch": epoch,
+                    "feed_epoch": int(result.get("feed_epoch") or 1),
+                    "seq": int(next_cursor.get("seq") or 0),
+                }, commit=False)
+                self.store.db.execute(
+                    "UPDATE remotes SET state_epoch=?, updated_at=? WHERE remote_id=? AND state_epoch<?",
+                    (epoch, now_iso(), remote_id, epoch),
+                )
+                self.store.db.commit()
+            except BaseException:
+                self.store.db.rollback()
+                raise
         return {
             "mode": "feed",
             "applied": applied,
@@ -587,17 +685,17 @@ class RemoteControl:
     # status / stop / rerun helpers
     # ------------------------------------------------------------------
 
-    def status(self, remote_id: str, remote_job_id: str, *, idempotency_key: str, expected_state_epoch: int | None = None) -> dict[str, Any]:
+    def status(self, remote_id: str, remote_job_id: str, *, idempotency_key: str, expected_state_epoch: int | None = None, expected_instance_id: str | None = None) -> dict[str, Any]:
         request = self.submit(
             remote_id, "job.status", {"job_id": remote_job_id},
-            idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch,
+            idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch, expected_instance_id=expected_instance_id,
         )
         if request["status"] != "creating":
             return request
         return self.run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
 
     def stop(self, remote_id: str, remote_job_id: str, *, signal: str = "terminate", kill_after_seconds: int = 10,
-             idempotency_key: str, expected_state_epoch: int | None = None) -> dict[str, Any]:
+             idempotency_key: str, expected_state_epoch: int | None = None, expected_instance_id: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"job_id": remote_job_id}
         if signal != "terminate":
             payload["signal"] = signal
@@ -605,19 +703,19 @@ class RemoteControl:
             payload["kill_after_seconds"] = kill_after_seconds
         request = self.submit(
             remote_id, "job.stop", payload,
-            idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch,
+            idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch, expected_instance_id=expected_instance_id,
         )
         if request["status"] != "creating":
             return request
         return self.run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
 
     def rerun(self, remote_id: str, remote_job_id: str, overrides: dict[str, Any] | None = None, *,
-              idempotency_key: str, expected_state_epoch: int | None = None) -> dict[str, Any]:
+              idempotency_key: str, expected_state_epoch: int | None = None, expected_instance_id: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"job_id": remote_job_id}
         payload.update({key: value for key, value in (overrides or {}).items() if value is not None})
         request = self.submit(
             remote_id, "job.rerun", payload,
-            idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch,
+            idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch, expected_instance_id=expected_instance_id,
         )
         if request["status"] != "creating":
             return request
@@ -649,57 +747,67 @@ class RemoteControl:
         expected = request.get("expected_state_epoch")
         if expected is not None:
             frame["expected_state_epoch"] = int(expected)
+        instance_id = request.get("expected_instance_id")
+        if instance_id is not None:
+            frame["expected_instance_id"] = instance_id
         return frame
 
     def _lost(self, remote_id: str, request: dict[str, Any]) -> dict[str, Any]:
         """Transport failure: keep the request durably ``submitting`` (lost)."""
-        self.store.db.execute("BEGIN IMMEDIATE")
-        try:
-            current = self.store.db.execute(
-                "SELECT status FROM remote_requests WHERE request_id=?", (request["request_id"],)
-            ).fetchone()
-            if current and current["status"] == "submitting":
-                # Leave status as-is so replay returns the same in-flight request
-                # and never starts a second job; the remote operation is keyed by
-                # idempotency_key and will accept only the first submission.
-                pass
-            self.store.db.commit()
-        except BaseException:
-            self.store.db.rollback()
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.store.db.execute(
+                    "SELECT status FROM remote_requests WHERE request_id=?", (request["request_id"],)
+                ).fetchone()
+                self.store.db.commit()
+            except BaseException:
+                self.store.db.rollback()
         return self.store.get_request_by_key(remote_id, request["idempotency_key"])
 
     def _finish_response(self, remote_id: str, request: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
         result = response.get("result") or {}
-        completed = self.store.update_request_status(
-            request["request_id"], "completed", response=result
-        )
-        remote_job_id = result.get("job_id")
-        if remote_job_id:
-            row = self.store.db.execute(
-                "SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)
-            ).fetchone()
-            epoch = int(row["state_epoch"]) if row else 1
-            self.store.upsert_shadow(
-                remote_id=remote_id,
-                remote_job_id=str(remote_job_id),
-                status=(result.get("status") or "running"),
-                payload=result,
-                state_epoch=epoch,
-            )
-            # The placeholder ``submitting`` shadow keyed by request id has
-            # served its purpose — retire it so no phantom job lingers in the
-            # read model (review P2-1).
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
             try:
-                self.store.suppress_shadow(remote_id, request["request_id"])
-            except Exception:
-                pass
-        return completed
+                completed = self.store.update_request_status(
+                    request["request_id"], "completed", response=result, commit=False
+                )
+                remote_job_id = result.get("job_id")
+                if remote_job_id:
+                    row = self.store.db.execute(
+                        "SELECT state_epoch FROM remotes WHERE remote_id=?", (remote_id,)
+                    ).fetchone()
+                    epoch = int(row["state_epoch"]) if row else 1
+                    self.store.upsert_shadow(
+                        remote_id=remote_id,
+                        remote_job_id=str(remote_job_id),
+                        status=(result.get("status") or "running"),
+                        payload=result,
+                        state_epoch=epoch,
+                        commit=False,
+                    )
+                    self.store.suppress_shadow(remote_id, request["request_id"], commit=False)
+                self.store.db.commit()
+                return completed
+            except BaseException:
+                self.store.db.rollback()
+                raise
 
     def _finish_error(self, remote_id: str, request: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
         code = response.get("code") or "INVALID_REQUEST"
         message = response.get("message") or ""
-        failed = self.store.update_request_status(
-            request["request_id"], "failed", error=f"{code}: {message}"
-        )
-        self.store.record_replay_tombstone(remote_id, request["idempotency_key"], request["digest"])
-        return failed
+        with self.store.db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                failed = self.store.update_request_status(
+                    request["request_id"], "failed", error=f"{code}: {message}", commit=False
+                )
+                self.store.record_replay_tombstone(
+                    remote_id, request["idempotency_key"], request["digest"], commit=False
+                )
+                self.store.db.commit()
+                return failed
+            except BaseException:
+                self.store.db.rollback()
+                raise

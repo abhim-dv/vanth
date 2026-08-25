@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -179,7 +180,11 @@ def test_transfer_methods_validate_via_protocol():
     })
     validate_request("artifact.transfer_init", {"transfer_id": "xfr_" + "b" * 32, "direction": "pull"})
     validate_request("artifact.blob_chunk", {"transfer_id": "xfr_" + "d" * 32, "offset": 0})
-    validate_request("artifact.transfer_complete", {"transfer_id": "xfr_" + "a" * 32, "sha256": "0" * 64})
+    validate_request("artifact.transfer_complete", {
+        "transfer_id": "xfr_" + "a" * 32,
+        "root_name": "r", "manifest_digest": "0" * 64, "total_bytes": 0,
+        "sha256": "0" * 64,
+    })
 
 
 
@@ -227,6 +232,26 @@ def test_push_replay_same_key_returns_same_version(world):
     assert second["replayed"] is True
     assert second["version_id"] == first["version_id"]
     assert len(remote_versions(world)) == 1
+
+
+def test_remote_init_resets_ack_when_push_staging_prefix_is_missing(world):
+    transfer_id = "xfr_" + "c" * 32
+    payload = {
+        "transfer_id": transfer_id, "direction": "push", "root_name": "r",
+        "manifest_digest": "0" * 64, "total_bytes": 3, "sha256": hashlib.sha256(b"abc").hexdigest(),
+    }
+    first = world.remote.transfers.init(payload)
+    world.remote.transfers.db.execute(
+        "UPDATE remote_transfers SET acked_offset=2 WHERE transfer_id=?", (transfer_id,)
+    )
+    world.remote.transfers.db.commit()
+    row = world.remote.transfers.db.execute(
+        "SELECT staging_path FROM remote_transfers WHERE transfer_id=?", (transfer_id,)
+    ).fetchone()
+    Path(row["staging_path"]).unlink(missing_ok=True)
+    resumed = world.remote.transfers.init(payload)
+    assert resumed["acked_offset"] == 0
+    assert Path(row["staging_path"]).is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -453,3 +478,39 @@ def test_same_idempotency_key_across_contexts_gets_separate_rows(world, tmp_path
     rows = controller_transfer_row(world)
     keys = [r["idempotency_key"] for r in rows]
     assert keys.count("shared-key-01") == 2
+
+
+def test_push_rejects_responses_that_do_not_bind_to_request(world):
+    """Sol review P2: response frames must echo request_id + method; a
+    mismatched frame is a lost/corrupted exchange and must abort loudly."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+    original_handler = world.transport.handler
+
+    def unbound_handler(frame):
+        resp = original_handler(frame)
+        if resp.get("kind") == "response":
+            # Valid frame shape, but bound to a DIFFERENT exchange.
+            resp["request_id"] = "req_" + "0" * 32
+        return resp
+
+    world.transport.handler = unbound_handler
+    with pytest.raises(ConnectionError, match="does not bind"):
+        world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0099")
+
+
+def test_init_result_must_name_the_transfer(world):
+    """Sol review P2: transfer_init answers must carry the transfer_id."""
+    put = publish_source(world)
+    rid = world.remote_row["remote_id"]
+    original_handler = world.transport.handler
+
+    def anonymous_init(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "artifact.transfer_init" and resp.get("kind") == "response":
+            resp["result"].pop("transfer_id", None)
+        return resp
+
+    world.transport.handler = anonymous_init
+    with pytest.raises(Exception, match="bind"):
+        world.broker.push_blob(rid, put["version_id"], idempotency_key="push-key-0100")

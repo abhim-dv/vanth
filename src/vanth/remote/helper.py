@@ -113,7 +113,7 @@ def error_frame(frame: dict[str, Any], *, code: str, message: str) -> dict[str, 
     return result
 
 
-def _fetch_daemon_identity(url: str, token: str) -> int | None:
+def _fetch_daemon_identity(url: str, token: str) -> dict[str, Any] | None:
     """GET the remote daemon's live state_epoch.
 
     The sentinel hello is only meaningful if it proves the daemon is actually
@@ -129,8 +129,15 @@ def _fetch_daemon_identity(url: str, token: str) -> int | None:
             payload = json.loads(response.read().decode())
     except Exception:
         return None
-    if isinstance(payload, dict) and isinstance(payload.get("state_epoch"), int):
-        return payload["state_epoch"]
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("state_epoch"), int)
+        and not isinstance(payload.get("state_epoch"), bool)
+        and payload["state_epoch"] >= 1
+        and isinstance(payload.get("instance_id"), str)
+        and payload["instance_id"].strip()
+    ):
+        return {"state_epoch": payload["state_epoch"], "instance_id": payload["instance_id"]}
     return None
 
 
@@ -152,14 +159,12 @@ def _handle_frame(frame: dict[str, Any]) -> dict[str, Any]:
         # Prove daemon connectivity in the hello itself: without a reachable
         # loopback daemon the helper is useless, and the old locally-faked
         # hello made the sentinel a false positive (review rc14 P0-1.4).
-        if url and token and _loopback_url(url):
-            state_epoch = _fetch_daemon_identity(url, token)
-        else:
-            state_epoch = None
-        if state_epoch is None:
-            state_epoch = _state_epoch()
-        if state_epoch is not None:
-            response["state_epoch"] = state_epoch
+        if not (url and token and _loopback_url(url)):
+            return error_frame(frame, code="AUTH_FAILED", message="remote helper is not configured with a loopback daemon")
+        identity = _fetch_daemon_identity(url, token)
+        if identity is None:
+            return error_frame(frame, code="AUTH_FAILED", message="remote daemon identity probe failed")
+        response.update(identity)
         return response
     if kind == "request":
         return _forward_to_remote_daemon(frame)

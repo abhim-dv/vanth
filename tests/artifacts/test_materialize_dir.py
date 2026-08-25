@@ -77,6 +77,17 @@ def test_existing_destination_refused_never_merges(tmp_path, ops):
     assert sentinel.read_bytes() == b"do not touch"
 
 
+def test_atomic_directory_publication_never_replaces_empty_destination(tmp_path, ops):
+    src = tmp_path / "staging"
+    dest = tmp_path / "destination"
+    src.mkdir()
+    dest.mkdir()
+    with pytest.raises(OSError):
+        ops._rename_noreplace(src, dest)
+    assert src.is_dir()
+    assert dest.is_dir()
+
+
 def test_symlinked_dest_parent_component_refused(tmp_path, ops):
     """A planted symlink/junction at a destination parent component must be
     refused without touching anything beyond it."""

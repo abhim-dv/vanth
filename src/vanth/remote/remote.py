@@ -37,6 +37,8 @@ import secrets
 import stat as _stat
 import threading
 import time
+import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +90,7 @@ class RemoteJobManager:
         self.dispatcher_thread: threading.Thread | None = None
         self.poll_interval = float(__import__("os").environ.get("VANTH_REMOTE_POLL_INTERVAL", "0.2"))
         self._shutdown = False
+        self._snapshot_cache: dict[str, dict[str, Any]] = {}
 
     def _remote_artifact_ops(self) -> Any:
         """The remote host's own ArtifactOperations (Phase 9 publication)."""
@@ -165,13 +168,24 @@ class RemoteJobManager:
         # refused transactionally before replay/acceptance (review P1-1).
         if method in self._MUTATION_REQUEST_METHODS:
             expected = frame.get("expected_state_epoch")
-            if expected is not None:
-                current = self.store.get_state_epoch()
-                if int(expected) != current:
-                    return self._error_frame(
-                        frame, code="STATE_EPOCH_MISMATCH",
-                        message=f"request bound to epoch {int(expected)}, remote is at {current}",
-                    )
+            expected_instance = frame.get("expected_instance_id")
+            if expected is None or not isinstance(expected_instance, str) or not expected_instance:
+                return self._error_frame(
+                    frame, code="INVALID_REQUEST",
+                    message="remote mutation requires expected_state_epoch and expected_instance_id",
+                )
+            current = self.store.get_state_epoch()
+            if int(expected) != current:
+                return self._error_frame(
+                    frame, code="STATE_EPOCH_MISMATCH",
+                    message=f"request bound to epoch {int(expected)}, remote is at {current}",
+                )
+            current_instance = self.store.get_instance_id()
+            if expected_instance != current_instance:
+                return self._error_frame(
+                    frame, code="INSTANCE_ID_MISMATCH",
+                    message="request bound to a different remote instance",
+                )
         if method == "job.status":
             return self._handle_status(frame, payload, idempotency_key)
         if method == "job.snapshot":
@@ -264,22 +278,44 @@ class RemoteJobManager:
                 stopped_status = stop_result.get("status")
         except Exception as exc:
             error = str(exc)
+        # A FAILED stop is recorded as a failed op (Sol review): marking it
+        # completed made the durable replay report a stop that never happened.
+        result_status = "error" if error else (stopped_status or "stopping")
         result = {
             "op_id": op["op_id"],
             "job_id": job_id,
-            "status": stopped_status or "stopping",
+            "status": result_status,
         }
         if error:
             result["error"] = error
-        # Force-complete the stop op with its durable result (the generic
-        # operation machine models job launches, not management intents), so a
-        # lost response replays THIS result instead of re-executing.
+        # Force-complete/failed the stop op with its durable result (the
+        # generic operation machine models job launches, not management
+        # intents), so a lost response replays THIS outcome instead of
+        # re-executing. A successful terminal stop emits a TERMINAL UPSERT —
+        # not a tombstone — so controller shadows learn the final status
+        # (Sol review).
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
             self.store.db.execute(
-                "UPDATE remote_operations SET status='completed', result_json=?, updated_at=? WHERE op_id=?",
-                (json.dumps(result, separators=(",", ":")), now_iso(), op["op_id"]),
+                "UPDATE remote_operations SET status=?, result_json=?, updated_at=? WHERE op_id=?",
+                (
+                    "failed" if error else "completed",
+                    json.dumps(result, separators=(",", ":")), now_iso(), op["op_id"],
+                ),
             )
+            if not error and stopped_status in TERMINAL_STATUSES:
+                payload_row = self.store.db.execute(
+                    "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                    "FROM jobs WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()
+                upsert_payload = dict(payload_row) if payload_row else {
+                    "job_id": job_id, "status": stopped_status,
+                }
+                self.feed.append_in_tx(
+                    "job.upsert", job_id=job_id,
+                    payload=upsert_payload,
+                )
             self.store.db.commit()
         except BaseException:
             self.store.db.rollback()
@@ -314,13 +350,10 @@ class RemoteJobManager:
                 self.store.update_operation_status(op["op_id"], "queued", commit=False)
                 # Outbox row commits ATOMICALLY with the acceptance — a crash
                 # after commit can no longer lose the change (review P1-6).
-                try:
-                    self.feed.append_in_tx(
-                        "job.upsert", job_id=job_id,
-                        payload={"job_id": job_id, "status": "queued"},
-                    )
-                except Exception:
-                    pass
+                self.feed.append_in_tx(
+                    "job.upsert", job_id=job_id,
+                    payload={"job_id": job_id, "status": "queued"},
+                )
             else:
                 # Replay returns the SAME job — never a second incarnation.
                 job_id = self.store.get_remote_job_origin_op(op["op_id"])
@@ -517,12 +550,15 @@ class RemoteJobManager:
             stop_result = self.manager.stop_sync(job_id)
             status = stop_result.get("status") or "stopping"
         except Exception as exc:
-            status = "unknown"
             self.store.db.execute(
                 "UPDATE remote_operations SET error=?, updated_at=? WHERE op_id=?",
                 (str(exc)[:500], now_iso(), row["op_id"]),
             )
             self.store.db.commit()
+            # Keep the intent non-terminal. The dispatcher will retry it on
+            # the next tick; claiming completion here loses a stop after a
+            # transient manager/SQLite failure.
+            return
         self.store.db.execute(
             "UPDATE remote_operations SET status='completed', result_json=?, updated_at=? WHERE op_id=?",
             (
@@ -531,6 +567,21 @@ class RemoteJobManager:
                 now_iso(), row["op_id"],
             ),
         )
+        if status in TERMINAL_STATUSES:
+            # Terminal UPSERT (not a tombstone): controller shadows must learn
+            # the final status (Sol review).
+            payload_row = self.store.db.execute(
+                "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                "FROM jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            upsert_payload = dict(payload_row) if payload_row else {
+                "job_id": job_id, "status": status,
+            }
+            self.feed.append_in_tx(
+                "job.upsert", job_id=job_id,
+                payload=upsert_payload,
+            )
         self.store.db.commit()
 
     def _trigger_gate(self, payload: dict[str, Any]) -> str:
@@ -541,8 +592,10 @@ class RemoteJobManager:
         ``"cancel"`` when the parent ended in a different terminal state.
         """
         trigger = payload.get("trigger") if isinstance(payload, dict) else None
-        if not isinstance(trigger, dict) or not trigger.get("job_id") or not trigger.get("status"):
+        if trigger is None:
             return "go"
+        if not isinstance(trigger, dict) or not trigger.get("job_id") or not trigger.get("status"):
+            return "cancel"
         parent = str(trigger["job_id"])
         wanted = str(trigger["status"])
         # Validate the trigger contract (review rc14 P1-4): malformed ids,
@@ -593,17 +646,15 @@ class RemoteJobManager:
                 ).fetchone()
                 if not row or row["status"] != status:
                     raise ValueError(f"cannot converge operation {op_id} to {status}")
-            try:
-                row = self.manager.db.execute(
-                    "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
-                    "FROM jobs WHERE job_id=?", (job_id,)
-                ).fetchone()
-                payload = dict(row) if row else {"job_id": job_id, "status": status}
-                self.feed.append_in_tx("job.upsert", job_id=job_id, payload=payload)
-            except Exception:
-                import logging
-
-                logging.getLogger("vanth.remote").exception("feed append failed job=%s", job_id)
+            row = self.manager.db.execute(
+                "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                "FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            payload = dict(row) if row else {"job_id": job_id, "status": status}
+            # The outbox row is part of the same transaction as the terminal
+            # operation. If it cannot be recorded, roll back and retry rather
+            # than exposing a terminal state the controller can never observe.
+            self.feed.append_in_tx("job.upsert", job_id=job_id, payload=payload)
             self.store.db.commit()
         except BaseException:
             self.store.db.rollback()
@@ -666,6 +717,12 @@ class RemoteJobManager:
             return 1
 
     def handle_snapshot_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.store.db_lock:
+            return self._handle_snapshot_request_locked(frame, payload)
+
+    def _handle_snapshot_request_locked(
+        self, frame: dict[str, Any], payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Build one paginated snapshot frame fixed to the remote state epoch.
 
         Pagination uses a KEYSET cursor (``after_job_id``, ordered by job_id)
@@ -681,34 +738,79 @@ class RemoteJobManager:
         if not isinstance(cursor, dict):
             cursor = {}
         after_job_id = str(cursor.get("after_job_id") or "")
-        high_water = cursor.get("high_water") if isinstance(cursor.get("high_water"), int) else None
         manager = self.manager
-        # Fixed high-water boundary (review rc14 P0-2): every page of one
-        # snapshot only sees rows with rowid <= the boundary captured on the
-        # FIRST page, so inserts/deletes between pages cannot produce a mixed
-        # authoritative set.
-        if high_water is None:
-            row = manager.db.execute("SELECT COALESCE(MAX(rowid), 0) AS hw FROM jobs").fetchone()
-            high_water = int(row["hw"])
-        rows = manager.db.execute(
-            """
-            SELECT job_id, name, command, status, created_at, updated_at, exit_code
-            FROM jobs WHERE job_id>? AND rowid<=? ORDER BY job_id ASC LIMIT ?
-            """,
-            (after_job_id, high_water, self.SNAPSHOT_PAGE_SIZE + 1),
-        ).fetchall()
-        has_more = len(rows) > self.SNAPSHOT_PAGE_SIZE
-        rows = rows[: self.SNAPSHOT_PAGE_SIZE]
-        jobs = [dict(row) for row in rows]
+        snapshot_id = cursor.get("snapshot_id")
+        if snapshot_id is None:
+            state_epoch = self._remote_state_epoch()
+            # Capture jobs and their events under one SQLite read transaction.
+            # Subsequent pages are slices of this immutable in-memory value,
+            # never fresh queries against mutable tables.
+            with getattr(manager, "db_lock", nullcontext()):
+                manager.db.execute("BEGIN")
+                try:
+                    captured = manager.db.execute(
+                        "SELECT rowid AS _rowid, job_id, name, command, status, "
+                        "created_at, updated_at, exit_code FROM jobs ORDER BY job_id"
+                    ).fetchall()
+                    jobs = []
+                    events_by_job: dict[str, list[dict[str, Any]]] = {}
+                    high_water = 0
+                    for captured_row in captured:
+                        item = dict(captured_row)
+                        high_water = max(high_water, int(item.pop("_rowid")))
+                        jobs.append(item)
+                        event_rows = manager.db.execute(
+                            "SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at "
+                            "FROM events WHERE job_id=? ORDER BY seq ASC LIMIT ?",
+                            (item["job_id"], self.SNAPSHOT_EVENT_LIMIT),
+                        ).fetchall()
+                        events_by_job[item["job_id"]] = [dict(row) for row in event_rows]
+                finally:
+                    manager.db.rollback()
+            # Feed boundary (Sol review): MAX(remote_feed.seq) captured with
+            # the snapshot. Feed events at or below it are already reflected
+            # by these pages; the controller advances its feed cursor to this
+            # boundary so stale events cannot regress snapshot state. Read
+            # under the store lock we already hold.
+            boundary_row = self.store.db.execute(
+                "SELECT COALESCE(MAX(feed_seq), 0) AS seq FROM remote_feed"
+            ).fetchone()
+            feed_boundary_seq = int(boundary_row["seq"]) if boundary_row else 0
+            state_row = self.store.db.execute(
+                "SELECT state_epoch, feed_epoch FROM remote_state WHERE id=1"
+            ).fetchone()
+            feed_epoch = int(state_row["feed_epoch"]) if state_row and state_row["feed_epoch"] else 1
+            snapshot_id = f"snap-{uuid.uuid4().hex}"
+            while len(self._snapshot_cache) >= 8:
+                self._snapshot_cache.pop(next(iter(self._snapshot_cache)))
+            self._snapshot_cache[snapshot_id] = {
+                "state_epoch": state_epoch,
+                "high_water": high_water,
+                "jobs": jobs,
+                "events": events_by_job,
+                "feed_boundary_seq": feed_boundary_seq,
+                "feed_epoch": feed_epoch,
+            }
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            return self._error_frame(frame, code="INVALID_REQUEST", message="invalid snapshot_id")
+        cached = self._snapshot_cache.get(snapshot_id)
+        if cached is None:
+            return self._error_frame(frame, code="SNAPSHOT_EXPIRED", message="snapshot expired; restart sync")
+        state_epoch = int(cached["state_epoch"])
+        if self._remote_state_epoch() != state_epoch:
+            self._snapshot_cache.pop(snapshot_id, None)
+            return self._error_frame(frame, code="STATE_EPOCH_MISMATCH", message="snapshot timeline changed")
+        high_water = int(cached["high_water"])
+        remaining = [job for job in cached["jobs"] if job["job_id"] > after_job_id]
+        has_more = len(remaining) > self.SNAPSHOT_PAGE_SIZE
+        jobs = remaining[: self.SNAPSHOT_PAGE_SIZE]
         event_water = dict(cursor.get("event_water") or {}) if isinstance(cursor.get("event_water"), dict) else {}
         events = []
         for job in jobs:
             job_high = int(event_water.get(job["job_id"]) or 0)
-            for event_row in manager.db.execute(
-                "SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at "
-                "FROM events WHERE job_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
-                (job["job_id"], job_high, self.SNAPSHOT_EVENT_LIMIT),
-            ).fetchall():
+            for event_row in cached["events"].get(job["job_id"], []):
+                if int(event_row["seq"]) <= job_high:
+                    continue
                 events.append(dict(event_row))
                 job_high = max(job_high, int(event_row["seq"]))
             if job_high:
@@ -717,18 +819,25 @@ class RemoteJobManager:
             "after_job_id": jobs[-1]["job_id"] if jobs else after_job_id,
             "event_water": event_water,
             "high_water": high_water,
+            "snapshot_id": snapshot_id,
         }
         # Reads travel in a standard response frame's result so the controller
         # run_request path handles them uniformly; the inner kind identifies
         # the payload shape.
-        return self._response_frame(frame, {
+        response = self._response_frame(frame, {
             "kind": "snapshot",
-            "state_epoch": self._remote_state_epoch(),
+            "state_epoch": state_epoch,
+            "feed_epoch": int(cached["feed_epoch"]),
+            "feed_boundary_seq": int(cached["feed_boundary_seq"]),
+            "snapshot_id": snapshot_id,
             "cursor": next_cursor,
             "jobs": jobs,
             "events": events,
             "has_more": has_more,
         })
+        if not has_more:
+            self._snapshot_cache.pop(snapshot_id, None)
+        return response
 
     # ------------------------------------------------------------------
     # Change feed (Phase 4)
@@ -856,9 +965,24 @@ class RemoteJobManager:
         if not _stat.S_ISREG(info.st_mode):
             return self._error_frame(frame, code="INVALID_REQUEST", message="log is not a regular file")
         file_size = int(info.st_size)
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            content = handle.read(size)
+        # Open the already-validated inode, refusing a final symlink where the
+        # platform exposes O_NOFOLLOW. On platforms without it, compare the
+        # opened descriptor's identity to the pre-open stat and fail closed on
+        # a swap; reads then remain descriptor-bound.
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(str(path), flags)
+            opened = os.fstat(fd)
+            if not _stat.S_ISREG(opened.st_mode) or (
+                opened.st_dev != info.st_dev or opened.st_ino != info.st_ino
+            ):
+                os.close(fd)
+                return self._error_frame(frame, code="INVALID_REQUEST", message="log changed during validation")
+            with os.fdopen(fd, "rb") as handle:
+                handle.seek(offset)
+                content = handle.read(size)
+        except OSError:
+            return self._error_frame(frame, code="INVALID_REQUEST", message="log is not safely readable")
         truncated = (offset + len(content)) < file_size
         return self._response_frame(frame, {
             "kind": "log_range",

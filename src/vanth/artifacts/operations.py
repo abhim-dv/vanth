@@ -28,13 +28,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import errno
 import secrets
 import shutil
 import stat
+import sys
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..remote.protocol import request_digest
 from .catalog import Catalog, is_recovery_required, new_id, now_iso
@@ -92,6 +95,13 @@ class ArtifactOperations:
         # Test hook: called between staging and blob publication so crash cases
         # can inject a failure while staging state is still discoverable.
         self.crash_hook = None
+
+    def _lease_tick(self, op_id: str, claim_token: str, state: list[float], *, force: bool = False) -> None:
+        """Renew long-running work without a database write per small chunk."""
+        now = time.monotonic()
+        if force or now - state[0] >= max(1.0, self.lease_seconds / 3):
+            self.renew(op_id, claim_token)
+            state[0] = now
 
     # ------------------------------------------------------------------
     # Durable operation plumbing
@@ -363,6 +373,7 @@ class ArtifactOperations:
         data: bytes | bytearray | memoryview | None = None,
         source_path: str | os.PathLike[str] | None = None,
         idempotency_key: str | None = None,
+        publish_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Publish file content as an immutable version of root ``name``.
 
@@ -397,11 +408,15 @@ class ArtifactOperations:
         claimed = self._claim(op["op_id"])
         token = claimed["claim_token"]
         try:
+            lease_state = [time.monotonic()]
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
+            if publish_guard is not None and not publish_guard():
+                raise ValueError("publication fence changed during artifact transfer")
             root = self._get_or_create_root(name)
             existing = self.catalog.db.execute(
                 "SELECT * FROM versions WHERE root_id=? AND manifest_digest=?", (root["root_id"], mdigest)
             ).fetchone()
-            if existing:
+            if existing and publish_guard is None:
                 # Dedup must never hand back a CORRUPT version: verify the
                 # referenced blob before returning it. On mismatch, fall
                 # through and republish (repairing the content) instead of
@@ -420,6 +435,7 @@ class ArtifactOperations:
                     self.complete(op["op_id"], token, result)
                     return result
             staged = self.blobs.stage(data)
+            self._lease_tick(op["op_id"], token, lease_state)
             if self.crash_hook is not None:
                 self.crash_hook(op["op_id"])
             intent = self._write_intent(
@@ -430,6 +446,7 @@ class ArtifactOperations:
             # can never unlink the blob in between (review P1-9).
             with self.blobs.gc_fence():
                 self.blobs.publish_staged(staged, manifest["sha256"])
+                self._lease_tick(op["op_id"], token, lease_state, force=True)
                 # Publication transaction boundary: the blob is durable above;
                 # the single transaction below commits version + root pointer
                 # + fenced op completion.
@@ -437,6 +454,8 @@ class ArtifactOperations:
                 with self.catalog.lock:
                     db.execute("BEGIN IMMEDIATE")
                     try:
+                        if publish_guard is not None and not publish_guard():
+                            raise ValueError("publication fence changed during artifact transfer")
                         row = db.execute(
                             "SELECT version_id FROM versions WHERE root_id=? AND manifest_digest=?",
                             (root["root_id"], mdigest),
@@ -541,17 +560,24 @@ class ArtifactOperations:
                 "SELECT * FROM versions WHERE root_id=? AND manifest_digest=?", (root["root_id"], mdigest)
             ).fetchone()
             if existing:
-                result = {
-                    "version_id": existing["version_id"],
-                    "root_id": root["root_id"],
-                    "name": name,
-                    "manifest_digest": mdigest,
-                    "size_bytes": int(existing["size_bytes"]),
-                    "file_count": sum(1 for e in manifest["entries"] if e["kind"] == "file"),
-                    "deduplicated": True,
-                }
-                self.complete(op["op_id"], token, result)
-                return result
+                # Never deduplicate a directory whose referenced blobs have
+                # gone missing or been tampered with; republish repairs it.
+                existing_ok = all(
+                    self.blobs.has_blob(str(e["sha256"])) and self.blobs.verify_blob(str(e["sha256"]))
+                    for e in manifest["entries"] if e["kind"] == "file"
+                )
+                if existing_ok:
+                    result = {
+                        "version_id": existing["version_id"],
+                        "root_id": root["root_id"],
+                        "name": name,
+                        "manifest_digest": mdigest,
+                        "size_bytes": int(existing["size_bytes"]),
+                        "file_count": sum(1 for e in manifest["entries"] if e["kind"] == "file"),
+                        "deduplicated": True,
+                    }
+                    self.complete(op["op_id"], token, result)
+                    return result
             # Stage every unique blob first (dedup by construction via the
             # content-addressed set of sha256s), then publish each one —
             # publish_staged re-hashes the staged bytes against the manifest
@@ -562,8 +588,11 @@ class ArtifactOperations:
                     continue
                 unique_shas.setdefault(entry["sha256"], str(source / str(entry["path"]).replace("/", os.sep)))
             staged_paths: list[tuple[Path, str]] = []
+            lease_state = [time.monotonic()]
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
             for sha256, file_path in unique_shas.items():
                 staged_paths.append((self.blobs.stage(file_path), sha256))
+                self._lease_tick(op["op_id"], token, lease_state)
             if self.crash_hook is not None:
                 self.crash_hook(op["op_id"])
             intent = self._write_intent(
@@ -577,12 +606,7 @@ class ArtifactOperations:
             with self.blobs.gc_fence():
                 for staged, sha256 in staged_paths:
                     self.blobs.publish_staged(staged, sha256)
-                    # Long captures must not have their lease expire mid-work
-                    # (review P2-12).
-                    try:
-                        self.renew(op["op_id"], token)
-                    except ValueError:
-                        pass
+                    self._lease_tick(op["op_id"], token, lease_state)
                 # Publication transaction boundary (same as put_file): blobs are
                 # durable above; this single transaction commits version + root
                 # pointer + fenced op completion.
@@ -801,24 +825,42 @@ class ArtifactOperations:
             if not row:
                 raise ValueError(f"Unknown version_id: {version_id}")
             manifest = json.loads(row["manifest_json"])
+            lease_state = [time.monotonic()]
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
             if manifest.get("kind") == "dir":
-                result = self._materialize_dir(manifest, dest, version_id, int(row["size_bytes"]))
+                result = self._materialize_dir(
+                    manifest, dest, version_id, int(row["size_bytes"]),
+                    heartbeat=lambda: self._lease_tick(op["op_id"], token, lease_state),
+                )
+                self._lease_tick(op["op_id"], token, lease_state, force=True)
                 self.complete(op["op_id"], token, result)
                 return result
             sha256 = manifest["sha256"]
             if not self.blobs.has_blob(sha256):
                 raise ValueError(f"blob missing for version {version_id}: {sha256}")
-            existed = dest.exists()
+            existed = os.path.lexists(dest)
+            if existed:
+                info = os.lstat(dest)
+                if self._is_reparse(info):
+                    raise ValueError(f"destination is a symlink/reparse point; refusing: {dest}")
             if existed and not overwrite:
                 raise ValueError(f"destination already exists: {dest}")
+            lease_state = [time.monotonic()]
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
             staged = self.blobs.stage(self.blobs.blob_path(sha256))
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # Fail-closed parent sweep + immediate pre-rename revalidation
-            # (review P1-11): a parent swapped for a symlink/reparse point
-            # after earlier checks aborts here instead of writing through it.
+            self._lease_tick(op["op_id"], token, lease_state)
+            # Fail-closed parent sweep BEFORE mkdir (Sol review): creating
+            # directories must never happen through a symlink/reparse
+            # ancestor that the sweep is about to reject.
             self._verify_dest_parents(dest)
-            os.replace(staged, dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Immediate pre-rename revalidation (review P1-11): a parent
+            # swapped for a symlink/reparse point after earlier checks aborts
+            # here instead of writing through it.
+            self._verify_dest_parents(dest)
+            self._publish_staged_file(staged, dest, overwrite=overwrite)
             self._verify_dest_parents(dest.parent)
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
             result = {
                 "version_id": version_id,
                 "dest_path": str(dest),
@@ -872,7 +914,108 @@ class ArtifactOperations:
                     f"refusing to materialize through a symlink/reparse-point path component: {probe}"
                 )
 
-    def _build_tree_into_staging(self, staging: Path, entries: list[dict[str, Any]]) -> None:
+    @staticmethod
+    def _open_parent_fd(parent: Path) -> int:
+        """Open an absolute POSIX directory chain one component at a time.
+
+        Every hop is descriptor-relative and ``O_NOFOLLOW`` so replacing an
+        ancestor after it has been opened cannot redirect final publication.
+        """
+        absolute = Path(os.path.abspath(parent))
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open(absolute.anchor, flags)
+        try:
+            for component in absolute.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @classmethod
+    def _rename_noreplace(cls, src: str | bytes, dst: str | bytes, *, dst_dir_fd: int | None = None,
+                          src_dir_fd: int | None = None) -> None:
+        """Atomically publish without replacing an object that raced in.
+
+        Linux uses ``renameat2(RENAME_NOREPLACE)``. Every other POSIX
+        platform (macOS, BSDs — Sol review) falls back to a hardlink
+        publication for files (``link(2)`` is itself no-replace) and a
+        checked rename otherwise."""
+        if os.name == "nt":
+            os.rename(src, dst)
+            return
+        if sys.platform.startswith("linux"):
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = getattr(libc, "renameat2", None)
+            if renameat2 is None:
+                raise OSError(errno.ENOTSUP, "renameat2 is unavailable")
+            at_fdcwd = -100
+            old_fd = at_fdcwd if src_dir_fd is None else src_dir_fd
+            new_fd = at_fdcwd if dst_dir_fd is None else dst_dir_fd
+            old_name = os.fsencode(src)
+            new_name = os.fsencode(dst)
+            if renameat2(old_fd, old_name, new_fd, new_name, 1) != 0:  # RENAME_NOREPLACE
+                code = ctypes.get_errno()
+                raise OSError(code, os.strerror(code), os.fsdecode(dst))
+            return
+        cls._rename_noreplace_portable(src, dst, dst_dir_fd=dst_dir_fd, src_dir_fd=src_dir_fd)
+
+    @classmethod
+    def _rename_noreplace_portable(cls, src: str | bytes, dst: str | bytes, *,
+                                   dst_dir_fd: int | None = None,
+                                   src_dir_fd: int | None = None) -> None:
+        """No-replace publish without renameat2 (macOS/BSD — Sol review).
+
+        1. Files: ``link()`` is atomic and fails with EEXIST when the target
+           exists; the source is unlinked only after a successful link.
+        2. Anything link cannot handle (directories, cross-device staging):
+           re-check the destination and rename. The lstat+rename window is
+           small and both paths are already component-checked; this residual
+           race is documented platform behavior."""
+        try:
+            os.link(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=False)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            if exc.errno not in (
+                errno.EPERM, errno.EXDEV, errno.EOPNOTSUPP, errno.ENOSYS, errno.EMLINK,
+                errno.ENOSPC,
+            ):
+                raise
+            try:
+                existing = os.lstat(dst, dir_fd=dst_dir_fd) if dst_dir_fd is not None else os.lstat(dst)
+            except FileNotFoundError:
+                existing = None
+            except OSError as lerr:
+                raise OSError(lerr.errno, os.strerror(lerr.errno), os.fsdecode(dst)) from None
+            if existing is not None:
+                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), os.fsdecode(dst)) from None
+            os.rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            return
+        # Link succeeded: remove the staged source (same directory tree).
+        if src_dir_fd is not None:
+            os.unlink(src, dir_fd=src_dir_fd)
+        else:
+            os.unlink(src)
+
+    def _publish_staged_file(self, staged: Path, dest: Path, *, overwrite: bool) -> None:
+        if os.name == "nt":
+            (os.replace if overwrite else os.rename)(staged, dest)
+            return
+        parent_fd = self._open_parent_fd(dest.parent)
+        try:
+            if overwrite:
+                os.replace(staged, dest.name, dst_dir_fd=parent_fd)
+            else:
+                self._rename_noreplace(str(staged), dest.name, dst_dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def _build_tree_into_staging(self, staging: Path, entries: list[dict[str, Any]], heartbeat=None) -> None:
         """Create every manifest entry under the fresh staging directory.
 
         Each path component is lstat-checked immediately before use and
@@ -919,6 +1062,8 @@ class ArtifactOperations:
                     for chunk in iter(lambda: src.read(1024 * 1024), b""):
                         digest.update(chunk)
                         out.write(chunk)
+                        if heartbeat is not None:
+                            heartbeat()
             except BaseException:
                 try:
                     target.unlink()
@@ -947,6 +1092,7 @@ class ArtifactOperations:
         dest: Path,
         version_id: str,
         size_bytes: int,
+        heartbeat=None,
     ) -> dict[str, Any]:
         from .manifest import validate_manifest_v1
 
@@ -958,9 +1104,12 @@ class ArtifactOperations:
                 f"destination already exists: {dest}; directory materialization never merges "
                 "(overwrite does not apply to directories)"
             )
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        # Refuse a planted symlink/junction anywhere along the parent chain.
+        # Refuse a planted symlink/junction anywhere along the parent chain
+        # BEFORE creating anything (Sol review) — mkdir must never run through
+        # an ancestor the sweep is about to reject.
         self._check_component_chain(dest.parent)
+        self._verify_dest_parents(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
         # Fail-closed sweep (review P1-11): any lstat error on an existing
         # ancestor is fatal, not "safe".
         self._verify_dest_parents(dest)
@@ -971,14 +1120,42 @@ class ArtifactOperations:
         if missing:
             raise ValueError(f"blobs missing for dir version {version_id}: {', '.join(missing)}")
 
-        staging = dest.parent / f".{dest.name}.materializing-{uuid.uuid4().hex}"
-        staging.mkdir()
+        staging_name = f".{dest.name}.materializing-{uuid.uuid4().hex}"
+        parent_fd = None
+        if os.name == "nt":
+            staging = dest.parent / staging_name
+            staging.mkdir()
+        else:
+            parent_fd = self._open_parent_fd(dest.parent)
+            os.mkdir(staging_name, dir_fd=parent_fd)
+            fd_root = Path(f"/proc/self/fd/{parent_fd}")
+            if sys.platform.startswith("linux") and fd_root.exists():
+                # Linux: keep the whole tree build descriptor-bound.
+                staging = fd_root / staging_name
+            else:
+                # macOS/BSD have no /proc/self/fd (Sol review): use the plain
+                # path, but prove the parent we are about to traverse is still
+                # the directory the descriptor was opened for.
+                parent_stat = os.stat(dest.parent)
+                fd_stat = os.fstat(parent_fd)
+                if (parent_stat.st_dev, parent_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+                    os.close(parent_fd)
+                    parent_fd = None
+                    raise ValueError(
+                        f"destination parent changed during materialization; refusing: {dest.parent}"
+                    )
+                staging = dest.parent / staging_name
         try:
             try:
-                self._build_tree_into_staging(staging, entries)
+                self._build_tree_into_staging(staging, entries, heartbeat)
                 # Atomic swap into place: rename fails rather than merges if
                 # a destination raced into existence.
-                os.rename(staging, dest)
+                if parent_fd is None:
+                    self._rename_noreplace(staging, dest)
+                else:
+                    self._rename_noreplace(
+                        staging_name, dest.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                    )
             except OSError as exc:
                 raise ValueError(
                     f"destination already exists or became unusable: {dest} ({exc})"
@@ -986,6 +1163,9 @@ class ArtifactOperations:
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
         return {
             "version_id": version_id,
             "dest_path": str(dest),
@@ -1007,6 +1187,8 @@ class ArtifactOperations:
             if not row:
                 raise ValueError(f"Unknown version_id: {version_id}")
             manifest = json.loads(row["manifest_json"])
+            lease_state = [time.monotonic()]
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
             if manifest.get("kind") == "dir":
                 # Verify EVERY referenced blob; empty-dir entries carry the
                 # well-known empty-content digest and no blob of their own.
@@ -1024,6 +1206,7 @@ class ArtifactOperations:
                         with self.blobs.blob_path(expected).open("rb") as handle:
                             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                                 digest.update(chunk)
+                                self._lease_tick(op["op_id"], token, lease_state)
                         actual = digest.hexdigest()
                     entry_ok = actual == expected
                     report = {
@@ -1045,6 +1228,7 @@ class ArtifactOperations:
                     "entries": entry_reports,
                     "offending_paths": offending,
                 }
+                self._lease_tick(op["op_id"], token, lease_state, force=True)
                 self.complete(op["op_id"], token, result)
                 return result
             expected = manifest["sha256"]
@@ -1054,6 +1238,7 @@ class ArtifactOperations:
                 with self.blobs.blob_path(expected).open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
+                        self._lease_tick(op["op_id"], token, lease_state)
                 actual = digest.hexdigest()
             ok = actual == expected
             result = {
@@ -1062,6 +1247,7 @@ class ArtifactOperations:
                 "expected_sha256": expected,
                 "actual_sha256": actual,
             }
+            self._lease_tick(op["op_id"], token, lease_state, force=True)
             self.complete(op["op_id"], token, result)
             return result
         except BaseException as exc:
