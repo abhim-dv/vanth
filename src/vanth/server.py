@@ -3185,6 +3185,20 @@ def main(argv: list[str] | None = None) -> None:
         "autostart", "--version", "version", "remote",
     }:
         raise SystemExit(cli_main(args))
+    # Interactive misuse guard (user report): bare `vanth` typed in a real
+    # terminal would otherwise start the MCP stdio server and appear to
+    # "hang" reading JSON-RPC from the keyboard. Real MCP clients always
+    # run us with pipes, never a TTY on stdin.
+    if not args and sys.stdin.isatty() and sys.stdout.isatty():
+        print(
+            "vanth: refusing to start the MCP stdio server in an interactive "
+            "terminal.\n"
+            "  - Terminal dashboard:            vanth-monitor\n"
+            "  - Human subcommands:             vanth doctor | status | setup\n"
+            "  - MCP clients launch `vanth` with pipes automatically.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     _hint_setup()
     _run_mcp_server()
 

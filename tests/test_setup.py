@@ -5,6 +5,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from vanth import setup
 from vanth.paths import canonical_home
 
@@ -189,3 +191,38 @@ def test_server_entry_keeps_bare_mcp(capsys, monkeypatch):
     monkeypatch.setattr(server.mcp, "run", lambda: called.append("mcp"))
     server.main([])
     assert called == ["mcp"]
+
+
+def test_bare_vanth_tty_guard_prints_usage(monkeypatch, capsys):
+    """User report rc23: bare `vanth` in an interactive terminal started the
+    MCP stdio server and appeared to hang. With a TTY stdin+stdout and no
+    args we must print guidance and exit 2 instead."""
+    import vanth.server as server
+
+    monkeypatch.setattr(server.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(server.sys.stdout, "isatty", lambda: True)
+    called = {"mcp": False}
+
+    def _boom():
+        called["mcp"] = True
+
+    monkeypatch.setattr(server, "_run_mcp_server", _boom)
+    with pytest.raises(SystemExit) as exc:
+        server.main([])
+    assert exc.value.code == 2
+    assert "vanth-monitor" in capsys.readouterr().err
+    assert called["mcp"] is False
+
+
+def test_bare_vanth_piped_still_runs_mcp(monkeypatch):
+    """MCP clients always run bare `vanth` with pipes; the TTY guard must
+    not interfere with them."""
+    import vanth.server as server
+
+    monkeypatch.setattr(server.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(server.sys.stdout, "isatty", lambda: False)
+    monkeypatch.setenv("VANTH_NO_SETUP_HINT", "1")
+    ran = {"mcp": False}
+    monkeypatch.setattr(server, "_run_mcp_server", lambda: ran.__setitem__("mcp", True))
+    server.main([])
+    assert ran["mcp"] is True

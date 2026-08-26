@@ -45,18 +45,32 @@ def test_find_monitor_prefers_bundled(tmp_path, monkeypatch):
     assert find_monitor_binary() == pkg / "monitor-bin" / _binary_name()
 
 
-def test_no_binary_and_no_go_raises(tmp_path, monkeypatch):
+def test_no_binary_raises_with_reinstall_guidance(tmp_path, monkeypatch):
+    """User report: source/sdist installs have no bundled binary. The wrapper
+    must fail fast with a reinstall recommendation — no Go fallback, no
+    standalone-binary override."""
     pkg = _fake_bundled(tmp_path, monkeypatch)
     shutil.rmtree(pkg / "monitor-bin")
-    # Point the dev cache at a fresh empty dir so no cached binary masks the
-    # missing-go path.
+    # A stale env override and cached dev build must both be ignored.
+    monkeypatch.setenv("VANTH_MONITOR_BIN", str(tmp_path / "nope.exe"))
     cache_dir = tmp_path / "fresh-cache"
     monkeypatch.setenv("VANTH_CACHE_DIR", str(cache_dir))
-    # Ensure `go` is not resolvable.
-    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    (tmp_path / "empty").mkdir(exist_ok=True)
-    with pytest.raises(RuntimeError, match="go"):
+    with pytest.raises(RuntimeError) as exc:
         find_monitor_binary()
+    assert "uv tool install" in str(exc.value)
+    assert "monitor-bin" in str(exc.value)
+
+
+def test_main_prints_error_and_exits_2_without_binary(
+    tmp_path, monkeypatch, capsys
+):
+    pkg = _fake_bundled(tmp_path, monkeypatch)
+    shutil.rmtree(pkg / "monitor-bin")
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "argv", ["vanth-monitor"])
+    assert main() == 2
+    assert "not present in this install" in capsys.readouterr().err
 
 
 def test_main_returns_binary_exit_code(tmp_path, monkeypatch):

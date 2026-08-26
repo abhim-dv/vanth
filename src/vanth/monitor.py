@@ -1,21 +1,18 @@
 """Console entry point for the native Go terminal monitor.
 
 The monitor is a read-only Go binary that renders Vanth's durable SQLite/JSONL
-state as a Bubble Tea TUI. The Python package bundles the host-platform binary
-inside the wheel (``vanth/monitor-bin/vanth-monitor``) and this module locates
-and re-executes it, so ``uv run vanth-monitor`` works without a separate Go
-toolchain.
+state as a Bubble Tea TUI. Platform wheels bundle the host-platform binary
+inside the wheel (``vanth/monitor-bin/vanth-monitor``); this module locates and
+re-executes it, so ``vanth-monitor`` works without a Go toolchain.
 
-When no bundled binary is present (e.g. a source checkout before a build), the
-wrapper falls back to building the monitor from the repository's Go module
-into a user cache directory. That keeps development workflows working while
-releases ship the real artifact.
+If the bundled binary is missing (source checkout or sdist install), the
+wrapper errors out and recommends reinstalling from a platform wheel — a
+standalone-binary override or local Go build is deliberately NOT attempted.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,51 +38,27 @@ def bundled_binary() -> Path | None:
     return None
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _dev_cache_binary() -> Path:
-    """Return a cached build of the monitor for source checkouts.
-
-    The build is cached under the user cache dir so repeated invocations do
-    not recompile. It is rebuilt only if the cache entry is missing.
-    """
-    override = os.environ.get("VANTH_CACHE_DIR")
-    cache_root = Path(override) if override else Path.home() / ".cache" / "vanth"
-    binary = cache_root / "monitor" / _binary_name()
-    if binary.is_file():
-        return binary
-
-    repo = _repo_root()
-    go = shutil.which("go")
-    if go is None:
-        raise RuntimeError(
-            "no bundled vanth-monitor binary found, and 'go' is not on PATH; "
-            "run `uv build` to produce a wheel with the native monitor"
-        )
-    build_dir = repo / "cmd" / "vanth"
-    if not (build_dir / "main.go").is_file():
-        raise RuntimeError(f"expected Go monitor source at {build_dir}")
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [go, "build", "-o", str(binary), "."],
-        cwd=str(build_dir),
-        check=True,
-    )
-    return binary
-
-
 def find_monitor_binary() -> Path:
-    """Return the path to an executable monitor binary for this platform."""
+    """Return the bundled monitor binary, or raise with a fix-it message."""
     bundled = bundled_binary()
-    if bundled is not None:
-        return bundled
-    return _dev_cache_binary()
+    if bundled is None:
+        raise RuntimeError(
+            "the vanth-monitor native binary is not present in this install.\n"
+            "This happens when vanth was installed from source or an sdist "
+            "instead of a platform wheel. Fix:\n"
+            "  uv tool install --force <platform wheel URL or 'vanth' from "
+            "PyPI>\n"
+            f"(looked in: {Path(vanth.__file__).parent / _BIN_DIR_NAME})"
+        )
+    return bundled
 
 
 def main() -> int:
-    binary = find_monitor_binary()
+    try:
+        binary = find_monitor_binary()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     args = sys.argv[1:]
     # The native binary uses subcommands; default to the monitor when invoked
     # via the dedicated console script (vanth-monitor).

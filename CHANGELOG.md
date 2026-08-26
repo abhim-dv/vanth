@@ -4,6 +4,18 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Field-report fixes (from 1.6.0-rc23 pre-release use)
+
+- **Bare `vanth` in a terminal no longer "hangs"**: with a TTY on stdin and
+  stdout and no subcommand, the MCP stdio server refuses to start, prints
+  where to find the dashboard (`vanth-monitor`) and human subcommands, and
+  exits 2. Piped invocations (real MCP clients) are unaffected.
+- **`vanth-monitor` fails fast without the bundled binary**: source/sdist
+  installs raise a clear reinstall-from-platform-wheel error instead of the
+  misleading "`go` not on PATH; run `uv build`" — local Go builds and
+  standalone-binary overrides were removed so shipped wheels are the single
+  supported path.
+
 ### RC22 review fixes
 
 - **P1 lost-transport stop re-drive**: the public `stop()` convergence path
