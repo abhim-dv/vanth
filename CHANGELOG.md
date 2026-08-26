@@ -6,6 +6,13 @@ All notable changes to Vanth are documented here.
 
 ### Field-report fixes (from 1.6.0-rc23 pre-release use)
 
+- **Wake targets inherit the launching thread by default**: a
+  `codex_thread`/`opencode_thread` wake target without an explicit
+  `thread_id`/`session_id` now resolves to the caller's thread
+  (`origin_thread_id`, falling back to `CODEX_THREAD_ID` then
+  `OPENCODE_SESSION_ID` from the MCP client environment) instead of failing
+  permanently at delivery time with "requires thread_id". Explicit ids in
+  the target always win, so agents can still fan out to other threads.
 - **Bare `vanth` in a terminal no longer "hangs"**: with a TTY on stdin and
   stdout and no subcommand, the MCP stdio server refuses to start, prints
   where to find the dashboard (`vanth-monitor`) and human subcommands, and

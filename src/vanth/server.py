@@ -904,6 +904,27 @@ class JobManager:
         trigger: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
+        # Thread inheritance (user request): the LAUNCHING thread is the
+        # default wake destination. A codex_thread/opencode_thread target
+        # without its own session/thread id inherits origin_thread_id, which
+        # itself defaults to CODEX_THREAD_ID / OPENCODE_SESSION_ID from the
+        # MCP client environment. Explicit ids in the target always win, so
+        # agents can still fan out to other threads.
+        origin_thread_id = (
+            origin_thread_id
+            or os.environ.get("CODEX_THREAD_ID")
+            or os.environ.get("OPENCODE_SESSION_ID")
+        )
+        if wake_targets and origin_thread_id:
+            for target in wake_targets:
+                if target.get("type") == "opencode_thread" and not (
+                    target.get("session_id") or target.get("sessionId")
+                ):
+                    target["session_id"] = origin_thread_id
+                elif target.get("type") == "codex_thread" and not (
+                    target.get("thread_id") or target.get("threadId")
+                ):
+                    target["thread_id"] = origin_thread_id
         validate_wake_targets(wake_targets)
         if notify_on:
             for target in wake_targets or []:
@@ -930,7 +951,11 @@ class JobManager:
             ),
             None,
         )
-        origin_thread_id = origin_thread_id or os.environ.get("CODEX_THREAD_ID")
+        origin_thread_id = (
+            origin_thread_id
+            or os.environ.get("CODEX_THREAD_ID")
+            or os.environ.get("OPENCODE_SESSION_ID")
+        )
         spec_path = self._write_spec(
             job_id,
             {

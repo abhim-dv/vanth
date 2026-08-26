@@ -458,3 +458,44 @@ def test_multiple_waiters(tmp_path):
         assert [r["event"]["type"] for r in results] == ["checkpoint", "checkpoint"]
 
     run(main())
+
+
+def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
+    """User report: wake notifications silently failed because opencode/codex
+    thread targets demanded an explicit session/thread id. The LAUNCHING
+    thread is now the default destination; explicit ids still win."""
+    import os
+
+    async def main():
+        manager = JobManager(tmp_path)
+        monkeypatch.setenv("OPENCODE_SESSION_ID", "ses_origin")
+        try:
+            started = await manager.start(
+                cmd("print('inherit')"),
+                notify_on=["completed"],
+                wake_targets=[
+                    {"type": "opencode_thread"},                      # inherits
+                    {"type": "opencode_thread", "session_id": "ses_explicit"},  # wins
+                    {"type": "codex_thread", "auto_dispatch": False},  # inherits
+                ],
+            )
+            await manager.wait(started["job_id"], ["completed"], timeout_seconds=30)
+            targets = {
+                t["target_id"]: json.loads(t["config_json"])
+                for t in manager.db.execute(
+                    "SELECT target_id, config_json FROM wake_targets WHERE job_id=?",
+                    (started["job_id"],),
+                ).fetchall()
+            }
+            by_session = {}
+            for config in targets.values():
+                key = config.get("session_id") or ("codex:" + str(config.get("thread_id")))
+                by_session.setdefault(key, 0)
+                by_session[key] += 1
+            assert by_session.get("ses_origin") == 1, by_session
+            assert by_session.get("ses_explicit") == 1, by_session
+            assert by_session.get("codex:ses_origin") == 1, by_session
+        finally:
+            manager.close()
+
+    run(main())
