@@ -527,3 +527,65 @@ def test_snapshot_race_aborts_without_regression(tmp_path):
     assert shadow["status"] == "completed", "newer feed state must survive"
     cursor_after = cstore.get_feed_cursor(rid)
     assert int(cursor_after["seq"]) == 1, "newer cursor must be retained"
+
+
+def test_public_stop_survives_lost_transport(tmp_path):
+    """rc22 P1: a lost-transport stop leaves the request 'submitting'; the
+    SECOND same-key PUBLIC stop() call must reopen transport and converge."""
+    from vanth.remote.control import RemoteControl
+
+    rstore, remote = _stop_world(tmp_path, [("job_a", "running")])
+    cstore = __import__("sys").modules["test_snapshot"].RemoteStore(
+        __import__("sys").modules["test_snapshot"].connect(tmp_path / "controller.sqlite")
+    )
+    crow = cstore.create_remote(target="user@host", state="paired")
+    rid = crow["remote_id"]
+    inner = __import__("sys").modules["test_snapshot"].FakeSessionTransport(remote.handle_request)
+
+    class FlakyTransport:
+        def __init__(self):
+            self.calls = 0
+            self._inner = inner
+
+        def open_session(self, remote_row, home=None):
+            self.calls += 1
+            if self.calls == 1:
+                return None  # transport lost before any bytes
+            return self._inner.open_session(remote_row, home=home)
+
+    control = RemoteControl(cstore, transport=FlakyTransport(), home=tmp_path)
+
+    class Stopper:
+        db_lock = threading.Lock()
+
+        def __init__(self):
+            self.logs = tmp_path
+            self.db = rstore.db
+
+        def stop_sync(self, job_id):
+            raise RuntimeError("transport lost before dispatch")
+
+    remote.manager = Stopper()
+    first = control.stop(rid, "job_a", idempotency_key="key-stop-0300",
+                         expected_state_epoch=1, expected_instance_id="test-instance")
+    # The lost attempt stays durably 'submitting' (no fake terminal result).
+    stored = cstore.get_request_by_key(rid, "key-stop-0300")
+    assert stored["status"] == "submitting"
+    assert control.transport.calls == 1
+
+    # Recovery: same key, transport now works, job actually stops.
+    class StopperOk(Stopper):
+        def stop_sync(self, job_id):
+            self.db.execute("UPDATE jobs SET status='completed' WHERE job_id=?", (job_id,))
+            self.db.commit()
+            return {"status": "completed"}
+
+    remote.manager = StopperOk()
+    second = control.stop(rid, "job_a", idempotency_key="key-stop-0300",
+                          expected_state_epoch=1, expected_instance_id="test-instance")
+    assert second.get("status") == "completed", second
+    assert control.transport.calls >= 2, "second public call must reopen transport"
+    status_now = rstore.db.execute(
+        "SELECT status FROM jobs WHERE job_id='job_a'"
+    ).fetchone()["status"]
+    assert status_now == "completed"

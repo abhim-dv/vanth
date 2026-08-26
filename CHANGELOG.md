@@ -4,6 +4,19 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### RC22 review fixes
+
+- **P1 lost-transport stop re-drive**: the public `stop()` convergence path
+  now also re-drives response-less `submitting` requests (the durable state
+  after transport loss), not just retry-pending `accepted` rows — a second
+  same-key public call reopens transport and completes instead of returning
+  the stale row.
+- **P2 UNC staging paths**: Windows final-path normalization converts
+  `\\?\UNC\server\share\...` to the intended `\\server\share\...` form, so
+  valid UNC staging locations pass containment instead of being falsely
+  rejected; `_final_path()` failures now close the opened handle before
+  propagating (no leaked lock on the staging file).
+
 ### RC21 review fixes
 
 - **P1 public stop convergence**: `control.stop()` (and any same-key public

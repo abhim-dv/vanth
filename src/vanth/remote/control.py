@@ -814,11 +814,12 @@ class RemoteControl:
             remote_id, "job.stop", payload,
             idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch, expected_instance_id=expected_instance_id,
         )
-        # Re-drive non-terminal requests (rc21 review P1a): an 'accepted'
-        # row WITHOUT a response is a retry-pending stop — the public API
-        # must keep converging it, not hand back the stale row.
+        # Re-drive non-terminal requests (rc21 review P1a / rc22 review P1):
+        # an 'accepted' row WITHOUT a response is a retry-pending stop, and a
+        # 'submitting' row is a LOST-transport attempt — the public API must
+        # keep converging both instead of handing back the stale row.
         if request["status"] == "creating" or (
-            request["status"] == "accepted" and not request.get("response")
+            request["status"] in ("accepted", "submitting") and not request.get("response")
         ):
             return self.run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
         return request

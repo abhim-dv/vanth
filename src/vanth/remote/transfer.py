@@ -291,9 +291,12 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
                 final = buf.value
                 break
             size = written  # required size; retry with a bigger buffer
-        # Strip the \\?\ prefix and normalize case for comparison.
-        if final.startswith("\\\\?\\"):
-            final = final[4:]
+        # Normalize device forms (rc22 review): \\?\UNC\server\share must
+        # compare equal to the intended \\server\share path.
+        if final.startswith("\\\\?\\UNC\\"):
+            final = "\\\\" + final[len("\\\\?\\UNC\\"):]
+        elif final.startswith("\\\\?\\"):
+            final = final[len("\\\\?\\"):]
         return _os.path.normcase(final)
 
     access = (GENERIC_READ | GENERIC_WRITE) if write else GENERIC_READ
@@ -328,7 +331,13 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
     # consistently redirected by a swapped ancestor junction — resolve the
     # FINAL path of the I/O handle and require it to be the intended file.
     intended = _os.path.normcase(_os.path.abspath(str(path)))
-    resolved = _final_path(handle)
+    try:
+        resolved = _final_path(handle)
+    except BaseException:
+        # Fail closed AND close the raw handle (rc22 review P2): a leaked
+        # handle keeps the staging file locked after the abort.
+        kernel32.CloseHandle(_ctypes.c_void_p(handle))
+        raise
     if resolved != intended:
         kernel32.CloseHandle(_ctypes.c_void_p(handle))
         raise TransferAborted(
