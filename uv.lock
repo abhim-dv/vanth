@@ -867,7 +867,7 @@ wheels = [
 
 [[package]]
 name = "vanth"
-version = "1.6.0rc21"
+version = "1.6.0rc22"
 source = { editable = "." }
 dependencies = [
     { name = "loguru" },

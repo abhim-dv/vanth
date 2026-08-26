@@ -1012,8 +1012,14 @@ class ArtifactOperations:
                 else:
                     src_info = os.lstat(src)
                 src_is_dir = stat.S_ISDIR(src_info.st_mode)
-            except OSError:
-                src_is_dir = False
+            except OSError as exc:
+                # Fail closed (rc21 review): an unknown source type must
+                # never reach the non-atomic rename fallback.
+                raise OSError(
+                    exc.errno or errno.EIO,
+                    f"cannot establish source type for no-replace publication: {exc}",
+                    os.fsdecode(dst),
+                ) from None
             if src_is_dir:
                 raise OSError(
                     errno.ENOSYS,

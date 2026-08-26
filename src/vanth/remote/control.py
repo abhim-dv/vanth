@@ -436,6 +436,11 @@ class RemoteControl:
         feed_boundary_seq = None
         feed_epoch = None
         pages: list[dict[str, Any]] = []
+        # Baseline durable progress BEFORE fetching (rc21 review P2): the
+        # publish transaction aborts if a concurrent feed batch moved it.
+        with self.store.db_lock:
+            baseline_cursor = self.store.get_feed_cursor(remote_id)
+            baseline_epoch = int(self.store.get_remote(remote_id)["state_epoch"])
         while True:
             snapshot = self.snapshot(remote_id, cursor=cursor)
             # Fail-fast (review rc14 P0-2): a lost/failed page returns {} —
@@ -508,6 +513,20 @@ class RemoteControl:
         with self.store.db_lock:
             self.store.db.execute("BEGIN IMMEDIATE")
             try:
+                # Publish-phase validation (rc21 review P2): if durable feed
+                # progress moved while pages were in flight, this snapshot is
+                # STALE relative to newer state — publishing would revert a
+                # newer shadow and the newer event would be skipped forever.
+                # Abort with nothing written; the caller retries cleanly.
+                current_cursor = self.store.get_feed_cursor(remote_id)
+                current_epoch = int(self.store.get_remote(remote_id)["state_epoch"])
+                if (current_cursor or {}) != (baseline_cursor or {}) or current_epoch != baseline_epoch:
+                    self.store.db.commit()
+                    raise VanthRemoteProtocolError(
+                        "INVALID_REQUEST",
+                        "snapshot raced concurrent feed progress; retry the sync "
+                        "(shadows and cursor left unchanged)",
+                    )
                 applied = 0
                 for page in pages:
                     for job in page["jobs"]:
@@ -795,9 +814,14 @@ class RemoteControl:
             remote_id, "job.stop", payload,
             idempotency_key=idempotency_key, expected_state_epoch=expected_state_epoch, expected_instance_id=expected_instance_id,
         )
-        if request["status"] != "creating":
-            return request
-        return self.run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
+        # Re-drive non-terminal requests (rc21 review P1a): an 'accepted'
+        # row WITHOUT a response is a retry-pending stop — the public API
+        # must keep converging it, not hand back the stale row.
+        if request["status"] == "creating" or (
+            request["status"] == "accepted" and not request.get("response")
+        ):
+            return self.run_request(remote_id, request, expected_state_epoch=expected_state_epoch)
+        return request
 
     def rerun(self, remote_id: str, remote_job_id: str, overrides: dict[str, Any] | None = None, *,
               idempotency_key: str, expected_state_epoch: int | None = None, expected_instance_id: str | None = None) -> dict[str, Any]:

@@ -274,14 +274,23 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
                 info.dwFileAttributes)
 
     def _final_path(handle):
-        """Resolved path of an open handle; None when unavailable."""
+        """Resolved path of an open handle. FAILS CLOSED (rc21 review): API
+        failure or buffer exhaustion raises instead of returning None."""
         size = 1024
-        buf = _ctypes.create_unicode_buffer(size)
-        # FILE_NAME_NORMALIZED = 0
-        written = kernel32.GetFinalPathNameByHandleW(_ctypes.c_void_p(handle), buf, size, 0)
-        if written == 0 or written > size:
-            return None
-        final = buf.value
+        while True:
+            buf = _ctypes.create_unicode_buffer(size)
+            # FILE_NAME_NORMALIZED = 0
+            written = kernel32.GetFinalPathNameByHandleW(
+                _ctypes.c_void_p(handle), buf, size, 0)
+            if written == 0:
+                raise TransferAborted(
+                    "staging containment check failed: cannot resolve the "
+                    f"final path of the staging handle (error {_ctypes.GetLastError()})"
+                )
+            if written <= size:
+                final = buf.value
+                break
+            size = written  # required size; retry with a bigger buffer
         # Strip the \\?\ prefix and normalize case for comparison.
         if final.startswith("\\\\?\\"):
             final = final[4:]
@@ -298,7 +307,12 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
     if exists:
         try:
             identity = _identity(probe)
-            if identity is not None and (identity[3] & FILE_ATTRIBUTE_REPARSE_POINT):
+            if identity is None:
+                # Fail closed (rc21 review): containment cannot be proven.
+                raise TransferAborted(
+                    f"staging containment check failed: cannot query handle information for {path}"
+                )
+            if identity[3] & FILE_ATTRIBUTE_REPARSE_POINT:
                 raise TransferAborted(f"staging leaf is a reparse point; refused: {path}")
         finally:
             kernel32.CloseHandle(_ctypes.c_void_p(probe))
@@ -315,14 +329,18 @@ def _windows_stage_file(path: Path, *, write: bool, create: bool):
     # FINAL path of the I/O handle and require it to be the intended file.
     intended = _os.path.normcase(_os.path.abspath(str(path)))
     resolved = _final_path(handle)
-    if resolved is not None and resolved != intended:
+    if resolved != intended:
         kernel32.CloseHandle(_ctypes.c_void_p(handle))
         raise TransferAborted(
             f"staging leaf resolved outside the intended path; refused: {path} -> {resolved}"
         )
     real_identity = _identity(handle)
-    if identity is not None and real_identity is not None \
-            and real_identity[:3] != identity[:3]:
+    if real_identity is None:
+        kernel32.CloseHandle(_ctypes.c_void_p(handle))
+        raise TransferAborted(
+            f"staging containment check failed: cannot query handle information for {path}"
+        )
+    if identity is not None and real_identity[:3] != identity[:3]:
         kernel32.CloseHandle(_ctypes.c_void_p(handle))
         raise TransferAborted(f"staging leaf was swapped during open; refused: {path}")
     flags = getattr(_os, "O_NOINHERIT", 0)

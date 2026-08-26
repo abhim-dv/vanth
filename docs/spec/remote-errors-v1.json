@@ -30,6 +30,10 @@
       "status": 409,
       "message": "request was bound to a stale remote state epoch"
     },
+    "OPERATION_RETRY_PENDING": {
+      "status": 503,
+      "message": "outcome not yet terminal; retry with the same idempotency key"
+    },
     "UNSUPPORTED_FEATURE": {
       "status": 501,
       "message": "requested feature is not supported"

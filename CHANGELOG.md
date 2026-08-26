@@ -4,6 +4,28 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### RC21 review fixes
+
+- **P1 public stop convergence**: `control.stop()` (and any same-key public
+  call) now RE-DRIVES a retry-pending request — an `accepted` row without a
+  response goes back through `run_request` instead of returning the stale
+  row. Regression test exercises two PUBLIC `stop()` calls through fail →
+  pending → completed.
+- **P1 snapshot/feed race**: the publish phase of a snapshot sync captures
+  durable feed progress before fetching and ABORTS (`raced concurrent feed
+  progress`) when cursor or timeline moved during fetch — a stale snapshot
+  can no longer revert a newer shadow whose event would then be skipped.
+- **P1 schema reconciliation**: `OPERATION_RETRY_PENDING` added to the JSON
+  Schema error enum and `remote-errors-v1.json`; `STATE_EPOCH_MISMATCH`
+  reconciled into both as well.
+- **P2 Windows containment fails closed**: final-path resolution resizes its
+  buffer as required and raises on API failure; handle-identity queries that
+  cannot be completed abort the open instead of proceeding unvalidated.
+- **P2 portable publication**: source-type inspection failures propagate
+  instead of silently taking the non-atomic rename fallback.
+- Snapshot page fetches run outside the global controller DB lock (publish
+  phase still validates and holds it).
+
 ### RC20 adversarial review fixes
 
 - **P1 retryable stops end-to-end**: transient stop failures return the new

@@ -450,3 +450,80 @@ def test_transient_stop_retry_cycle_via_controller(tmp_path):
     final = control.replay(rid, "key-stop-0100")
     assert final.get("response", {}).get("result", {}).get("status") == "completed" or \
            final.get("status") == "completed"
+
+
+def test_public_stop_retries_converge(tmp_path):
+    """rc21 P1: TWO PUBLIC control.stop() calls with the same key must
+    converge — the second call re-drives the retry-pending request instead of
+    returning the stale row."""
+    from vanth.remote.control import RemoteControl
+
+    rstore, remote = _stop_world(tmp_path, [("job_a", "running")])
+    cstore = __import__("sys").modules["test_snapshot"].RemoteStore(
+        __import__("sys").modules["test_snapshot"].connect(tmp_path / "controller.sqlite")
+    )
+    crow = cstore.create_remote(target="user@host", state="paired")
+    rid = crow["remote_id"]
+    control = RemoteControl(cstore,
+                            transport=__import__("sys").modules["test_snapshot"].FakeSessionTransport(
+                                remote.handle_request),
+                            home=tmp_path)
+
+    class BoomManager:
+        db_lock = threading.Lock()
+
+        def __init__(self):
+            self.logs = tmp_path
+            self.db = rstore.db
+
+        def stop_sync(self, job_id):
+            raise RuntimeError("transient manager failure")
+
+    remote.manager = BoomManager()
+    first = control.stop(rid, "job_a", idempotency_key="key-stop-0200",
+                         expected_state_epoch=1, expected_instance_id="test-instance")
+    assert first.get("retry_pending") is True
+
+    class OkManager(BoomManager):
+        def stop_sync(self, job_id):
+            self.db.execute("UPDATE jobs SET status='completed' WHERE job_id=?", (job_id,))
+            self.db.commit()
+            return {"status": "completed"}
+
+    remote.manager = OkManager()
+    # SECOND PUBLIC CALL — no run_request in sight.
+    second = control.stop(rid, "job_a", idempotency_key="key-stop-0200",
+                          expected_state_epoch=1, expected_instance_id="test-instance")
+    assert second.get("status") == "completed", second
+
+
+def test_snapshot_race_aborts_without_regression(tmp_path):
+    """rc21 P2: a feed update landing mid-fetch makes the snapshot publish
+    ABORT — the newer 'completed' shadow and its cursor survive untouched."""
+    cstore, rstore, remote, control, row, jobs_db, logs = make_world(
+        tmp_path, job_rows=[(f"job_{i:03d}", "running") for i in range(60)]
+    )
+    rid = row["remote_id"]
+
+    original_handler = control.transport.handler
+    injected = {"done": False}
+
+    def racing_handler(frame):
+        resp = original_handler(frame)
+        if frame.get("method") == "job.snapshot" and not injected["done"]:
+            # A concurrent feed batch lands mid-fetch.
+            injected["done"] = True
+            cstore.upsert_shadow(remote_id=rid, remote_job_id="job_000",
+                                 status="completed",
+                                 payload={"status": "completed"}, state_epoch=1)
+            cstore.set_feed_cursor(rid, {"state_epoch": 1, "feed_epoch": 1, "seq": 1})
+        return resp
+
+    control.transport.handler = racing_handler
+    with pytest.raises(Exception, match="raced concurrent feed progress"):
+        control.sync_snapshot(rid)
+
+    shadow = next(s for s in control.shadows(rid) if s["remote_job_id"] == "job_000")
+    assert shadow["status"] == "completed", "newer feed state must survive"
+    cursor_after = cstore.get_feed_cursor(rid)
+    assert int(cursor_after["seq"]) == 1, "newer cursor must be retained"
