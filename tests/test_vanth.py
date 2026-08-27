@@ -499,3 +499,160 @@ def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
             manager.close()
 
     run(main())
+
+
+def test_policy_validation_rejects_bad_shapes(tmp_path):
+    from vanth.server import validate_policy
+    import pytest
+
+    with pytest.raises(ValueError, match="after_n"):
+        validate_policy({"on_failure": {"after_n": 0, "action": "alert"}})
+    with pytest.raises(ValueError, match="action"):
+        validate_policy({"on_failure": {"after_n": 2, "action": "explode"}})
+    with pytest.raises(ValueError, match="job_id"):
+        validate_policy({"on_failure": {"after_n": 2, "action": "run_job"}})
+    with pytest.raises(ValueError, match="expected_interval_seconds"):
+        validate_policy({"schedule": {"expected_interval_seconds": -5}})
+    with pytest.raises(ValueError, match="grace_period_seconds"):
+        validate_policy({"schedule": {"expected_interval_seconds": 60, "grace_period_seconds": "x"}})
+    with pytest.raises(ValueError, match="schedule or on_failure"):
+        validate_policy({"unrelated": {}})
+    assert validate_policy(None) is None
+    assert validate_policy({"schedule": {"expected_interval_seconds": 60}}) == {
+        "schedule": {"expected_interval_seconds": 60, "grace_period_seconds": 0}
+    }
+
+
+def test_dead_mans_switch_emits_job_stuck_and_wake(tmp_path):
+    """A job with a schedule policy that outlives interval+grace emits
+    job_stuck, which flows to wake targets like any other event."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import time; time.sleep(30)"),
+                notify_on=["job_stuck"],
+                wake_targets=[{"type": "codex_thread", "thread_id": "t_dms", "auto_dispatch": False}],
+                policy={"schedule": {"expected_interval_seconds": 1, "grace_period_seconds": 1}},
+            )
+            event = await manager.wait(job["job_id"], ["job_stuck"], timeout_seconds=15)
+            assert event["result"] == "event"
+            assert "past expected interval" in event["event"]["message"]
+            deliveries = manager.deliveries(job["job_id"])["deliveries"]
+            assert any(d["target_type"] == "codex_thread" and d["payload"]["target"]["thread_id"] == "t_dms" for d in deliveries)
+            status = manager.status(job["job_id"])
+            assert status["policy"]["schedule"]["expected_interval_seconds"] == 1
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_dead_mans_switch_emits_schedule_missed(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("print('once')"),
+                policy={"schedule": {"expected_interval_seconds": 1, "grace_period_seconds": 1}},
+            )
+            await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)
+            event = await manager.wait(job["job_id"], ["schedule_missed"], timeout_seconds=15)
+            assert event["result"] == "event"
+            assert "no start" in event["event"]["message"]
+            # Emitted exactly once per window (no duplicate spam).
+            await asyncio.sleep(1.5)
+            missed = [e for e in manager.events(job["job_id"], types=["schedule_missed"], limit=50)["events"]]
+            assert len(missed) == 1
+        finally:
+            manager.close()
+
+    run(main())
+
+
+def test_failure_threshold_alert_action(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 1, "action": "alert"}},
+            )
+            event = await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            assert event["result"] == "event"
+            assert event["event"]["level"] == "error"
+            state = manager._policy_state(job["job_id"])
+            assert state["failure_streak"] >= 1
+            # Alert does NOT disable: rerun is allowed.
+            assert manager._row("SELECT policy_disabled FROM jobs WHERE job_id=?", (job["job_id"],))["policy_disabled"] == 0
+        finally:
+            manager.close()
+
+    run(main())
+
+
+def test_failure_threshold_streak_across_reruns_then_reset(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 2, "action": "alert"}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(1.0)  # let the watcher record streak 1
+            await manager.rerun(job["job_id"])
+            event = await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            assert event["result"] == "event"
+            data = event["event"]["data"]
+            assert data["failure_streak"] >= 2
+            # A successful run (override the failing command) resets the streak.
+            rerun = await manager.rerun(job["job_id"], command=cmd("print('recovered')"))
+            await manager.wait(rerun["job_id"], ["completed"], timeout_seconds=30)
+            await asyncio.sleep(1.0)
+            assert manager._policy_state(rerun["job_id"])["failure_streak"] == 0
+        finally:
+            manager.close()
+
+    run(main())
+
+
+def test_failure_threshold_disable_action_blocks_rerun(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 1, "action": "disable"}},
+            )
+            event = await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            assert event["event"]["data"]["disabled"] is True
+            assert manager._row("SELECT policy_disabled FROM jobs WHERE job_id=?", (job["job_id"],))["policy_disabled"] == 1
+            launch = manager.prepare_launch(job["job_id"])
+            assert launch is None, "disabled job must not relaunch"
+        finally:
+            manager.close()
+
+    run(main())
+
+
+def test_failure_threshold_run_job_action_launches_reaction(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            reaction = await manager.start(cmd("print('cleanup')"), name="reaction-job")
+            await manager.wait(reaction["job_id"], ["completed"], timeout_seconds=30)
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 1, "action": "run_job", "job_id": reaction["job_id"]}},
+            )
+            event = await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            assert event["event"]["data"]["reaction_job_id"] == reaction["job_id"]
+            # The reaction job relaunches via the rerun path.
+            await manager.wait(reaction["job_id"], ["running", "completed"], timeout_seconds=30)
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())

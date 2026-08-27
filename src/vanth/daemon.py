@@ -185,7 +185,7 @@ def _remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if key in {
             "command", "cwd", "name", "env", "timeout_seconds", "notify_on",
             "wake_targets", "origin_thread_id", "tags", "notes", "interactive",
-            "trigger", "signal", "kill_after_seconds", "overrides",
+            "trigger", "policy", "signal", "kill_after_seconds", "overrides",
             "idempotency_key",
         }
     }
@@ -648,7 +648,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "remote_id", "idempotency_key"}
+                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy", "remote_id", "idempotency_key"}
                 if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)

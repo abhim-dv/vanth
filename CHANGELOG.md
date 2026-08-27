@@ -4,6 +4,33 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Dead-man's switch + failure reactions (job policies)
+
+New per-job `policy` block on `job_start` (persisted, carried across
+`rerun`, exposed in `job_status`), watched by the daemon dispatch loop:
+
+- **Dead-man's switch** — `policy.schedule: {expected_interval_seconds,
+  grace_period_seconds}` emits `schedule_missed` when no new run starts
+  within interval+grace, and `job_stuck` when a run outlasts interval+grace.
+  The daemon is the monitor: no external pinging service needed. Emitted
+  once per window, reset on a fresh start.
+- **Failure reactions** — `policy.on_failure: {after_n, action}` fires once
+  the consecutive-failure streak reaches N (streak persists across reruns
+  of the logical job; a completed run resets it):
+  - `alert` emits `failure_threshold`
+  - `disable` additionally sets a flag that blocks future launches
+    (`prepare_launch` refuses disabled jobs)
+  - `run_job` launches a named reaction job (e.g. cleanup/failover)
+
+All policy events are `warning`/`error` level, flow to wake targets
+(codex/opencode threads) and the delivery queue like any other event, and
+carry structured data (`failure_streak`, `action`, `disabled`,
+`reaction_job_id`, elapsed/interval/grace seconds).
+
+Also: jobs launched via the dispatcher (`prepare_launch`/`_launch_prepared`)
+now clear `exit_code`/`ended_at` so re-runs of a previously terminal job
+start clean.
+
 ### Field-report fixes (from 1.6.0-rc23 pre-release use)
 
 - **Wake targets inherit the launching thread by default**: a

@@ -52,6 +52,54 @@ DEFAULT_MAX_ERROR_BYTES = 4096
 TERMINAL_STATUSES = {"completed", "failed", "timeout", "cancelled", "orphaned"}
 
 
+def validate_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Validate the per-job policy block (dead-man's switch + failure reactions).
+
+    Shape:
+      {
+        "schedule": {"expected_interval_seconds": int>=1, "grace_period_seconds": int>=0},
+        "on_failure": {"after_n": int>=1, "action": "alert"|"disable"|"run_job",
+                       "job_id": str (only for run_job)}
+      }
+    """
+    if policy is None:
+        return None
+    if not isinstance(policy, dict):
+        raise ValueError("policy must be an object")
+    cleaned: dict[str, Any] = {}
+    schedule = policy.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            raise ValueError("policy.schedule must be an object")
+        interval = schedule.get("expected_interval_seconds")
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            raise ValueError("policy.schedule.expected_interval_seconds must be an integer >= 1")
+        grace = schedule.get("grace_period_seconds", 0)
+        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
+            raise ValueError("policy.schedule.grace_period_seconds must be an integer >= 0")
+        cleaned["schedule"] = {"expected_interval_seconds": interval, "grace_period_seconds": grace}
+    on_failure = policy.get("on_failure")
+    if on_failure is not None:
+        if not isinstance(on_failure, dict):
+            raise ValueError("policy.on_failure must be an object")
+        after_n = on_failure.get("after_n")
+        if isinstance(after_n, bool) or not isinstance(after_n, int) or after_n < 1:
+            raise ValueError("policy.on_failure.after_n must be an integer >= 1")
+        action = on_failure.get("action")
+        if action not in {"alert", "disable", "run_job"}:
+            raise ValueError("policy.on_failure.action must be one of: alert, disable, run_job")
+        entry: dict[str, Any] = {"after_n": after_n, "action": action}
+        if action == "run_job":
+            job_id = on_failure.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("policy.on_failure.job_id is required when action is run_job")
+            entry["job_id"] = job_id
+        cleaned["on_failure"] = entry
+    if not cleaned:
+        raise ValueError("policy must contain a schedule or on_failure block")
+    return cleaned
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -337,9 +385,206 @@ class JobManager:
                 self._dispatch_due_deliveries()
                 self._reconcile_running_jobs()
                 self._fire_triggered_jobs()
+                self._watch_policies()
                 self._maybe_auto_cleanup()
             except Exception:
                 self.logger.exception("maintenance iteration failed")
+
+    def _watch_policies(self) -> None:
+        """Evaluate per-job policy blocks (dead-man's switch + failure reactions).
+
+        Two independent watches per job:
+
+        - ``schedule``: a recurring job pattern. ``last_started_at`` is the
+          most recent time this job entered a running state. If the expected
+          interval (plus grace) elapses with no new start, emit
+          ``schedule_missed`` once per missed window. If a job started but has
+          been running longer than interval+grace, emit ``job_stuck`` once.
+        - ``on_failure``: count consecutive terminal failures (from the
+          ``failure_threshold``-committed state, see below); when the count
+          reaches ``after_n``, fire the configured action once, then reset so
+          a subsequent streak re-triggers.
+        """
+        try:
+            now = datetime.now(timezone.utc)
+            with self.db_lock:
+                rows = self.db.execute(
+                    "SELECT job_id, status, started_at, updated_at, policy_json, tags_json, name FROM jobs "
+                    "WHERE policy_json IS NOT NULL AND policy_disabled=0"
+                ).fetchall()
+            for row in rows:
+                try:
+                    policy = json.loads(row["policy_json"] or "null")
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(policy, dict):
+                    continue
+                schedule = policy.get("schedule")
+                if isinstance(schedule, dict):
+                    self._watch_schedule(row, schedule, now)
+                on_failure = policy.get("on_failure")
+                if isinstance(on_failure, dict):
+                    self._watch_on_failure(row, on_failure)
+        except Exception:
+            self.logger.exception("policy watch iteration failed")
+
+    def _policy_state(self, job_id: str) -> dict[str, Any]:
+        row = self._row("SELECT policy_state_json FROM jobs WHERE job_id=?", (job_id,))
+        if not row:
+            return {}
+        try:
+            state = json.loads(row["policy_state_json"] or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def _save_policy_state(self, job_id: str, state: dict[str, Any]) -> None:
+        def write() -> None:
+            with self.db_lock:
+                self.db.execute(
+                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
+                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
+                )
+                self.db.commit()
+        self._retry_locked(write)
+
+    def _watch_schedule(self, row: sqlite3.Row, schedule: dict[str, Any], now: datetime) -> None:
+        job_id = row["job_id"]
+        interval = int(schedule["expected_interval_seconds"])
+        grace = int(schedule.get("grace_period_seconds", 0))
+        horizon = interval + grace
+        state = self._policy_state(job_id)
+        # Only track jobs that are actually recurring: enabled + completed/
+        # failed/running histories. Queued/cancelled/timeout jobs pause the
+        # watch (timeout means the run itself failed; on_failure handles it).
+        status = row["status"]
+        if status in {"queued", "cancelled"}:
+            return
+        last_start = row["started_at"]
+        try:
+            last_start_dt = datetime.fromisoformat(last_start.replace("Z", "+00:00")) if last_start else None
+        except ValueError:
+            last_start_dt = None
+        if last_start_dt is None:
+            return
+        elapsed = (now - last_start_dt).total_seconds()
+        if status == "running":
+            # Started but running far past its expected cadence -> stuck.
+            if elapsed > horizon and not state.get("stuck_emitted"):
+                self._emit(
+                    job_id,
+                    "job_stuck",
+                    message=f"Job running for {int(elapsed)}s, past expected interval {interval}s + grace {grace}s",
+                    data={"elapsed_seconds": int(elapsed), "expected_interval_seconds": interval, "grace_period_seconds": grace},
+                    level="warning",
+                )
+                state["stuck_emitted"] = True
+                self._save_policy_state(job_id, state)
+            return
+        # Terminal (completed/failed/orphaned): watch for a missed next run.
+        if elapsed > horizon and not state.get("missed_emitted_at_elapsed"):
+            self._emit(
+                job_id,
+                "schedule_missed",
+                message=f"Expected re-run within {interval}s (+{grace}s grace) but no start for {int(elapsed)}s",
+                data={"elapsed_seconds": int(elapsed), "expected_interval_seconds": interval, "grace_period_seconds": grace},
+                level="warning",
+            )
+            # Re-arm only when the job starts again (started_at changes);
+            # record elapsed to avoid duplicate emissions within this window.
+            state["missed_emitted_at_elapsed"] = int(elapsed)
+            self._save_policy_state(job_id, state)
+        elif elapsed <= interval:
+            # Fresh run happened; clear sticky flags.
+            if state.get("missed_emitted_at_elapsed") or state.get("stuck_emitted"):
+                self._save_policy_state(job_id, {"failure_streak": state.get("failure_streak", 0)})
+
+    def _watch_on_failure(self, row: sqlite3.Row, on_failure: dict[str, Any]) -> None:
+        job_id = row["job_id"]
+        after_n = int(on_failure["after_n"])
+        action = on_failure["action"]
+        state = self._policy_state(job_id)
+        streak = int(state.get("failure_streak", 0))
+        reacted = bool(state.get("reacted_at_streak"))
+        status = row["status"]
+        if status == "failed":
+            if reacted and int(state.get("reacted_at_streak", 0)) == streak:
+                return  # already reacted to this exact failure
+            new_streak = streak + 1
+            if new_streak >= after_n and not (reacted and state.get("reacted_for_streak") == new_streak):
+                self._react_to_failure(row, on_failure, new_streak)
+                state["reacted_at_streak"] = new_streak
+                state["reacted_for_streak"] = new_streak
+            state["failure_streak"] = new_streak
+            self._save_policy_state(job_id, state)
+        elif status in {"completed", "timeout", "cancelled", "orphaned"}:
+            if streak:
+                # Non-failure terminal outcome: timeout still counts as a
+                # failure signal? Healthchecks counts timeout as failure.
+                # We keep it simple: timeout continues the streak, others reset.
+                if status != "timeout":
+                    state["failure_streak"] = 0
+                    state.pop("reacted_at_streak", None)
+                    state.pop("reacted_for_streak", None)
+                    self._save_policy_state(job_id, state)
+
+    def _react_to_failure(self, row: sqlite3.Row, on_failure: dict[str, Any], streak: int) -> None:
+        job_id = row["job_id"]
+        action = on_failure["action"]
+        message = f"Failure streak reached {streak} (after_n={on_failure['after_n']}); policy action: {action}"
+        data = {"failure_streak": streak, "after_n": on_failure["after_n"], "action": action}
+        # Commit any open write transaction BEFORE emitting: _emit opens its
+        # own BEGIN IMMEDIATE and the connection must be idle for that.
+        with self.db_lock:
+            try:
+                self.db.commit()
+            except sqlite3.Error:
+                pass
+        if action == "alert":
+            self._emit(job_id, "failure_threshold", message=message, data=data, level="error")
+            return
+        if action == "disable":
+            def disable() -> int:
+                with self.db_lock:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET policy_disabled=1, updated_at=? WHERE job_id=?",
+                        (now_iso(), job_id),
+                    ).rowcount
+                    self.db.commit()
+                    return changed
+            changed = bool(self._retry_locked(disable))
+            with self.db_lock:
+                try:
+                    self.db.commit()
+                except sqlite3.Error:
+                    pass
+            if changed:
+                self._emit(job_id, "failure_threshold", message=message + "; job disabled", data={**data, "disabled": True}, level="error")
+            return
+        if action == "run_job":
+            target_job = on_failure.get("job_id")
+            if not target_job:
+                return
+            try:
+                with self.db_lock:
+                    try:
+                        self.db.commit()
+                    except sqlite3.Error:
+                        pass
+                launch = self.prepare_launch(target_job)
+            except ValueError as exc:
+                self._emit(job_id, "failure_threshold", message=f"{message}; reaction job launch failed: {exc}", data={**data, "reaction_job_id": target_job}, level="error")
+                return
+            if launch is None:
+                self._emit(job_id, "failure_threshold", message=f"{message}; reaction job {target_job} is not idle", data={**data, "reaction_job_id": target_job}, level="warning")
+                return
+            self._launch_prepared(launch)
+            with self.db_lock:
+                try:
+                    self.db.commit()
+                except sqlite3.Error:
+                    pass
+            self._emit(job_id, "failure_threshold", message=f"{message}; launched reaction job {target_job}", data={**data, "reaction_job_id": target_job})
 
     def _fire_triggered_jobs(self) -> None:
         """Launch queued jobs whose trigger parent has reached the status.
@@ -902,6 +1147,7 @@ class JobManager:
         notes: str | None = None,
         interactive: bool = False,
         trigger: dict[str, str] | None = None,
+        policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         # Thread inheritance (user request): the LAUNCHING thread is the
@@ -935,6 +1181,7 @@ class JobManager:
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise ValueError("timeout_seconds must be an integer >= 1")
         trigger = self._validate_trigger(trigger)
+        policy = validate_policy(policy)
         queued = trigger is not None
         if self.max_running_jobs and not queued and self._running_count() >= self.max_running_jobs:
             raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
@@ -976,8 +1223,8 @@ class JobManager:
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
                   timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
-                  stdout_path, stderr_path, events_path, trigger_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stdout_path, stderr_path, events_path, trigger_json, policy_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1001,6 +1248,7 @@ class JobManager:
                     str(stderr_path),
                     str(events_path),
                     json.dumps(trigger, separators=(",", ":")) if trigger else None,
+                    json.dumps(policy, separators=(",", ":")) if policy else None,
                 ),
             )
             self.db.commit()
@@ -1098,7 +1346,7 @@ class JobManager:
         threading.Thread(target=self._watch_runner, args=(job_id, proc), daemon=True).start()
         with self.db_lock:
             self.db.execute(
-                "UPDATE jobs SET status='running', started_at=?, runner_heartbeat_at=?, worker_pid=?, updated_at=? WHERE job_id=?",
+                "UPDATE jobs SET status='running', started_at=?, runner_heartbeat_at=?, worker_pid=?, updated_at=?, exit_code=NULL, ended_at=NULL WHERE job_id=?",
                 (now_iso(), now_iso(), proc.pid, now_iso(), job_id),
             )
             self.db.commit()
@@ -1127,6 +1375,9 @@ class JobManager:
             (job_id,),
         )
         if not row:
+            return None
+        disabled = self._row("SELECT policy_disabled FROM jobs WHERE job_id=?", (job_id,))
+        if disabled and disabled["policy_disabled"]:
             return None
         interactive = json.loads(row["run_json"] or "{}").get("interactive") is True
         spec = {
@@ -1183,11 +1434,15 @@ class JobManager:
         self._ensure_open()
         row = self._row(
             "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
-            "tags_json, name, notes, run_json FROM jobs WHERE job_id=?",
+            "tags_json, name, notes, run_json, policy_json FROM jobs WHERE job_id=?",
             (job_id,),
         )
         if not row:
             raise ValueError(f"Unknown job_id: {job_id}")
+        # Carry the failure streak across reruns: the policy state of the
+        # source job seeds the new job, so after_n counts consecutive failures
+        # of the *logical* job, not one runner instance.
+        prior_state = self._policy_state(job_id)
         targets = []
         for target in self.db.execute("SELECT * FROM wake_targets WHERE job_id=?", (job_id,)).fetchall():
             config = json.loads(target["config_json"] or "{}")
@@ -1205,7 +1460,7 @@ class JobManager:
             if not isinstance(env, dict):
                 raise ValueError("env must be an object of string values")
             merged_env = {**stored_env, **env}
-        return asyncio.run(self.start(
+        result = asyncio.run(self.start(
             command=command if command is not None else row["command"],
             cwd=cwd if cwd is not None else row["cwd"],
             name=name if name is not None else row["name"],
@@ -1217,7 +1472,14 @@ class JobManager:
             tags=stored_tags if tags is None else tags,
             notes=notes if notes is not None else row["notes"],
             interactive=stored_interactive if not isinstance(interactive, bool) else interactive,
+            policy=json.loads(row["policy_json"] or "null"),
         ))
+        if prior_state and json.loads(row["policy_json"] or "null"):
+            # Carry ONLY the failure streak: reacted_* dedup markers belong to
+            # the previous runner instance and must not suppress the next
+            # failure's reaction.
+            self._save_policy_state(result["job_id"], {"failure_streak": int(prior_state.get("failure_streak", 0))})
+        return result
 
     def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
@@ -1551,6 +1813,7 @@ class JobManager:
             "notes": row["notes"],
             "run": json.loads(row["run_json"] or "{}"),
             "trigger": json.loads(row["trigger_json"] or "null"),
+            "policy": json.loads(row["policy_json"] or "null"),
             "runtime_seconds": _runtime_seconds(row["started_at"], row["ended_at"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -2622,6 +2885,7 @@ def job_start(
     notes: str | None = None,
     interactive: bool = False,
     trigger: dict[str, str] | None = None,
+    policy: dict[str, Any] | None = None,
     remote_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -2632,6 +2896,16 @@ def job_start(
     A reaches ``completed``. The new job is created ``queued`` and its runner
     starts automatically when the trigger fires (or it is ``cancelled`` if A
     ends in a different terminal status).
+
+    ``policy`` adds dead-man's-switch monitoring and failure reactions:
+      - ``{"schedule": {"expected_interval_seconds": 3600, "grace_period_seconds": 300}}``
+        emits ``schedule_missed`` when no new run starts within interval+grace
+        and ``job_stuck`` when a run outlasts interval+grace.
+      - ``{"on_failure": {"after_n": 3, "action": "alert"|"disable"|"run_job",
+        "job_id": "cleanup_job"}}`` fires once the failure streak reaches N:
+        ``alert`` emits ``failure_threshold``, ``disable`` stops the job from
+        launching again, ``run_job`` launches another job. All three emit
+        ``failure_threshold`` and flow to wake targets.
 
     Pass ``remote_id`` to run the job on a paired remote host instead of the
     local daemon. Remote mutations require ``idempotency_key`` (8..128 chars in
@@ -2652,6 +2926,7 @@ def job_start(
             "notes": notes,
             "interactive": interactive,
             "trigger": trigger,
+            "policy": policy,
             "remote_id": remote_id,
             "idempotency_key": idempotency_key,
         },
