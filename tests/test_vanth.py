@@ -656,3 +656,118 @@ def test_failure_threshold_run_job_action_launches_reaction(tmp_path):
             manager.close()
 
     run(main())
+
+
+def test_restart_policy_relails_with_backoff_then_gives_up(tmp_path):
+    """policy.restart: failed job relaunches up to max_retries with backoff;
+    budget exhaustion emits gave_up; success resets the counter."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 2, "backoff_seconds": 0}},
+            )
+            # Original failure + 2 restarts => 3 failed runs, then gave_up.
+            event = await manager.wait(job["job_id"], ["gave_up"], timeout_seconds=60)
+            assert event["result"] == "event"
+            assert event["event"]["level"] == "error"
+            assert event["event"]["data"]["restart_attempts"] == 2
+            failures = [e for e in manager.events(job["job_id"], types=["failed", "restarted"], limit=100)["events"]]
+            assert sum(1 for e in failures if e["type"] == "restarted") == 2
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] == 2
+            assert state["gave_up"] is True
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_restart_policy_resets_on_success(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            # Alternate: fail, succeed via rerun override with same policy.
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 3, "backoff_seconds": 0}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.6)
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] >= 1
+            # Stop the restart churn, then prove a completed run resets it.
+            with manager.db_lock:
+                manager.db.execute("UPDATE jobs SET policy_json=NULL WHERE job_id=?", (job["job_id"],))
+                manager.db.commit()
+            success = await manager.rerun(job["job_id"], command=cmd("print('ok')"))
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET policy_json=? WHERE job_id=?",
+                    (json.dumps({"restart": {"max_retries": 3, "backoff_seconds": 0}}), success["job_id"]),
+                )
+                manager.db.commit()
+            await manager.wait(success["job_id"], ["completed"], timeout_seconds=30)
+            await asyncio.sleep(0.8)
+            # A completed run resets (or never accumulates) the counter.
+            assert manager._policy_state(success["job_id"]).get("restart_attempts", 0) == 0
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_restart_backoff_delays_relaunch(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 1, "backoff_seconds": 2}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.7)
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] == 1  # budget consumed immediately
+            assert state["last_restart_delay_seconds"] == 2
+            restarted = [e for e in manager.events(job["job_id"], types=["restarted"], limit=10)["events"]]
+            assert restarted == []  # still waiting out the backoff
+            event = await manager.wait(job["job_id"], ["restarted"], timeout_seconds=15)
+            assert event["result"] == "event"
+            assert event["event"]["data"]["delay_seconds"] == 2
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_retention_policy_prunes_events_and_metrics(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            script = tmp_path / "emit_metric.py"
+            script.write_text(
+                "import json\n"
+                "print('AGENT_EVENT ' + json.dumps({'type': 'metric', 'metric': {'loss': 0.5}}), flush=True)\n"
+            )
+            job = await manager.start(
+                subprocess.list2cmdline([sys.executable, str(script)]),
+                policy={"retention": {"events_seconds": 1, "metrics_seconds": 1}},
+            )
+            await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)
+            events_before = len(manager.events(job["job_id"], limit=100)["events"])
+            assert events_before > 0
+            await asyncio.sleep(2.5)
+            # Terminal events survive; non-terminal ones age out.
+            remaining = manager.events(job["job_id"], limit=100)["events"]
+            assert all(e["type"] in {"completed", "failed", "timeout", "cancelled", "orphaned"} for e in remaining)
+            series = manager.metrics_query(job["job_id"])["series"]
+            assert isinstance(series, dict)
+        finally:
+            manager.close()
+
+    run(main())

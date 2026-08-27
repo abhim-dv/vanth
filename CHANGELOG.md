@@ -4,6 +4,29 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Restart policies + retention pruning (job policies, continued)
+
+- **Restart policies** — `policy.restart: {max_retries, backoff_seconds,
+  backoff_max_seconds}` relaunches a failed job automatically with linear
+  backoff capped at the max. Each relaunch emits `restarted` with attempt
+  counts; the attempt budget is persisted before launch (crash-safe) and a
+  successful completion resets it. When the budget is exhausted emits
+  `gave_up` (level=error, flows to wake targets) once.
+- **Retention pruning** — `policy.retention: {events_seconds,
+  metrics_seconds, deliveries_seconds}` prunes a job's non-terminal events,
+  metric points, and settled deliveries older than the TTL every dispatch
+  iteration. Terminal events are always kept (status history survives).
+  Log-retention without the per-entry paywall.
+- **Stale-watcher race fix**: a previous run's `_watch_runner` could mark a
+  relaunched job `orphaned` mid-boot (restart vs. watcher race). The watcher
+  now verifies the recorded worker_pid still belongs to its own runner
+  process before declaring the job dead.
+- **Retention transaction hygiene**: a zero-match DELETE leaves an implicit
+  transaction open which blocked runner processes for the full busy_timeout
+  (30s) — retention now always settles the transaction, even when nothing
+  matched.
+- Fixed `DeadRunner` test-fake compatibility in `_watch_runner`.
+
 ### Dead-man's switch + failure reactions (job policies)
 
 New per-job `policy` block on `job_start` (persisted, carried across

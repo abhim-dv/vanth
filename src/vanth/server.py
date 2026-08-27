@@ -59,7 +59,10 @@ def validate_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
       {
         "schedule": {"expected_interval_seconds": int>=1, "grace_period_seconds": int>=0},
         "on_failure": {"after_n": int>=1, "action": "alert"|"disable"|"run_job",
-                       "job_id": str (only for run_job)}
+                       "job_id": str (only for run_job)},
+        "restart": {"max_retries": int>=1, "backoff_seconds": int>=0,
+                    "backoff_max_seconds": int>=0},
+        "retention": {"events_seconds"|"metrics_seconds"|"deliveries_seconds": int>=1}
       }
     """
     if policy is None:
@@ -95,6 +98,39 @@ def validate_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
                 raise ValueError("policy.on_failure.job_id is required when action is run_job")
             entry["job_id"] = job_id
         cleaned["on_failure"] = entry
+    restart = policy.get("restart")
+    if restart is not None:
+        if not isinstance(restart, dict):
+            raise ValueError("policy.restart must be an object")
+        max_retries = restart.get("max_retries")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError("policy.restart.max_retries must be an integer >= 1")
+        backoff = restart.get("backoff_seconds", 0)
+        if isinstance(backoff, bool) or not isinstance(backoff, int) or backoff < 0:
+            raise ValueError("policy.restart.backoff_seconds must be an integer >= 0")
+        backoff_max = restart.get("backoff_max_seconds", 0)
+        if isinstance(backoff_max, bool) or not isinstance(backoff_max, int) or backoff_max < 0:
+            raise ValueError("policy.restart.backoff_max_seconds must be an integer >= 0")
+        cleaned["restart"] = {
+            "max_retries": max_retries,
+            "backoff_seconds": backoff,
+            "backoff_max_seconds": backoff_max,
+        }
+    retention = policy.get("retention")
+    if retention is not None:
+        if not isinstance(retention, dict):
+            raise ValueError("policy.retention must be an object")
+        cleaned_retention: dict[str, int] = {}
+        for stream, key in (("events_seconds", "events"), ("metrics_seconds", "metrics"), ("deliveries_seconds", "deliveries")):
+            value = retention.get(stream)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"policy.retention.{stream} must be an integer >= 1")
+            cleaned_retention[key] = value
+        if not cleaned_retention:
+            raise ValueError("policy.retention must set at least one of events_seconds, metrics_seconds, deliveries_seconds")
+        cleaned["retention"] = cleaned_retention
     if not cleaned:
         raise ValueError("policy must contain a schedule or on_failure block")
     return cleaned
@@ -252,6 +288,8 @@ class JobManager:
         self._metric_ingest_keys: set[str] = set()
         self._delivery_threads: set[threading.Thread] = set()
         self._delivery_threads_lock = threading.Lock()
+        self._restart_timers: dict[str, threading.Timer] = {}
+        self._restart_timers_lock = threading.Lock()
         self.max_delivery_concurrency = max(1, int(os.environ.get("VANTH_DELIVERY_MAX_CONCURRENT", "4")))
         self.max_running_jobs = max(0, int(os.environ.get("VANTH_MAX_RUNNING_JOBS", "0")))
         self.max_retention_seconds = max(0, int(os.environ.get("VANTH_RETENTION_SECONDS", "0")))
@@ -425,6 +463,12 @@ class JobManager:
                 on_failure = policy.get("on_failure")
                 if isinstance(on_failure, dict):
                     self._watch_on_failure(row, on_failure)
+                restart = policy.get("restart")
+                if isinstance(restart, dict):
+                    self._watch_restart(row, restart)
+                retention = policy.get("retention")
+                if isinstance(retention, dict):
+                    self._apply_retention(row["job_id"], retention)
         except Exception:
             self.logger.exception("policy watch iteration failed")
 
@@ -527,6 +571,133 @@ class JobManager:
                     state.pop("reacted_at_streak", None)
                     state.pop("reacted_for_streak", None)
                     self._save_policy_state(job_id, state)
+
+    def _watch_restart(self, row: sqlite3.Row, restart: dict[str, Any]) -> None:
+        """Relaunch failed jobs with linear-until-cap backoff, up to max_retries.
+
+        The restart bookkeeping lives in policy_state (restart_attempts,
+        restart_after). A successful completion resets the attempt counter;
+        exhausting the budget emits a ``gave_up`` event (level=error) that
+        flows to wake targets. Disabled jobs are skipped.
+        """
+        job_id = row["job_id"]
+        status = row["status"]
+        if status not in {"failed", "completed"}:
+            return
+        state = self._policy_state(job_id)
+        max_retries = int(restart["max_retries"])
+        backoff_base = int(restart.get("backoff_seconds", 0))
+        backoff_max = int(restart.get("backoff_max_seconds", 0))
+        if status == "completed":
+            if state.get("restart_attempts"):
+                state["restart_attempts"] = 0
+                state.pop("restart_after", None)
+                self._save_policy_state(job_id, state)
+            return
+        attempts = int(state.get("restart_attempts", 0))
+        if attempts >= max_retries:
+            if not state.get("gave_up"):
+                self._emit(
+                    job_id,
+                    "gave_up",
+                    message=f"Job failed and the restart budget is exhausted ({attempts}/{max_retries} retries used)",
+                    data={"restart_attempts": attempts, "max_retries": max_retries},
+                    level="error",
+                )
+                state["gave_up"] = True
+                self._save_policy_state(job_id, state)
+            return
+        restart_after = state.get("restart_after")
+        if restart_after:
+            try:
+                if datetime.now(timezone.utc) < datetime.fromisoformat(str(restart_after).replace("Z", "+00:00")):
+                    return  # backoff not elapsed yet
+            except ValueError:
+                pass  # malformed stamp: fall through and restart now
+        # Mark the attempt BEFORE launching so a crash between the two writes
+        # cannot loop forever on one budget.
+        delay = min(backoff_base * (attempts + 1), backoff_max) if backoff_max else backoff_base * (attempts + 1)
+        state["restart_attempts"] = attempts + 1
+        state.pop("gave_up", None)
+        state["last_restart_delay_seconds"] = delay
+        self._save_policy_state(job_id, state)
+
+        def launch() -> None:
+            launch_info = self.prepare_launch(job_id)
+            if launch_info is None:
+                self.logger.warning("restart launch refused job_id=%s attempt=%s", job_id, attempts + 1)
+                return
+            self._launch_prepared(launch_info)
+            self._emit(
+                job_id,
+                "restarted",
+                message=f"Restart attempt {attempts + 1}/{max_retries} after failure (delay {delay}s)",
+                data={"restart_attempt": attempts + 1, "max_retries": max_retries, "delay_seconds": delay},
+            )
+
+        if delay > 0:
+            # Schedule the relaunch on the shared timer thread pool: sleep in
+            # a daemon thread so the dispatch loop never blocks.
+            timer = threading.Timer(
+                delay,
+                lambda: self._retry_locked_silent(launch),
+            )
+            timer.daemon = True
+            with self._restart_timers_lock:
+                old = self._restart_timers.pop(job_id, None)
+                if old is not None:
+                    old.cancel()
+                self._restart_timers[job_id] = timer
+            timer.start()
+        else:
+            launch()
+
+    def _retry_locked_silent(self, fn) -> None:
+        try:
+            self._retry_locked(fn)
+        except Exception:
+            self.logger.exception("restart launch failed")
+
+    def _apply_retention(self, job_id: str, retention: dict[str, int]) -> None:
+        """Prune old per-stream rows for one job (policy.retention block).
+
+        Runs at most once per retention stream per poll-window via a cheap
+        `deleted` counter in policy_state; deletion is idempotent so retries
+        are harmless. Terminal events (needed for status history) are kept —
+        only non-terminal, non-metric bookkeeping rows expire.
+        """
+        cutoff_base = datetime.now(timezone.utc)
+        deleted_total = 0
+        with self.db_lock:
+            try:
+                for column, table in (("events", "events"), ("metrics", "metric_series"), ("deliveries", "deliveries")):
+                    seconds = retention.get(column)
+                    if not seconds:
+                        continue
+                    cutoff = (cutoff_base - timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+                    if column == "events":
+                        cur = self.db.execute(
+                            "DELETE FROM events WHERE job_id=? AND created_at < ? AND type NOT IN ('completed','failed','timeout','cancelled','orphaned')",
+                            (job_id, cutoff),
+                        )
+                    elif column == "metrics":
+                        cur = self.db.execute(
+                            "DELETE FROM metric_series WHERE job_id=? AND created_at < ?",
+                            (job_id, cutoff),
+                        )
+                    else:
+                        cur = self.db.execute(
+                            "DELETE FROM deliveries WHERE job_id=? AND created_at < ? AND status IN ('delivered','failed')",
+                            (job_id, cutoff),
+                        )
+                    deleted_total += cur.rowcount
+            finally:
+                # A DELETE opens an implicit transaction even when it matches
+                # nothing; leaving it open blocks runner processes for the
+                # full busy_timeout. Always settle it.
+                self.db.commit()
+        if deleted_total:
+            self.logger.info("retention pruned job_id=%s rows=%s", job_id, deleted_total)
 
     def _react_to_failure(self, row: sqlite3.Row, on_failure: dict[str, Any], streak: int) -> None:
         job_id = row["job_id"]
@@ -691,6 +862,11 @@ class JobManager:
             self.begin_shutdown()
             self._closed = True
             self.dispatcher_stop.set()
+            with self._restart_timers_lock:
+                timers = list(self._restart_timers.values())
+                self._restart_timers.clear()
+            for timer in timers:
+                timer.cancel()
             if self.dispatcher_thread and self.dispatcher_thread is not threading.current_thread():
                 self.dispatcher_thread.join(timeout=2)
             deadline = time.monotonic() + float(os.environ.get("VANTH_SHUTDOWN_TIMEOUT", "10"))
@@ -1484,8 +1660,15 @@ class JobManager:
     def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
         try:
-            row = self._row("SELECT status, pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+            row = self._row("SELECT status, pid, worker_pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
             if not row or row["status"] != "running":
+                return
+            # A restart policy can relaunch this job with a NEW runner while a
+            # stale watcher from the previous run is still waking up. If the
+            # recorded worker_pid is no longer OUR runner process, a newer
+            # launch owns the row — leave it alone.
+            watcher_pid = getattr(proc, "pid", None)
+            if row["worker_pid"] and watcher_pid and int(row["worker_pid"]) != int(watcher_pid):
                 return
             if row["pid"] and not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
                 self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
@@ -2906,6 +3089,13 @@ def job_start(
         ``alert`` emits ``failure_threshold``, ``disable`` stops the job from
         launching again, ``run_job`` launches another job. All three emit
         ``failure_threshold`` and flow to wake targets.
+      - ``{"restart": {"max_retries": 3, "backoff_seconds": 5,
+        "backoff_max_seconds": 60}}`` relaunches a failed job with linear
+        backoff capped at the max, resetting the counter on success; when the
+        budget is exhausted emits ``gave_up``.
+      - ``{"retention": {"events_seconds": 604800, "metrics_seconds": 2592000}}``
+        prunes that job's non-terminal events / metric points / settled
+        deliveries older than the TTL (log-retention without the paywall).
 
     Pass ``remote_id`` to run the job on a paired remote host instead of the
     local daemon. Remote mutations require ``idempotency_key`` (8..128 chars in
