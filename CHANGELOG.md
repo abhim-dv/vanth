@@ -4,6 +4,47 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Review fixes (RC30 policy + wake delivery reliability)
+
+- **Launch claims are exclusive and stale claims recover (P1)** — `launching`
+  is no longer in the runnable-status set, so two serialized `prepare_launch`
+  calls cannot both succeed and double-spawn the same job. A claim abandoned
+  by a crash (row stuck `launching`) is recovered to `orphaned` by the
+  dispatch loop after `VANTH_LAUNCH_CLAIM_TIMEOUT` (default 30s), so the job
+  becomes relaunchable.
+- **Restart failures advance the failure streak (P1)** — automatic restarts
+  reuse the job row, and `_watch_on_failure` previously suppressed every later
+  failure once `last_failure_event_id` was set (a probe produced three `failed`
+  events but a streak of one). The watcher now compares the newest failed event
+  (ordered by `seq`, the per-job monotonic sequence — event ids are random
+  UUIDs and not time-ordered) with the stored id, so each execution — original
+  plus every restart — increments the streak exactly once.
+- **Delivery leases cover the adapter's effective timeout (P1)** — thread
+  bridges (codex/opencode) wait up to 300s by default, but the delivery lease
+  defaulted to 30s + 5s margin, letting the dispatcher reclaim and re-send a
+  wake while its turn was still running. The lease is now computed from each
+  adapter's effective timeout (300s for thread targets, 30s otherwise), so a
+  codex wake is never reclaimed mid-turn.
+- **Webhook redirects cannot exfiltrate credentials (P1)** — urllib's default
+  redirect handler forwarded configured headers (e.g. `Authorization`) to a
+  cross-origin destination. A custom no-redirect handler fails 3xx deliveries
+  instead of leaking; configured header secrets are also stripped from the
+  JSON payload body (headers are sent as headers only).
+- **Queue drain preserves settled history (P2)** — `clear_deliveries` without
+  an explicit `status` now only touches `pending`/`retrying` rows; delivered
+  records are audit history and require an explicit `status` to drain. Draining
+  an in-flight row finalizes its `delivery_attempts` entry instead of leaving
+  it `dispatching`.
+- **Daemon no longer infers thread identity (P2)** — `JobManager.start` no
+  longer falls back to the persistent daemon's `CODEX_THREAD_ID`/
+  `OPENCODE_SESSION_ID` (which would inherit the thread that spawned the
+  daemon); callers pass `origin_thread_id` explicitly (the MCP wrapper
+  resolves it). Caller-owned wake-target dicts are copied before inherited ids
+  or events are injected — never mutated.
+- **Restart regression test de-flaked (P2)** — the polling-budget test observed
+  for exactly the configured backoff window (2s) and could race the relaunch;
+  it now uses an 8s backoff with a 2s observation window.
+
 ### Review fixes (RC27 policy + delivery reliability)
 
 - **Restart budget consumed by launch, not polling (P1)** — the restart policy

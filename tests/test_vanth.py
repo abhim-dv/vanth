@@ -474,16 +474,19 @@ def test_multiple_waiters(tmp_path):
 def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
     """User report: wake notifications silently failed because opencode/codex
     thread targets demanded an explicit session/thread id. The LAUNCHING
-    thread is now the default destination; explicit ids still win."""
-    import os
+    thread is now the default destination; explicit ids still win.
 
+    Per review P2-2 the daemon no longer infers the thread from its own
+    environment: the caller (MCP wrapper) resolves it and passes
+    ``origin_thread_id`` explicitly. This test passes it the same way.
+    """
     async def main():
         manager = JobManager(tmp_path)
-        monkeypatch.setenv("OPENCODE_SESSION_ID", "ses_origin")
         try:
             started = await manager.start(
                 cmd("print('inherit')"),
                 notify_on=["completed"],
+                origin_thread_id="ses_origin",
                 wake_targets=[
                     {"type": "opencode_thread"},                      # inherits
                     {"type": "opencode_thread", "session_id": "ses_explicit"},  # wins
@@ -768,10 +771,12 @@ def test_restart_polling_does_not_consume_budget(tmp_path):
         try:
             job = await manager.start(
                 cmd("import sys; sys.exit(1)"),
-                policy={"restart": {"max_retries": 3, "backoff_seconds": 2}},
+                policy={"restart": {"max_retries": 3, "backoff_seconds": 8}},
             )
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             # Give the watcher many ticks; budget must stay at exactly 1.
+            # Observation window (2s) is well inside the 8s backoff, so the
+            # deadline is guaranteed not to have fired yet (review P2-3).
             await asyncio.sleep(2.0)
             state = manager._policy_state(job["job_id"])
             assert state["restart_attempts"] == 1, f"expected exactly 1 claim, got {state.get('restart_attempts')}"
@@ -781,7 +786,7 @@ def test_restart_polling_does_not_consume_budget(tmp_path):
             restarted = [e for e in manager.events(job["job_id"], types=["restarted"], limit=10)["events"]]
             assert restarted == []
             # After the backoff the single claimed restart fires.
-            await manager.wait(job["job_id"], ["restarted"], timeout_seconds=15)
+            await manager.wait(job["job_id"], ["restarted"], timeout_seconds=20)
             state = manager._policy_state(job["job_id"])
             assert state["restart_attempts"] == 1, "budget must not grow during the due relaunch"
         finally:
@@ -1160,5 +1165,243 @@ def test_webhook_auto_dispatch_false_queues_only(tmp_path):
         finally:
             server.shutdown()
             thread.join()
+
+    run(main())
+
+
+def test_launch_claim_cannot_be_acquired_twice(tmp_path):
+    """Review P1-1: after prepare_launch claims a job as 'launching', a second
+    serialized call must return None (never double-spawn)."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            # A failed job is runnable (eligible for relaunch).
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            first = manager.prepare_launch(job["job_id"])
+            assert first is not None, "first claim should succeed"
+            second = manager.prepare_launch(job["job_id"])
+            assert second is None, "active claim must not be re-acquirable"
+            status = manager.status(job["job_id"])["status"]
+            assert status == "launching"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_stale_launch_claim_recovers_to_orphaned(tmp_path):
+    """Review P1-1: a claim abandoned by a crash (row stuck 'launching') is
+    recovered by the dispatch loop after the grace period."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            first = manager.prepare_launch(job["job_id"])
+            assert first is not None
+            # Age the claim past the timeout by rewriting updated_at.
+            import datetime as _dt
+            stale = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=manager.launch_claim_timeout + 5)).isoformat().replace("+00:00", "Z")
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND status='launching'",
+                    (stale, job["job_id"]),
+                )
+                manager.db.commit()
+            manager._recover_stale_launch_claims()
+            status = manager.status(job["job_id"])["status"]
+            assert status == "orphaned", f"stale claim should be recovered, got {status}"
+            # The recovered job is runnable again.
+            assert manager.prepare_launch(job["job_id"]) is not None
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_restart_failures_advance_failure_streak(tmp_path):
+    """Review P1-2: automatic restarts reuse the job row, and each failed
+    execution (original + restarts) must advance the failure streak."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={
+                    "restart": {"max_retries": 2, "backoff_seconds": 0},
+                    "on_failure": {"after_n": 3, "action": "alert"},
+                },
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await manager.wait(job["job_id"], ["gave_up"], timeout_seconds=60)
+            # The streak watcher may lag the gave_up event by a tick; poll.
+            deadline = time.monotonic() + 5
+            streak = 0
+            while time.monotonic() < deadline:
+                streak = int(manager._policy_state(job["job_id"]).get("failure_streak", 0))
+                if streak == 3:
+                    break
+                await asyncio.sleep(0.2)
+            # 1 original + 2 restarts = 3 failed executions.
+            assert streak == 3, f"expected streak 3, got {streak}"
+            thresholds = [e for e in manager.events(job["job_id"], types=["failure_threshold"], limit=10)["events"]]
+            assert len(thresholds) == 1, "after_n=3 should fire exactly once"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_webhook_redirect_does_not_leak_headers(tmp_path):
+    """Review P1-4: a 302 redirect must NOT be followed (credentials would be
+    forwarded cross-origin); the delivery fails instead, and the destination
+    never receives the request."""
+    import http.server
+
+    class _RedirectSink:
+        received = False
+
+    sink = _RedirectSink()
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target_port}/dest")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    class DestHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            sink.received = True
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    target_server = http.server.HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    target_port = target_server.server_port
+    dest_server = http.server.HTTPServer(("127.0.0.1", 0), DestHandler)
+    dest_port = dest_server.server_port
+    t1 = threading.Thread(target=target_server.serve_forever, daemon=True)
+    t2 = threading.Thread(target=dest_server.serve_forever, daemon=True)
+    t1.start()
+    t2.start()
+    try:
+        async def main():
+            manager = JobManager(tmp_path)
+            try:
+                url = f"http://127.0.0.1:{target_port}/hook"
+                code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
+                started = await manager.start(
+                    cmd(code),
+                    wake_targets=[
+                        {
+                            "type": "webhook",
+                            "events": ["checkpoint"],
+                            "url": url,
+                            "headers": {"Authorization": "Bearer secret"},
+                            "max_attempts": 1,
+                            "retry_delay_seconds": 0,
+                        }
+                    ],
+                )
+                await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+                delivery = None
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    delivery = poll_delivery(manager, started["job_id"], "failed")
+                    if delivery and delivery["status"] == "failed":
+                        break
+                    time.sleep(0.05)
+                assert delivery is not None
+                assert delivery["status"] == "failed"
+                assert "redirect" in (delivery["last_error"] or "").lower()
+                await asyncio.sleep(0.3)
+                assert sink.received is False, "redirect destination must not receive the request"
+            finally:
+                manager.begin_shutdown()
+                manager.close()
+
+        run(main())
+    finally:
+        target_server.shutdown()
+        dest_server.shutdown()
+        t1.join()
+        t2.join()
+
+
+def test_webhook_payload_omits_header_secrets(tmp_path):
+    """Review P1-4: configured header secrets are sent as headers only and
+    never duplicated into the JSON payload body."""
+    sink = _WebhookSink()
+    server, thread = _start_webhook_server(sink)
+    try:
+        async def main():
+            manager = JobManager(tmp_path)
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/hook"
+                code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
+                started = await manager.start(
+                    cmd(code),
+                    wake_targets=[
+                        {
+                            "type": "webhook",
+                            "events": ["checkpoint"],
+                            "url": url,
+                            "headers": {"Authorization": "Bearer secret"},
+                        }
+                    ],
+                )
+                await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+                assert sink.pending.wait(timeout=5)
+                payload = sink.received[0]
+                target = payload["target"]
+                assert "headers" not in target, "secrets must not be in the JSON body"
+                assert "Authorization" not in payload
+            finally:
+                manager.begin_shutdown()
+                manager.close()
+
+        run(main())
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+def test_clear_deliveries_default_does_not_touch_delivered(tmp_path):
+    """Review P2-1: a default drain (no explicit status) only clears
+    pending/retrying deliveries and never rewrites delivered history."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
+            started = await manager.start(
+                cmd(code),
+                wake_targets=[{"type": "codex_thread", "thread_id": "t_del", "events": ["checkpoint"], "auto_dispatch": False}],
+            )
+            await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+            # Manually mark the delivery delivered (settled history).
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE deliveries SET status='delivered' WHERE job_id=?",
+                    (started["job_id"],),
+                )
+                manager.db.commit()
+            result = manager.clear_deliveries(job_id=started["job_id"], dry_run=False)
+            assert result["matched"] == 0, "delivered rows must not be matched by a default drain"
+            deliveries = manager.deliveries(started["job_id"])["deliveries"]
+            assert deliveries and deliveries[0]["status"] == "delivered"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
 
     run(main())

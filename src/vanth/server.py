@@ -220,6 +220,22 @@ ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked"}
 WAKE_TARGET_TYPES = {"local_command", "codex_thread", "opencode_thread", "webhook"}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib handler that refuses 3xx redirects (webhook credential safety).
+
+    urllib's default HTTPRedirectHandler follows redirects and re-sends the
+    request headers, which would forward Authorization tokens to a different
+    origin. Raising here surfaces the redirect as an HTTPError so webhook
+    delivery fails instead of leaking credentials (review P1-4).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
     if targets is None:
         return
@@ -284,6 +300,7 @@ class JobManager:
         self.max_event_line_bytes = int(os.environ.get("VANTH_MAX_EVENT_LINE_BYTES", DEFAULT_MAX_EVENT_LINE_BYTES))
         self.max_log_bytes = int(os.environ.get("VANTH_MAX_LOG_BYTES", DEFAULT_MAX_LOG_BYTES))
         self.delivery_lease_margin = int(os.environ.get("VANTH_DELIVERY_LEASE_MARGIN", "5"))
+        self.launch_claim_timeout = max(5, int(os.environ.get("VANTH_LAUNCH_CLAIM_TIMEOUT", "30")))
         self.heartbeat_interval = float(os.environ.get("VANTH_RUNNER_HEARTBEAT_INTERVAL", "1"))
         self.heartbeat_stale_after = float(os.environ.get("VANTH_RUNNER_HEARTBEAT_STALE_AFTER", "10"))
         self.recovery_kill_timeout = max(0, int(os.environ.get("VANTH_RECOVERY_KILL_TIMEOUT", "10")))
@@ -437,6 +454,7 @@ class JobManager:
             try:
                 self._dispatch_due_deliveries()
                 self._reconcile_running_jobs()
+                self._recover_stale_launch_claims()
                 self._fire_triggered_jobs()
                 self._watch_policies()
                 self._maybe_auto_cleanup()
@@ -579,21 +597,21 @@ class JobManager:
         streak = int(state.get("failure_streak", 0))
         status = row["status"]
         if status == "failed":
-            # Count each failed EXECUTION exactly once (review P1-2): the
-            # failure event is the unit, identified by its event_id. A failed
-            # row that stays failed across many watcher ticks is not re-counted.
-            # ``_last_failure_event_id`` stores the terminal event we already
-            # folded into the streak; only a NEW terminal event advances it.
-            # Restart relaunches reuse the same job row, so the watcher is the
-            # only place that can distinguish runs.
-            if state.get("last_failure_event_id"):
-                return  # already counted this failed run
+            # Count each failed EXECUTION exactly once (review P1-2 / P2):
+            # the failure event is the unit, identified by its event_id. A failed
+            # row that stays failed across many watcher ticks is not re-counted,
+            # but an automatic RESTART that reuses the same job row emits a NEW
+            # failed event with a new id — compare the latest failed event to the
+            # stored one so every execution (including restarts) advances the
+            # streak exactly once.
             last_terminal = self.db.execute(
-                "SELECT event_id, created_at FROM events WHERE job_id=? AND type='failed' ORDER BY event_id DESC LIMIT 1",
+                "SELECT event_id, created_at FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
                 (job_id,),
             ).fetchone()
             if last_terminal is None:
                 return
+            if state.get("last_failure_event_id") == last_terminal["event_id"]:
+                return  # already counted this failed run
             new_streak = streak + 1
             if new_streak >= after_n and not (state.get("reacted_at_streak") == new_streak):
                 self._react_to_failure(row, on_failure, new_streak)
@@ -1246,7 +1264,14 @@ class JobManager:
                 self.db.rollback()
                 return None
             target = json.loads(row["payload_json"] or "{}").get("target", {})
-            timeout = int(target.get("timeout_seconds", 30))
+            # The lease must cover the adapter's effective timeout (review
+            # P1-3). Thread bridges wait up to 300s by default, so a 30s lease
+            # would let the dispatcher reclaim and re-send a wake whose turn is
+            # still running. Per-target timeout_seconds overrides; thread
+            # targets without one use the bridge default (300).
+            target_type = row["target_type"]
+            default_timeout = 300 if target_type in {"codex_thread", "opencode_thread"} else 30
+            timeout = int(target.get("timeout_seconds", default_timeout))
             lease_seconds = timeout + max(1, self.delivery_lease_margin)
             due = (
                 row["status"] in {"pending", "retrying"}
@@ -1398,12 +1423,20 @@ class JobManager:
 
         Raises on non-2xx status or transport error; the caller marks the
         delivery failed (and retries per max_attempts/retry_delay_seconds).
+        Redirects are NOT followed (review P1-4): urllib's default redirect
+        handler would forward configured headers — including ``Authorization``
+        — to a cross-origin destination. A 3xx here fails the delivery instead
+        of leaking credentials. The JSON body omits configured header secrets.
         """
         target = payload["target"]
         url = target["url"]
         headers = dict(target.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        # Never duplicate configured header secrets into the JSON payload.
+        body_payload = dict(payload)
+        body_payload["target"] = dict(target)
+        body_payload["target"].pop("headers", None)
+        body = json.dumps(body_payload, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=body,
@@ -1412,12 +1445,18 @@ class JobManager:
         )
         timeout = float(target.get("timeout_seconds", 30))
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            # Disable automatic redirects: cross-origin redirects could exfiltrate
+            # the configured headers (Authorization bearer tokens, service tokens).
+            with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
                 status = response.getcode()
         except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                raise RuntimeError(f"webhook redirect not followed (HTTP {exc.code}); credentials would leak cross-origin") from exc
             raise RuntimeError(f"webhook returned HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"webhook request failed: {exc.reason}") from exc
+        if status in (301, 302, 303, 307, 308):
+            raise RuntimeError(f"webhook redirect not followed (HTTP {status}); credentials would leak cross-origin")
         if status not in (200, 201, 202, 204):
             raise RuntimeError(f"webhook returned HTTP {status}")
 
@@ -1461,17 +1500,17 @@ class JobManager:
         policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
-        # Thread inheritance (user request): the LAUNCHING thread is the
-        # default wake destination. A codex_thread/opencode_thread target
-        # without its own session/thread id inherits origin_thread_id, which
-        # itself defaults to CODEX_THREAD_ID / OPENCODE_SESSION_ID from the
-        # MCP client environment. Explicit ids in the target always win, so
-        # agents can still fan out to other threads.
-        origin_thread_id = (
-            origin_thread_id
-            or os.environ.get("CODEX_THREAD_ID")
-            or os.environ.get("OPENCODE_SESSION_ID")
-        )
+        # Thread identity (review P1-4 / P2-2): the LAUNCHING thread is the
+        # default wake destination, but the daemon cannot know it. The MCP
+        # wrapper (job_start) resolves origin_thread_id from the calling task's
+        # environment and passes it explicitly; the daemon NEVER infers it
+        # from its own (persistent) environment, which would inherit the thread
+        # that originally spawned the daemon. Explicit ids in the target always
+        # win, so agents can still fan out to other threads. Caller-owned
+        # wake-target dicts are copied before any inherited id or event is
+        # injected — the caller's objects are never mutated.
+        if wake_targets is not None:
+            wake_targets = [dict(target) for target in wake_targets]
         if wake_targets and origin_thread_id:
             for target in wake_targets:
                 if target.get("type") == "opencode_thread" and not (
@@ -1508,11 +1547,6 @@ class JobManager:
                 if target.get("type") in {"codex_thread", "opencode_thread"}
             ),
             None,
-        )
-        origin_thread_id = (
-            origin_thread_id
-            or os.environ.get("CODEX_THREAD_ID")
-            or os.environ.get("OPENCODE_SESSION_ID")
         )
         spec_path = self._write_spec(
             job_id,
@@ -1689,11 +1723,13 @@ class JobManager:
         calls ``JobManager.start`` directly. Returns ``None`` when the job is
         unknown or not launchable.
 
-        The runnable check is ATOMIC (review P1-3): under one transaction the
-        row's status and policy_disabled flag are verified, then the status is
-        claimed as ``launching``. Any concurrent caller sees a non-runnable
-        status and cannot double-launch the same job row — this closes the
-        ``run_job``-launches-an-already-running-job hole.
+        The runnable check is ATOMIC (review P1-3 / P1-1): under one
+        transaction the row's status and policy_disabled flag are verified,
+        then the status is claimed as ``launching``. ``launching`` is NOT
+        runnable, so a serialized second call (or a concurrent one) cannot
+        claim the same row twice. A crash between claim and spawn leaves the
+        row ``launching``; the dispatch loop's stale-claim recovery reclaims
+        it after a grace period (see ``_recover_stale_launch_claims``).
         """
         self._ensure_open()
         launch: dict[str, Any] | None = None
@@ -1707,18 +1743,26 @@ class JobManager:
                 ).fetchone()
                 if row is None:
                     return None
-                if row["status"] not in {"queued", "failed", "orphaned", "launching"}:
-                    # Already running (or a transient claimed/terminal state a
-                    # concurrent launcher owns). Never double-spawn.
+                if row["status"] not in {"queued", "failed", "orphaned"}:
+                    # Already running or claimed ('launching') — a concurrent
+                    # caller owns the claim. Never double-spawn.
                     return None
                 if row["policy_disabled"]:
                     return None
                 # Claim the row for launch: a concurrent prepare_launch or a
                 # watcher seeing this status will treat it as not-runnable.
                 self.db.execute(
-                    "UPDATE jobs SET status='launching', updated_at=? WHERE job_id=?",
+                    "UPDATE jobs SET status='launching', updated_at=? WHERE job_id=? AND status IN ('queued','failed','orphaned')",
                     (now_iso(), job_id),
                 )
+                # Verify the claim actually took (guards against a race where
+                # another thread claimed between our SELECT and UPDATE).
+                claimed = self.db.execute(
+                    "SELECT status FROM jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                if claimed is None or claimed["status"] != "launching":
+                    self.db.commit()
+                    return None
                 self.db.commit()
             # Read the run spec AFTER the claim so the row reflects the claimed
             # state; spec fields are immutable so this is just a fresh read.
@@ -1759,6 +1803,30 @@ class JobManager:
                 )
                 self.db.commit()
         return result
+
+    def _recover_stale_launch_claims(self) -> None:
+        """Reclaim ``launching`` rows whose claim went stale (crash between
+        claim and spawn). Called from the dispatch loop; a row left
+        ``launching`` past the grace window means the claiming process died
+        before spawning, so it is recovered to ``orphaned`` (the runner never
+        started) so it can be relaunched.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.launch_claim_timeout)).isoformat().replace("+00:00", "Z")
+        try:
+            with self.db_lock:
+                stale = self.db.execute(
+                    "SELECT job_id FROM jobs WHERE status='launching' AND updated_at < ?",
+                    (cutoff,),
+                ).fetchall()
+                for row in stale:
+                    self.db.execute(
+                        "UPDATE jobs SET status='orphaned', ended_at=?, updated_at=? WHERE job_id=? AND status='launching'",
+                        (now_iso(), now_iso(), row["job_id"]),
+                    )
+                if stale:
+                    self.db.commit()
+        except Exception:
+            self.logger.exception("stale launch claim recovery failed")
 
     def _launch_prepared(self, launch: dict[str, Any]) -> dict[str, Any]:
         """Launch a job prepared by :meth:`prepare_launch` (wraps ``_launch``).
@@ -2800,9 +2868,15 @@ class JobManager:
         """Bulk-drain the wake/delivery queue (agent-controllable overflow valve).
 
         Matches deliveries by optional job_id, status, and age; ``stale_only``
-        restricts to deliveries whose SOURCE EVENT is terminal-and-old — i.e.
+        restricts to deliveries whose SOURCE EVENT is terminal — i.e.
         notifications that lost their moment (the "disk full, everything
         floods at once" case). Returns what was (or would be) drained.
+
+        Default drain set is the unsettled queue (``pending``/``retrying``):
+        a bulk drain must never rewrite already-delivered records as failed
+        (review P2-1). To drain settled history you must pass an explicit
+        ``status`` (e.g. ``status="delivered"``). Draining a ``dispatching``
+        row finalizes its in-flight delivery_attempts entry first.
         """
         validate_limit(limit, "limit", 10000)
         if status is not None and status not in {"pending", "retrying", "dispatching", "delivered", "failed"}:
@@ -2819,17 +2893,18 @@ class JobManager:
         if status is not None:
             where.append("d.status=?")
             args.append(status)
+        else:
+            # Safe default: only unsettled deliveries. Settled rows (delivered/
+            # failed) are audit history and must be explicitly opted into.
+            where.append("d.status IN ('pending','retrying')")
         if older_than_seconds is not None:
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
             where.append("d.created_at < ?")
             args.append(cutoff)
         if stale_only:
             # Only drain deliveries whose event no longer matters: the source
-            # job already reached a terminal state AND the delivery is old
-            # enough that the payload cannot be acted on promptly. We accept
-            # any terminal event; freshness is bounded by the source event's
-            # created_at (event must itself be at least as old as the
-            # older_than cutoff when given, otherwise any age).
+            # job already reached a terminal state. We accept any terminal
+            # event; freshness is bounded by the source event's created_at.
             where.append(
                 "EXISTS (SELECT 1 FROM events e JOIN jobs j ON j.job_id=e.job_id "
                 "WHERE e.event_id=d.event_id AND j.status IN ('completed','failed','timeout','cancelled','orphaned'))"
@@ -2848,6 +2923,13 @@ class JobManager:
             ).fetchall()
             ids = [r["delivery_id"] for r in rows]
             placeholders = ",".join("?" for _ in ids)
+            # Finalize any in-flight delivery_attempts rows for dispatching
+            # deliveries being drained (never leave them dangling 'dispatching').
+            self.db.execute(
+                f"UPDATE delivery_attempts SET status='failed', ended_at=?, error='drained via clear_deliveries' "
+                f"WHERE delivery_id IN ({placeholders}) AND ended_at IS NULL",
+                (now_iso(), *ids),
+            )
             cur = self.db.execute(
                 f"UPDATE deliveries SET status='failed', last_error='drained via clear_deliveries', next_attempt_at=NULL, claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL "
                 f"WHERE delivery_id IN ({placeholders})",
