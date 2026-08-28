@@ -411,7 +411,14 @@ class JobManager:
             with condition:
                 condition.notify_all()
 
-    def _transition_terminal(self, job_id: str, status: str, exit_code: int | None = None) -> bool:
+    def _transition_terminal(
+        self,
+        job_id: str,
+        status: str,
+        exit_code: int | None = None,
+        *,
+        claim_token: str | None = None,
+    ) -> bool:
         if status not in TERMINAL_STATUSES:
             raise ValueError(f"invalid terminal status: {status}")
         self._ensure_open()
@@ -419,10 +426,24 @@ class JobManager:
 
         def transition() -> bool:
             with self.db_lock:
-                changed = self.db.execute(
-                    "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=? AND status='running'",
-                    (status, exit_code, stamp, stamp, job_id),
-                ).rowcount
+                if claim_token:
+                    # Claim-OWNED transition (review rc32 P1-3): only the run
+                    # holding this token may move the row to a terminal state.
+                    # Guards both the 'running' (normal) and 'launching'
+                    # (runner failed before publishing) states so a stale run
+                    # can never clobber a newer launch, and a run that finished
+                    # while the row was still 'launching' still records its
+                    # terminal outcome (no more rejected transitions).
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL "
+                        "WHERE job_id=? AND claim_token=? AND status IN ('running','launching')",
+                        (status, exit_code, stamp, stamp, job_id, claim_token),
+                    ).rowcount
+                else:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=? AND status='running'",
+                        (status, exit_code, stamp, stamp, job_id),
+                    ).rowcount
                 self.db.commit()
             return bool(changed)
 
@@ -721,37 +742,26 @@ class JobManager:
     def _claim_due_restart(self, job_id: str, restart_after: str) -> dict[str, Any] | None:
         """Atomically claim a due restart deadline and prepare its launch.
 
-        One dispatcher tick wins the claim: within a single write transaction
-        we verify the job is still failed and the deadline is unchanged, then
-        clear ``restart_after`` and call ``prepare_launch`` while holding the
-        DB lock so no other thread can double-launch. Returns the launch dict,
-        or ``None`` when the job is no longer eligible.
+        One dispatcher tick wins the claim: within a single guarded UPDATE the
+        job is verified still-failed/not-disabled with the deadline unchanged,
+        the deadline is cleared, and the row is claimed ``launching`` with a
+        durable claim_token. The deadline clear and the launch claim are ONE
+        transaction (review rc32 P1-4): a crash between them previously left a
+        failed job with its attempt consumed and no pending deadline, so
+        ``max_retries=1`` immediately became ``gave_up``. Now either both the
+        claim and the deadline-clear commit, or neither does — and if the claim
+        cannot be won (disabled, already claimed, or deadline changed), the
+        deadline stays intact for the next tick. Returns the launch dict, or
+        ``None`` when the job is no longer eligible.
         """
-        def claim() -> dict[str, Any] | None:
-            with self.db_lock:
-                row = self.db.execute(
-                    "SELECT status, policy_disabled, policy_state_json FROM jobs WHERE job_id=?",
-                    (job_id,),
-                ).fetchone()
-                if row is None or row["status"] != "failed" or row["policy_disabled"]:
-                    return None
-                try:
-                    state = json.loads(row["policy_state_json"] or "{}")
-                except (TypeError, ValueError):
-                    state = {}
-                if state.get("restart_after") != restart_after:
-                    return None  # another thread already claimed this deadline
-                state["restart_after"] = None
-                self.db.execute(
-                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
-                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
-                )
-                self.db.commit()
-                # prepare_launch writes the spec + reads state under the same
-                # connection; holding the lock here guarantees serialized
-                # claim-then-prepare so a concurrent launch cannot interleave.
-                return self.prepare_launch(job_id)
-        return self._retry_locked(claim)
+        token = self._claim_launch(
+            job_id,
+            require_policy_state={"restart_after": restart_after},
+            policy_state_updates={"restart_after": None},
+        )
+        if token is None:
+            return None
+        return self._build_launch(job_id, token)
 
     def _apply_retention(self, job_id: str, retention: dict[str, int]) -> None:
         """Prune old per-stream rows for one job (policy.retention block).
@@ -1646,6 +1656,8 @@ class JobManager:
         stderr_path: Path,
         events_path: Path,
         spec_path: Path,
+        *,
+        claim_token: str | None = None,
     ) -> dict[str, Any]:
         creationflags = 0
         if sys.platform == "win32":
@@ -1670,10 +1682,17 @@ class JobManager:
                 # guard's WHERE status='running' would skip a launching row).
                 stamp = now_iso()
                 with self.db_lock:
-                    self.db.execute(
-                        "UPDATE jobs SET status='failed', exit_code=1, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=?",
-                        (stamp, stamp, job_id),
-                    )
+                    if claim_token:
+                        self.db.execute(
+                            "UPDATE jobs SET status='failed', exit_code=1, ended_at=?, updated_at=?, stop_requested_at=NULL "
+                            "WHERE job_id=? AND claim_token=? AND status='launching'",
+                            (stamp, stamp, job_id, claim_token),
+                        )
+                    else:
+                        self.db.execute(
+                            "UPDATE jobs SET status='failed', exit_code=1, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=?",
+                            (stamp, stamp, job_id),
+                        )
                     self.db.commit()
                 self._emit(
                     job_id,
@@ -1697,7 +1716,48 @@ class JobManager:
         finally:
             runner_log.close()
         self.processes[job_id] = proc
-        threading.Thread(target=self._watch_runner, args=(job_id, proc), daemon=True).start()
+        threading.Thread(target=self._watch_runner, args=(job_id, proc, claim_token), daemon=True).start()
+        if claim_token:
+            # The runner (not this parent) performs the launching->running
+            # promotion atomically, guarded by claim_token. The parent only
+            # records worker_pid so stale-claim recovery can tell a live runner
+            # from a claim abandoned before spawn (review rc32 P1-3). This write
+            # is claim-token guarded: it cannot resurrect a run the runner has
+            # already finished or that a newer launch owns.
+            with self.db_lock:
+                wrote = self.db.execute(
+                    "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND claim_token=? AND status='launching'",
+                    (proc.pid, now_iso(), job_id, claim_token),
+                ).rowcount
+                self.db.commit()
+            if wrote != 1:
+                # The claim was lost between spawn and this write (recovery
+                # reclaimed it, or a newer launch owns the row). Never leave a
+                # runner for a run that is no longer ours.
+                self.processes.pop(job_id, None)
+                try:
+                    self._terminate_pid(proc.pid, force=True, deadline=time.monotonic() + self.recovery_kill_timeout)
+                except Exception:
+                    self.logger.exception("could not terminate leaked runner job_id=%s pid=%s", job_id, proc.pid)
+                current = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))
+                return {
+                    "job_id": job_id,
+                    "status": (current["status"] if current else "lost"),
+                    "message": "Launch claim was lost before the runner published",
+                    "worker_pid": proc.pid,
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "events_path": str(events_path),
+                }
+            return {
+                "job_id": job_id,
+                "status": "running",
+                "worker_pid": proc.pid,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "events_path": str(events_path),
+                "message": "Job started",
+            }
         with self.db_lock:
             self.db.execute(
                 "UPDATE jobs SET status='running', started_at=?, runner_heartbeat_at=?, worker_pid=?, updated_at=?, exit_code=NULL, ended_at=NULL WHERE job_id=?",
@@ -1714,65 +1774,82 @@ class JobManager:
             "message": "Job started",
         }
 
-    def prepare_launch(self, job_id: str) -> dict[str, Any] | None:
-        """Prepare a job already inserted in a runnable state for launch.
+    def _claim_launch(
+        self,
+        job_id: str,
+        *,
+        require_policy_state: dict[str, Any] | None = None,
+        policy_state_updates: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Atomically claim a runnable job for launch and return the claim token.
 
-        Writes the spec JSON (command/cwd/env/timeout/etc. from the row) and
-        returns a launch dict. This is the shared explicit operation used by the
-        local dispatcher and the remote dispatcher so a remote launch never
-        calls ``JobManager.start`` directly. Returns ``None`` when the job is
-        unknown or not launchable.
+        The claim is a single guarded UPDATE whose rowcount is authoritative:
+        ``WHERE status IN ('queued','failed','orphaned') AND policy_disabled=0``.
+        Exactly one caller (in this process or another) observes rowcount==1;
+        every other caller gets 0 and returns None (review rc32 P1-2). The old
+        SELECT-then-verify approach let two JobManager instances both believe
+        they owned the claim because a post-UPDATE SELECT only confirmed the
+        row's status, not who wrote it.
 
-        The runnable check is ATOMIC (review P1-3 / P1-1): under one
-        transaction the row's status and policy_disabled flag are verified,
-        then the status is claimed as ``launching``. ``launching`` is NOT
-        runnable, so a serialized second call (or a concurrent one) cannot
-        claim the same row twice. A crash between claim and spawn leaves the
-        row ``launching``; the dispatch loop's stale-claim recovery reclaims
-        it after a grace period (see ``_recover_stale_launch_claims``).
+        ``require_policy_state`` guards the claim on persisted policy_state
+        (e.g. ``{"restart_after": <deadline>}``); ``policy_state_updates`` are
+        applied to policy_state in the SAME transaction as the claim. This makes
+        the restart-deadline clear atomic with the launch claim (review rc32
+        P1-4): a crash between the two can no longer consume the restart budget
+        without establishing launch ownership.
         """
-        self._ensure_open()
-        launch: dict[str, Any] | None = None
-
-        def claim() -> dict[str, Any] | None:
-            nonlocal launch
+        def claim() -> str | None:
             with self.db_lock:
                 row = self.db.execute(
-                    "SELECT job_id, status, policy_disabled FROM jobs WHERE job_id=?",
+                    "SELECT job_id, status, policy_disabled, policy_state_json FROM jobs WHERE job_id=?",
                     (job_id,),
                 ).fetchone()
                 if row is None:
                     return None
                 if row["status"] not in {"queued", "failed", "orphaned"}:
-                    # Already running or claimed ('launching') — a concurrent
-                    # caller owns the claim. Never double-spawn.
                     return None
                 if row["policy_disabled"]:
                     return None
-                # Claim the row for launch: a concurrent prepare_launch or a
-                # watcher seeing this status will treat it as not-runnable.
-                self.db.execute(
-                    "UPDATE jobs SET status='launching', updated_at=? WHERE job_id=? AND status IN ('queued','failed','orphaned')",
-                    (now_iso(), job_id),
-                )
-                # Verify the claim actually took (guards against a race where
-                # another thread claimed between our SELECT and UPDATE).
-                claimed = self.db.execute(
-                    "SELECT status FROM jobs WHERE job_id=?", (job_id,)
-                ).fetchone()
-                if claimed is None or claimed["status"] != "launching":
+                state: dict[str, Any] = {}
+                try:
+                    state = json.loads(row["policy_state_json"] or "{}")
+                except (TypeError, ValueError):
+                    state = {}
+                if not isinstance(state, dict):
+                    state = {}
+                if require_policy_state is not None:
+                    for key, value in require_policy_state.items():
+                        if state.get(key) != value:
+                            return None
+                if policy_state_updates is not None:
+                    state.update(policy_state_updates)
+                token = "claim_" + uuid.uuid4().hex[:16]
+                changed = self.db.execute(
+                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=? "
+                    "WHERE job_id=? AND status IN ('queued','failed','orphaned') AND policy_disabled=0",
+                    (token, json.dumps(state, separators=(",", ":")), now_iso(), job_id),
+                ).rowcount
+                if changed != 1:
+                    # A concurrent caller won the claim (rowcount 0) — never
+                    # double-claim. Commit to close the read transaction.
                     self.db.commit()
                     return None
                 self.db.commit()
-            # Read the run spec AFTER the claim so the row reflects the claimed
-            # state; spec fields are immutable so this is just a fresh read.
-            spec_row = self._row(
-                "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json FROM jobs WHERE job_id=?",
-                (job_id,),
-            )
-            if not spec_row:
-                return None
-            interactive = json.loads(spec_row["run_json"] or "{}").get("interactive") is True
+                return token
+        return self._retry_locked(claim)
+
+    def _build_launch(self, job_id: str, token: str) -> dict[str, Any]:
+        """Read the run spec for a claimed job and write its spec file."""
+        spec_row = self._row(
+            "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json FROM jobs WHERE job_id=?",
+            (job_id,),
+        )
+        interactive = False
+        if spec_row:
+            try:
+                interactive = json.loads(spec_row["run_json"] or "{}").get("interactive") is True
+            except (TypeError, ValueError):
+                interactive = False
             spec = {
                 "command": spec_row["command"],
                 "cwd": spec_row["cwd"],
@@ -1782,27 +1859,66 @@ class JobManager:
                 "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
                 "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
                 "interactive": interactive,
+                # The runner uses this token to atomically promote the claim
+                # (launching -> running) and to guard every terminal transition
+                # so a stale run can never touch a newer launch.
+                "claim_token": token,
             }
-            spec_path = self._write_spec(job_id, spec)
-            launch = {
-                "job_id": job_id,
-                "stdout_path": Path(spec["stdout_path"]),
-                "stderr_path": Path(spec["stderr_path"]),
-                "events_path": self.events_dir / f"{job_id}.jsonl",
-                "spec_path": spec_path,
+        else:
+            spec = {
+                "command": "",
+                "cwd": None,
+                "env": {},
+                "timeout_seconds": None,
+                "max_log_bytes": self.max_log_bytes,
+                "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
+                "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
+                "interactive": False,
+                "claim_token": token,
             }
-            return launch
+        spec_path = self._write_spec(job_id, spec)
+        return {
+            "job_id": job_id,
+            "stdout_path": Path(spec["stdout_path"]),
+            "stderr_path": Path(spec["stderr_path"]),
+            "events_path": self.events_dir / f"{job_id}.jsonl",
+            "spec_path": spec_path,
+            "claim_token": token,
+        }
 
-        result = self._retry_locked(claim)
-        if result is None and self._closed:
-            # A shutdown raced the claim; the row may be left 'launching'.
-            with self.db_lock:
-                self.db.execute(
-                    "UPDATE jobs SET status='orphaned', updated_at=? WHERE job_id=? AND status='launching'",
-                    (now_iso(), job_id),
-                )
-                self.db.commit()
-        return result
+    def prepare_launch(self, job_id: str) -> dict[str, Any] | None:
+        """Prepare a job already inserted in a runnable state for launch.
+
+        Writes the spec JSON (command/cwd/env/timeout/etc. from the row) and
+        returns a launch dict. This is the shared explicit operation used by the
+        local dispatcher and the remote dispatcher so a remote launch never
+        calls ``JobManager.start`` directly. Returns ``None`` when the job is
+        unknown or not launchable.
+
+        The runnable check is ATOMIC (review P1-3 / P1-1 / rc32 P1-2): under one
+        guarded UPDATE the row's status and policy_disabled flag are verified
+        and the row is claimed as ``launching`` with a durable claim_token. The
+        UPDATE's rowcount==1 is authoritative, so across processes exactly one
+        caller owns the claim (no SELECT-then-verify ambiguity). ``launching``
+        is NOT runnable, so a serialized second call (or a concurrent one)
+        cannot claim the same row twice. A crash between claim and spawn leaves
+        the row ``launching``; the dispatch loop's stale-claim recovery reclaims
+        it after a grace period (see ``_recover_stale_launch_claims``).
+        """
+        self._ensure_open()
+        token = self._claim_launch(job_id)
+        if token is None:
+            if self._closed:
+                # A shutdown raced the claim; the row may be left 'launching'
+                # and no runner will ever be spawned for it.
+                with self.db_lock:
+                    self.db.execute(
+                        "UPDATE jobs SET status='orphaned', updated_at=? WHERE job_id=? AND status='launching' AND claim_token IS NOT NULL",
+                        (now_iso(), job_id),
+                    )
+                    self.db.commit()
+            return None
+        return self._build_launch(job_id, token)
 
     def _recover_stale_launch_claims(self) -> None:
         """Reclaim ``launching`` rows whose claim went stale (crash between
@@ -1810,21 +1926,59 @@ class JobManager:
         ``launching`` past the grace window means the claiming process died
         before spawning, so it is recovered to ``orphaned`` (the runner never
         started) so it can be relaunched.
+
+        Review rc32 P1-3: recovery reconciles process ownership FIRST. A row
+        whose runner (worker_pid) is still alive is a launch that is mid-flight
+        (the runner is about to publish its workload) — never orphan a live
+        launch. A row with no live runner may still have a live workload pid to
+        terminate before the row is freed, and the recovery emits an
+        ``orphaned`` event through the normal terminal-transition path so waits,
+        wake targets, and feeds are notified.
         """
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.launch_claim_timeout)).isoformat().replace("+00:00", "Z")
         try:
+            rows_to_recover: list[sqlite3.Row] = []
             with self.db_lock:
                 stale = self.db.execute(
-                    "SELECT job_id FROM jobs WHERE status='launching' AND updated_at < ?",
+                    "SELECT job_id, worker_pid, pid, claim_token FROM jobs WHERE status='launching' AND updated_at < ?",
                     (cutoff,),
                 ).fetchall()
                 for row in stale:
-                    self.db.execute(
-                        "UPDATE jobs SET status='orphaned', ended_at=?, updated_at=? WHERE job_id=? AND status='launching'",
-                        (now_iso(), now_iso(), row["job_id"]),
+                    if row["worker_pid"] and self._pid_alive(row["worker_pid"]):
+                        # The runner process is alive: this launch will publish
+                        # momentarily. Leave it alone.
+                        continue
+                    rows_to_recover.append(row)
+            for row in rows_to_recover:
+                job_id = row["job_id"]
+                if row["pid"]:
+                    # A workload child outlived its runner; terminate it before
+                    # freeing the row (review rc32 P1-3).
+                    if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                        self.logger.error("stale-claim recovery could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                        continue
+                if row["claim_token"]:
+                    recovered = self._transition_terminal(job_id, "orphaned", claim_token=row["claim_token"])
+                else:
+                    # Legacy row claimed before the claim_token column existed.
+                    def recover_legacy() -> bool:
+                        with self.db_lock:
+                            changed = self.db.execute(
+                                "UPDATE jobs SET status='orphaned', ended_at=?, updated_at=? "
+                                "WHERE job_id=? AND status='launching' AND claim_token IS NULL",
+                                (now_iso(), now_iso(), job_id),
+                            ).rowcount
+                            self.db.commit()
+                        return bool(changed)
+                    recovered = self._retry_locked(recover_legacy)
+                if recovered:
+                    self._emit(
+                        job_id,
+                        "orphaned",
+                        message="Launch claim went stale before the runner published its workload",
+                        data={"claim_token": row["claim_token"]},
+                        source="server",
                     )
-                if stale:
-                    self.db.commit()
         except Exception:
             self.logger.exception("stale launch claim recovery failed")
 
@@ -1840,6 +1994,7 @@ class JobManager:
             launch["stderr_path"],
             launch["events_path"],
             launch["spec_path"],
+            claim_token=launch.get("claim_token"),
         )
 
     async def rerun(self, job_id: str, **overrides: Any) -> dict[str, Any]:
@@ -1915,24 +2070,56 @@ class JobManager:
             self._save_policy_state(result["job_id"], {"failure_streak": int(prior_state.get("failure_streak", 0))})
         return result
 
-    def _watch_runner(self, job_id: str, proc: subprocess.Popen[bytes]) -> None:
+    def _watch_runner(
+        self,
+        job_id: str,
+        proc: subprocess.Popen[bytes],
+        claim_token: str | None = None,
+    ) -> None:
         proc.wait()
         try:
-            row = self._row("SELECT status, pid, worker_pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
-            if not row or row["status"] != "running":
+            row = self._row("SELECT status, pid, worker_pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,))
+            if not row:
+                return
+            if claim_token and row["status"] == "launching" and row["claim_token"] == claim_token:
+                # Our runner exited before it ever published its workload —
+                # either the child spawn failed inside the runner or the runner
+                # was killed. The claim is stale; recover it NOW (no grace
+                # period wait) so the job can be relaunched promptly. Guarded by
+                # claim_token so a concurrent recovery can't double-orphan.
+                if row["pid"]:
+                    if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                        self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                if self._transition_terminal(job_id, "orphaned", claim_token=claim_token):
+                    self._emit(
+                        job_id,
+                        "orphaned",
+                        message="Job runner exited before its workload was published",
+                        data={"claim_token": claim_token},
+                        source="server",
+                    )
+                return
+            if row["status"] != "running":
                 return
             # A restart policy can relaunch this job with a NEW runner while a
-            # stale watcher from the previous run is still waking up. If the
-            # recorded worker_pid is no longer OUR runner process, a newer
-            # launch owns the row — leave it alone.
+            # stale watcher from the previous run is still waking up. If a newer
+            # launch owns the row, leave it alone. Ownership is claim_token
+            # based when available (the launch path); on the start() path the
+            # recorded worker_pid must still be OUR runner process. Note: on
+            # Windows the runner's os.getpid() (real python) can differ from the
+            # Popen pid (launcher shim), so the pid guard only applies to the
+            # no-token path where worker_pid is the parent-observed Popen pid.
             watcher_pid = getattr(proc, "pid", None)
-            if row["worker_pid"] and watcher_pid and int(row["worker_pid"]) != int(watcher_pid):
+            if claim_token:
+                if row["claim_token"] and row["claim_token"] != claim_token:
+                    return
+            elif row["worker_pid"] and watcher_pid and int(row["worker_pid"]) != int(watcher_pid):
                 return
             if row["pid"] and not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
                 self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
                 return
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
-            if self._transition_terminal(job_id, terminal):
+            if self._transition_terminal(job_id, terminal, claim_token=claim_token):
                 self._emit(job_id, terminal, message="Job runner exited before recording a terminal status")
         except (sqlite3.Error, RuntimeError):
             return
@@ -2088,11 +2275,11 @@ class JobManager:
                 time.sleep(0.05)
         return not self._pid_alive(pid)
 
-    def _finish(self, job_id: str, status: str, exit_code: int | None = None) -> None:
+    def _finish(self, job_id: str, status: str, exit_code: int | None = None, *, claim_token: str | None = None) -> None:
         row = self._row("SELECT stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
         if row and row["stop_requested_at"]:
             status = "cancelled"
-        if self._transition_terminal(job_id, status, exit_code):
+        if self._transition_terminal(job_id, status, exit_code, claim_token=claim_token):
             data = {"exit_code": exit_code} if exit_code is not None else {}
             self._emit(job_id, status, data=data)
         self.processes.pop(job_id, None)

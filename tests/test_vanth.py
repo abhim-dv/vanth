@@ -1191,6 +1191,144 @@ def test_launch_claim_cannot_be_acquired_twice(tmp_path):
     run(main())
 
 
+def test_launch_claim_is_exclusive_across_manager_instances(tmp_path):
+    """Review rc32 P1-2: two JobManager instances sharing one database must not
+    both believe they own the same launch claim. The claim UPDATE's rowcount is
+    authoritative; a post-UPDATE status SELECT cannot identify the owner, which
+    let two callers each think they won."""
+    import threading as _threading
+
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        manager2 = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+
+            # Both instances race prepare_launch on the same failed job.
+            barrier = _threading.Barrier(2)
+            results: dict[str, object] = {}
+
+            def claim_a():
+                barrier.wait()
+                try:
+                    results["a"] = manager.prepare_launch(job["job_id"])
+                except Exception as exc:  # pragma: no cover
+                    results["a"] = exc
+
+            def claim_b():
+                barrier.wait()
+                try:
+                    results["b"] = manager2.prepare_launch(job["job_id"])
+                except Exception as exc:  # pragma: no cover
+                    results["b"] = exc
+
+            ta = _threading.Thread(target=claim_a)
+            tb = _threading.Thread(target=claim_b)
+            ta.start(); tb.start(); ta.join(); tb.join()
+
+            winners = [k for k in ("a", "b") if isinstance(results[k], dict) and results[k] is not None]
+            assert len(winners) == 1, f"expected exactly one claim winner, got {winners}"
+            # The row is claimed 'launching' by the winner.
+            status = manager.status(job["job_id"])["status"]
+            assert status == "launching"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+            manager2.begin_shutdown()
+            manager2.close()
+
+    run(main())
+
+
+def test_runner_promotes_owned_claim_and_parent_cannot_resurrect(tmp_path):
+    """Review rc32 P1-3: the runner atomically promotes its OWNED claim
+    (launching -> running, guarded by claim_token), and a parent write for that
+    claim can never resurrect a run the runner already finished."""
+    import os as _os
+    import threading as _threading
+
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            assert launch is not None
+            token = launch["claim_token"]
+            row = manager._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "launching"
+            assert row["claim_token"] == token
+
+            # The runner promotes its claim atomically.
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 4242, token)
+            row = manager._row("SELECT status, pid, worker_pid, started_at FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "running"
+            assert row["pid"] == 4242
+            assert row["worker_pid"] == _os.getpid()
+            assert row["started_at"] is not None
+
+            # A fast job then records its terminal state through the claim-owned
+            # transition (previously REJECTED because the row was still
+            # 'launching' when the parent update raced).
+            assert manager._transition_terminal(job["job_id"], "completed", 0, claim_token=token)
+            row = manager._row("SELECT status, exit_code FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "completed"
+
+            # A guarded parent write can no longer resurrect the dead runner.
+            with manager.db_lock:
+                changed = manager.db.execute(
+                    "UPDATE jobs SET status='running', updated_at=? "
+                    "WHERE job_id=? AND claim_token=? AND status='launching'",
+                    (now_iso(), job["job_id"], token),
+                ).rowcount
+                manager.db.commit()
+            assert changed == 0, "parent must not resurrect a finished run"
+            assert manager.status(job["job_id"])["status"] == "completed"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_launch_lost_claim_kills_runner_and_does_not_resurrect(tmp_path):
+    """Review rc32 P1-3: if the parent's guarded worker_pid write fails because
+    the claim was already finished, _launch must NOT mark the row running."""
+    import threading as _threading
+
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token = launch["claim_token"]
+
+            # Simulate a runner that already finished the job before the parent
+            # write (the deterministic delayed-parent probe).
+            assert manager._transition_terminal(job["job_id"], "completed", 0, claim_token=token)
+
+            # _launch with this token must not resurrect the finished run.
+            result = manager._launch(
+                job["job_id"],
+                launch["stdout_path"],
+                launch["stderr_path"],
+                launch["events_path"],
+                launch["spec_path"],
+                claim_token=token,
+            )
+            # It must not report running; the run stays completed.
+            assert result["status"] != "running"
+            assert manager.status(job["job_id"])["status"] == "completed"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
 def test_stale_launch_claim_recovers_to_orphaned(tmp_path):
     """Review P1-1: a claim abandoned by a crash (row stuck 'launching') is
     recovered by the dispatch loop after the grace period."""
@@ -1213,8 +1351,107 @@ def test_stale_launch_claim_recovers_to_orphaned(tmp_path):
             manager._recover_stale_launch_claims()
             status = manager.status(job["job_id"])["status"]
             assert status == "orphaned", f"stale claim should be recovered, got {status}"
+            # The recovery emits an orphaned event so waits/wake targets fire.
+            events = manager.events(job["job_id"], types=["orphaned"], limit=10)["events"]
+            assert events, "stale-claim recovery must emit an orphaned event"
             # The recovered job is runnable again.
             assert manager.prepare_launch(job["job_id"]) is not None
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_stale_recovery_skips_live_runner(tmp_path):
+    """Review rc32 P1-3: recovery must NOT orphan a 'launching' row whose
+    runner process is still alive (it is mid-publish)."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            assert launch is not None
+            token = launch["claim_token"]
+            # Simulate a spawned (alive) runner: set worker_pid to this process.
+            import os as _os
+            import datetime as _dt
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND status='launching'",
+                    (_os.getpid(), _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"), job["job_id"]),
+                )
+                manager.db.commit()
+                stale = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=manager.launch_claim_timeout + 5)).isoformat().replace("+00:00", "Z")
+                manager.db.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND status='launching'",
+                    (stale, job["job_id"]),
+                )
+                manager.db.commit()
+            manager._recover_stale_launch_claims()
+            status = manager.status(job["job_id"])["status"]
+            assert status == "launching", f"live launch must not be orphaned, got {status}"
+            # And the live run can still promote normally.
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 9999, token)
+            assert manager.status(job["job_id"])["status"] == "running"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_restart_deadline_survives_until_claim_is_atomic(tmp_path):
+    """Review rc32 P1-4: the restart deadline must remain persisted until it is
+    cleared atomically WITH the launch claim. A crash (or failed claim) between
+    budget consumption and launch ownership must not leave a failed job with its
+    attempt consumed and no pending deadline (which turned max_retries=1 into
+    immediate gave_up)."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.6)
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] == 1
+            deadline = state.get("restart_after")
+            assert deadline is not None, "deadline must persist after budget claim"
+
+            # Disable the job: the claim must be REFUSED and the deadline must
+            # stay intact (old code cleared it before prepare_launch -> budget
+            # lost -> immediate gave_up).
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET policy_disabled=1 WHERE job_id=?", (job["job_id"],)
+                )
+                manager.db.commit()
+            launch = manager._claim_due_restart(job["job_id"], deadline)
+            assert launch is None, "disabled job must not claim a restart launch"
+            state = manager._policy_state(job["job_id"])
+            assert state.get("restart_after") == deadline, "deadline must survive a refused claim"
+            assert state["restart_attempts"] == 1, "budget must not be consumed by a refused claim"
+
+            # Re-enable: the atomic claim now clears the deadline AND claims the
+            # row in one transaction.
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET policy_disabled=0 WHERE job_id=?", (job["job_id"],)
+                )
+                manager.db.commit()
+            launch = manager._claim_due_restart(job["job_id"], deadline)
+            assert launch is not None, "due restart must claim after re-enable"
+            row = manager._row("SELECT status, policy_state_json FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "launching"
+            state = json.loads(row["policy_state_json"] or "{}")
+            assert state.get("restart_after") is None, "deadline cleared atomically with the claim"
+            # A second claim of the same deadline is refused.
+            assert manager._claim_due_restart(job["job_id"], deadline) is None
         finally:
             manager.begin_shutdown()
             manager.close()

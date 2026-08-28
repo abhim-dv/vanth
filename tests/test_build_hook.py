@@ -7,6 +7,7 @@ selection without requiring a Go toolchain or a real wheel build.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -145,6 +146,84 @@ def test_prebuilt_injection_names_binary_for_target_posix(tmp_path, monkeypatch)
         binary: os.path.join("vanth", "monitor-bin", "vanth-monitor")
     }
     assert os.path.isfile(binary)
+
+
+def test_prebuilt_injection_sets_executable_mode_for_posix(tmp_path, monkeypatch) -> None:
+    """Review P1-1: published POSIX wheels stored vanth-monitor as 0644, so
+    running it failed with PermissionError. copyfile does not preserve the
+    source's executable bit; the hook must chmod 0755 for non-Windows targets.
+
+    Verifies the chmod call directly because a Windows host cannot observe
+    POSIX mode bits via stat."""
+    dummy = tmp_path / "prebuilt-linux"
+    dummy.write_bytes(b"linux monitor")
+    os.chmod(dummy, 0o644)
+
+    monkeypatch.setenv("VANTH_MONITOR_BIN", str(dummy))
+    monkeypatch.setenv("VANTH_MONITOR_GOOS", "linux")
+    monkeypatch.setenv("VANTH_MONITOR_GOARCH", "amd64")
+    monkeypatch.setattr("bundle_monitor.os.name", "posix")
+
+    chmod_calls = []
+
+    def fake_chmod(path, mode):
+        chmod_calls.append((path, mode))
+
+    monkeypatch.setattr("bundle_monitor.os.chmod", fake_chmod)
+
+    build_data: dict[str, dict] = {}
+    hook = _make_hook(str(tmp_path))
+    hook.initialize("1.2.1", build_data)
+
+    binary = str(tmp_path / "dist" / "vanth-monitor")
+    assert (binary, 0o755) in chmod_calls, f"expected chmod 0755 on {binary}, got {chmod_calls}"
+    assert os.path.isfile(binary)
+
+
+def test_prebuilt_injection_keeps_windows_non_executable(tmp_path, monkeypatch) -> None:
+    """Windows wheels bundle vanth-monitor.exe; chmod semantics are irrelevant
+    there and the hook must not fail on them."""
+    dummy = tmp_path / "prebuilt-win.exe"
+    dummy.write_bytes(b"windows monitor")
+
+    monkeypatch.setenv("VANTH_MONITOR_BIN", str(dummy))
+    monkeypatch.setenv("VANTH_MONITOR_GOOS", "windows")
+    monkeypatch.setenv("VANTH_MONITOR_GOARCH", "amd64")
+    monkeypatch.setenv("VANTH_MONITOR_TAG", "win_amd64")
+    monkeypatch.setattr("bundle_monitor.os.name", "posix")
+
+    build_data: dict[str, dict] = {}
+    hook = _make_hook(str(tmp_path))
+    hook.initialize("1.2.1", build_data)
+
+    binary = str(tmp_path / "dist" / "vanth-monitor.exe")
+    assert os.path.isfile(binary)
+    assert build_data["tag"] == "py3-none-win_amd64"
+
+
+def test_prebuilt_injection_falls_back_to_target_tag(tmp_path, monkeypatch) -> None:
+    """Review P2-1: with a prebuilt binary + target GOOS/GOARCH and NO explicit
+    VANTH_MONITOR_TAG, the wheel tag must come from the target (never the build
+    host), so a Windows binary is never paired with a Linux wheel tag."""
+    dummy = tmp_path / "prebuilt-win.exe"
+    dummy.write_bytes(b"windows monitor")
+
+    monkeypatch.setenv("VANTH_MONITOR_BIN", str(dummy))
+    monkeypatch.setenv("VANTH_MONITOR_GOOS", "windows")
+    monkeypatch.setenv("VANTH_MONITOR_GOARCH", "amd64")
+    monkeypatch.delenv("VANTH_MONITOR_TAG", raising=False)
+    # Build host is Linux; the target tag must win.
+    monkeypatch.setattr("bundle_monitor.os.name", "posix")
+    monkeypatch.setattr("bundle_monitor.wheel_platform_tag", lambda: "manylinux_2_17_x86_64")
+
+    build_data: dict[str, dict] = {}
+    hook = _make_hook(str(tmp_path))
+    hook.initialize("1.2.1", build_data)
+
+    binary = str(tmp_path / "dist" / "vanth-monitor.exe")
+    assert build_data["tag"] == "py3-none-win_amd64"
+    assert os.path.isfile(binary)
+    assert "monitor-bin" in build_data["force_include"][binary]
 
 
 def test_prebuilt_missing_raises(tmp_path, monkeypatch) -> None:

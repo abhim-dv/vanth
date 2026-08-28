@@ -12,39 +12,71 @@ from pathlib import Path
 from .server import JobManager, now_iso
 
 
-def _fail_start(manager: JobManager, job_id: str, exc: Exception) -> int:
+def _fail_start(manager: JobManager, job_id: str, exc: Exception, claim_token: str | None = None) -> int:
     message = f"Job runner failed to start: {exc}"
     try:
-        if manager._transition_terminal(job_id, "failed", 1):
+        # The row may still be 'launching' (the parent claimed it and the runner
+        # is mid-start). A claim-owned transition records the failure from
+        # 'launching' OR 'running' so a run that fails before publishing is not
+        # left stranded as 'launching' until stale-claim recovery.
+        if manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token):
             manager._emit(job_id, "failed", message=message, data={"error": str(exc)}, level="error", source="runner")
     finally:
         manager.close()
     return 1
 
 
-def _publish_workload(manager: JobManager, job_id: str, pid: int) -> bool:
+def _publish_workload(
+    manager: JobManager, job_id: str, pid: int, claim_token: str | None = None
+) -> bool:
     def publish() -> int:
         with manager.db_lock:
-            # The row may still be 'launching' if the server claimed it in
-            # prepare_launch and is mid-spawn; accept either so the workload
-            # publication never aborts a valid runner.
-            changed = manager.db.execute(
-                "UPDATE jobs SET pid=?, runner_heartbeat_at=?, updated_at=? WHERE job_id=? AND status IN ('running','launching') AND stop_requested_at IS NULL",
-                (pid, now_iso(), now_iso(), job_id),
-            ).rowcount
+            if claim_token:
+                # Claim-owned promotion (review rc32 P1-3): the runner atomically
+                # promotes the row it owns from 'launching' to 'running' ONLY if
+                # it still holds claim_token. This is what makes the launching->running
+                # transition race-free: a fast job can complete and record its
+                # terminal state, and a parent can never resurrect a dead runner
+                # with an unguarded 'running' write. If the claim was lost
+                # (recovery orphaned it, or a newer launch owns the row), the
+                # rowcount is 0 and the runner aborts its workload instead of
+                # running an untracked process.
+                changed = manager.db.execute(
+                    "UPDATE jobs SET status='running', pid=?, worker_pid=?, started_at=?, runner_heartbeat_at=?, "
+                    "updated_at=?, exit_code=NULL, ended_at=NULL "
+                    "WHERE job_id=? AND claim_token=? AND status='launching' AND stop_requested_at IS NULL",
+                    (pid, os.getpid(), now_iso(), now_iso(), now_iso(), job_id, claim_token),
+                ).rowcount
+            else:
+                # start()-path jobs are inserted 'running' with worker_pid set
+                # by the parent (the Popen pid). Record only the workload PID;
+                # worker_pid stays the parent-observed process so _watch_runner's
+                # pid guard keeps matching on platforms where the runner's
+                # os.getpid() differs from the Popen pid (Windows launcher shim).
+                changed = manager.db.execute(
+                    "UPDATE jobs SET pid=?, runner_heartbeat_at=?, updated_at=? "
+                    "WHERE job_id=? AND status='running' AND stop_requested_at IS NULL",
+                    (pid, now_iso(), now_iso(), job_id),
+                ).rowcount
             manager.db.commit()
         return changed
 
     return bool(manager._retry_locked(publish))
 
 
-def _abort_workload(manager: JobManager, job_id: str, proc: subprocess.Popen[bytes]) -> int:
+def _abort_workload(
+    manager: JobManager, job_id: str, proc: subprocess.Popen[bytes], claim_token: str | None = None
+) -> int:
     manager._kill_process(proc, force=True)
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         manager._kill_process(proc, force=True)
         proc.wait()
+    if claim_token:
+        # Record the failed publish if we still own the claim. If recovery
+        # already moved the row to a terminal state, this is a guarded no-op.
+        manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token)
     manager.close()
     return 1
 
@@ -103,8 +135,10 @@ def _feed_stdin(job_id: str, channel: Path, stdin, feeder_stop: threading.Event)
 
 def run(home: str, job_id: str) -> int:
     manager = JobManager(home, recover=False)
+    claim_token: str | None = None
     try:
         spec = json.loads((Path(home) / "specs" / f"{job_id}.json").read_text(encoding="utf-8"))
+        claim_token = spec.get("claim_token")
         env = os.environ.copy()
         env.update(spec.get("env") or {})
         creationflags = 0
@@ -122,14 +156,14 @@ def run(home: str, job_id: str) -> int:
             start_new_session=sys.platform != "win32",
         )
     except Exception as exc:
-        return _fail_start(manager, job_id, exc)
+        return _fail_start(manager, job_id, exc, claim_token)
     try:
-        published = _publish_workload(manager, job_id, proc.pid)
+        published = _publish_workload(manager, job_id, proc.pid, claim_token)
     except Exception as exc:
         manager.logger.exception("workload PID publication failed job_id=%s", job_id)
-        return _abort_workload(manager, job_id, proc)
+        return _abort_workload(manager, job_id, proc, claim_token)
     if not published:
-        return _abort_workload(manager, job_id, proc)
+        return _abort_workload(manager, job_id, proc, claim_token)
     try:
         (Path(home) / "specs" / f"{job_id}.json").unlink()
     except FileNotFoundError:
@@ -189,7 +223,7 @@ def run(home: str, job_id: str) -> int:
         manager._kill_process(proc, force=True)
         exit_code = proc.wait()
         manager._readers_done(job_id)
-        manager._finish(job_id, "timeout", exit_code)
+        manager._finish(job_id, "timeout", exit_code, claim_token=claim_token)
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1)
         manager.close()
@@ -205,7 +239,7 @@ def run(home: str, job_id: str) -> int:
     status = manager._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))["status"]
     if status != "cancelled":
         manager._readers_done(job_id)
-        manager._finish(job_id, "completed" if exit_code == 0 else "failed", exit_code)
+        manager._finish(job_id, "completed" if exit_code == 0 else "failed", exit_code, claim_token=claim_token)
     heartbeat_stop.set()
     heartbeat_thread.join(timeout=1)
     manager.close()

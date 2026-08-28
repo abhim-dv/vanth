@@ -183,7 +183,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          ARGS=(--repo "${{ github.repository }}")
+          if [[ "${{ github.ref_name }}" == *-rc* ]]; then
+            ARGS+=(--prerelease)
+          fi
           gh release create "${{ github.ref_name }}" dist/*.whl dist/*.tar.gz \
-            --repo "${{ github.repository }}" \
+            "${ARGS[@]}" \
             --title "Vanth ${{ github.ref_name }}" \
             --notes "Release ${{ github.ref_name }}"

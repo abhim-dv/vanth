@@ -4,6 +4,41 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Launch claims, runner ownership, and wheel-executable fixes (rc33)
+
+- **POSIX wheels now bundle an executable monitor (P1).** Artifact download and
+  `shutil.copyfile` do not preserve executable bits, so every published RC32
+  Linux/macOS wheel stored `vanth/monitor-bin/vanth-monitor` as mode 0644 and
+  failed with `PermissionError`. The build hook now `chmod 0755`s the injected
+  binary for every non-Windows target.
+- **Launch claims are exclusive across processes (P1).** `prepare_launch` now
+  claims a job with a single guarded `UPDATE ... WHERE status IN (...)` whose
+  rowcount==1 is authoritative, instead of SELECT-then-verify. Two
+  `JobManager` instances can no longer both believe they own the same claim,
+  because a post-UPDATE status SELECT cannot identify the writer.
+- **The runner atomically promotes its owned claim (P1).** The runner promotes
+  `launching -> running` guarded by a durable `claim_token` recorded in the run
+  spec, and every runner terminal transition is claim-token guarded. A fast job
+  can no longer finish while the row is still `launching` and then have the
+  parent's unguarded update resurrect it as `running`.
+- **Stale-claim recovery reconciles process ownership (P1).** Recovery now
+  skips `launching` rows whose runner is still alive, terminates any workload
+  PID before freeing the row, and emits an `orphaned` event through the normal
+  terminal path so waits, wake targets, and feeds are notified.
+- **Restart deadline clears atomically with the launch claim (P1).** The
+  `restart_after` deadline and the `launching` claim are one guarded UPDATE, so
+  a crash between the old deadline-clear and `prepare_launch` can no longer
+  leave a failed job with its attempt consumed and no pending deadline (which
+  turned `max_retries=1` into immediate `gave_up`).
+- **Prebuilt target tagging falls back to the target tag (P2).** With a
+  prebuilt binary + target GOOS/GOARCH and no explicit `VANTH_MONITOR_TAG`, the
+  wheel is tagged for the target (`platform_tag_for(goos, goarch)`) instead of
+  the build host.
+- **RC tags publish as GitHub prereleases (P2).** The release workflow passes
+  `--prerelease` for `*-rc*` tags so RC builds are not presented as stable
+  releases.
+- Adds `jobs.claim_token` (schema v11). Full suite: 630 passed, 6 skipped.
+
 ### Wheel bundles the Windows monitor with the correct `.exe` name
 
 - **Windows wheels were missing the TUI binary** — every wheel is assembled on

@@ -130,7 +130,17 @@ class BundleMonitorBuildHook(BuildHookInterface):
 
         if prebuilt is not None:
             binary = self._inject_prebuilt(root, prebuilt, goos)
-            tag = tag_override or wheel_platform_tag()
+            if tag_override:
+                tag = tag_override
+            elif goos and goarch:
+                # A prebuilt binary + target GOOS/GOARCH describe a specific
+                # target wheel even without an explicit tag; name both the
+                # binary and the wheel for the TARGET (review P2-1). Never fall
+                # back to the BUILD host tag, which would pair a Windows binary
+                # with a Linux wheel tag.
+                tag = platform_tag_for(goos, goarch)
+            else:
+                tag = wheel_platform_tag()
         elif goos and goarch:
             binary = self._compile(root, goos, goarch)
             tag = tag_override or platform_tag_for(goos, goarch)
@@ -187,4 +197,10 @@ class BundleMonitorBuildHook(BuildHookInterface):
         binary = os.path.join(root, "dist", monitor_filename(goos))
         os.makedirs(os.path.dirname(binary), exist_ok=True)
         shutil.copyfile(source, binary)
+        if not (goos == "windows" or (goos is None and os.name == "nt")):
+            # Review P1-1: artifact download and copyfile do not preserve
+            # executable bits. The published POSIX wheels stored the monitor as
+            # mode 0644, so running it failed with PermissionError. chmod 0755
+            # explicitly for every non-Windows target.
+            os.chmod(binary, 0o755)
         return binary
