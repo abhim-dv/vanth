@@ -4,6 +4,20 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Wheel bundles the Windows monitor with the correct `.exe` name
+
+- **Windows wheels were missing the TUI binary** — every wheel is assembled on
+  a Linux CI host, and the build hook named the bundled monitor binary from the
+  BUILD host (no `.exe`) for every target. On Windows the runtime looks for
+  `vanth/monitor-bin/vanth-monitor.exe`, so a Windows install reported the
+  "native binary is not present" error (exit 2). The hook now names the bundled
+  binary from the TARGET GOOS (`VANTH_MONITOR_GOOS`): Windows wheels bundle
+  `vanth-monitor.exe`, POSIX wheels bundle `vanth-monitor`. The release
+  workflow passes `VANTH_MONITOR_GOOS`/`VANTH_MONITOR_GOARCH` through to the
+  wheel builds.
+- Added build-hook regression tests for target-OS naming (Windows `.exe` vs
+  POSIX no-suffix).
+
 ### Review fixes (RC30 policy + wake delivery reliability)
 
 - **Launch claims are exclusive and stale claims recover (P1)** — `launching`

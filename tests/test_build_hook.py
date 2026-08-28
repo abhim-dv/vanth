@@ -97,6 +97,56 @@ def test_prebuilt_bin_injection(tmp_path, monkeypatch) -> None:
     assert os.path.isfile(binary)
 
 
+def test_prebuilt_injection_names_binary_for_target_goos(tmp_path, monkeypatch) -> None:
+    """A Linux-host wheel build for Windows must bundle the binary as
+    vanth-monitor.exe (the runtime's Windows lookup), not vanth-monitor.
+
+    Regression: CI assembles every wheel on ubuntu-latest, so before this fix a
+    Windows wheel contained a non-.exe binary and the vanth-monitor console
+    script failed to find the TUI binary.
+    """
+    dummy = tmp_path / "prebuilt-win.exe"
+    dummy.write_bytes(b"windows monitor")
+
+    monkeypatch.setenv("VANTH_MONITOR_BIN", str(dummy))
+    monkeypatch.setenv("VANTH_MONITOR_GOOS", "windows")
+    monkeypatch.setenv("VANTH_MONITOR_GOARCH", "amd64")
+    monkeypatch.setenv("VANTH_MONITOR_TAG", "win_amd64")
+    # Simulate a Linux CI host.
+    monkeypatch.setattr("bundle_monitor.os.name", "posix")
+
+    build_data: dict[str, dict] = {}
+    hook = _make_hook(str(tmp_path))
+    hook.initialize("1.2.1", build_data)
+
+    binary = str(tmp_path / "dist" / "vanth-monitor.exe")
+    assert build_data["force_include"] == {
+        binary: os.path.join("vanth", "monitor-bin", "vanth-monitor.exe")
+    }
+    assert os.path.isfile(binary)
+
+
+def test_prebuilt_injection_names_binary_for_target_posix(tmp_path, monkeypatch) -> None:
+    """A Linux-host wheel build for Linux keeps the no-suffix name."""
+    dummy = tmp_path / "prebuilt-linux"
+    dummy.write_bytes(b"linux monitor")
+
+    monkeypatch.setenv("VANTH_MONITOR_BIN", str(dummy))
+    monkeypatch.setenv("VANTH_MONITOR_GOOS", "linux")
+    monkeypatch.setenv("VANTH_MONITOR_GOARCH", "amd64")
+    monkeypatch.setenv("VANTH_MONITOR_TAG", "manylinux_2_17_x86_64")
+
+    build_data: dict[str, dict] = {}
+    hook = _make_hook(str(tmp_path))
+    hook.initialize("1.2.1", build_data)
+
+    binary = str(tmp_path / "dist" / "vanth-monitor")
+    assert build_data["force_include"] == {
+        binary: os.path.join("vanth", "monitor-bin", "vanth-monitor")
+    }
+    assert os.path.isfile(binary)
+
+
 def test_prebuilt_missing_raises(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("VANTH_MONITOR_BIN", str(tmp_path / "does-not-exist"))
     hook = _make_hook(str(tmp_path))

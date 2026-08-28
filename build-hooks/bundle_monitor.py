@@ -129,7 +129,7 @@ class BundleMonitorBuildHook(BuildHookInterface):
         tag_override = os.environ.get("VANTH_MONITOR_TAG")
 
         if prebuilt is not None:
-            binary = self._inject_prebuilt(root, prebuilt)
+            binary = self._inject_prebuilt(root, prebuilt, goos)
             tag = tag_override or wheel_platform_tag()
         elif goos and goarch:
             binary = self._compile(root, goos, goarch)
@@ -167,15 +167,24 @@ class BundleMonitorBuildHook(BuildHookInterface):
         subprocess.run(cmd, cwd=root, check=True, env=env)
         return binary
 
-    def _inject_prebuilt(self, root: str, source: str) -> str:
-        """Copy a prebuilt monitor binary into the build output without compiling."""
+    def _inject_prebuilt(self, root: str, source: str, goos: str | None = None) -> str:
+        """Copy a prebuilt monitor binary into the build output without compiling.
+
+        The bundled filename must match what the runtime lookup expects on the
+        INSTALL platform: ``vanth-monitor`` on POSIX, ``vanth-monitor.exe`` on
+        Windows. In CI all wheels are assembled on a Linux host, so the name
+        must come from the TARGET GOOS (``VANTH_MONITOR_GOOS``), not the build
+        host — otherwise a Windows wheel would contain a binary named
+        ``vanth-monitor`` (no .exe) and the runtime ``vanth-monitor.exe``
+        lookup would fail.
+        """
         if not os.path.isfile(source):
             raise FileNotFoundError(
                 f"VANTH_MONITOR_BIN is set but no file exists at: {source}"
             )
-        # The wheel is built for the host platform (the prebuilt binary matches
-        # it), so name the bundled binary for the host where it will install.
-        binary = os.path.join(root, "dist", monitor_filename())
+        # The wheel is tagged for the target platform; name the bundled binary
+        # for the TARGET so the installed wheel's runtime lookup finds it.
+        binary = os.path.join(root, "dist", monitor_filename(goos))
         os.makedirs(os.path.dirname(binary), exist_ok=True)
         shutil.copyfile(source, binary)
         return binary

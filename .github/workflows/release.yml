@@ -127,6 +127,8 @@ jobs:
         shell: bash
         env:
           VANTH_MONITOR_BIN: ${{ env.MONITOR_BIN_ABS }}
+          VANTH_MONITOR_GOOS: ${{ matrix.goos }}
+          VANTH_MONITOR_GOARCH: ${{ matrix.goarch }}
           VANTH_MONITOR_TAG: ${{ matrix.tag }}
         run: uv build
       - uses: actions/upload-artifact@v4
