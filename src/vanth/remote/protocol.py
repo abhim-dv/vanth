@@ -267,7 +267,7 @@ _ARRAY_FIELDS = {"notify_on", "wake_targets", "tags"}
 
 START_OPTIONAL_FIELDS = {
     "command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets",
-    "origin_thread_id", "tags", "notes", "interactive", "trigger",
+    "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy",
 }
 STOP_OPTIONAL_FIELDS = {"signal", "kill_after_seconds"}
 RERUN_OPTIONAL_FIELDS = {"command", "env", "timeout_seconds", "name", "tags", "notes", "cwd", "interactive"}
@@ -404,6 +404,8 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         _check_boolean_field(payload, "interactive")
         if "trigger" in payload and not isinstance(payload["trigger"], dict):
             raise VanthRemoteProtocolError("INVALID_REQUEST", "trigger must be an object")
+        if "policy" in payload and not isinstance(payload["policy"], dict):
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "policy must be an object")
     elif method == "job.stop":
         _check_required_and_unknown(payload, {"job_id"}, STOP_ALLOWED, "payload")
         _check_string_field(payload, "job_id", required=True)

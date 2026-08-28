@@ -206,6 +206,46 @@
         }
       }
     },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schedule": {
+          "type": "object",
+          "properties": {
+            "expected_interval_seconds": { "type": "integer", "minimum": 1 },
+            "grace_period_seconds": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["expected_interval_seconds"]
+        },
+        "on_failure": {
+          "type": "object",
+          "properties": {
+            "after_n": { "type": "integer", "minimum": 1 },
+            "action": { "type": "string", "enum": ["alert", "disable", "run_job"] },
+            "job_id": { "type": "string" }
+          },
+          "required": ["after_n", "action"]
+        },
+        "restart": {
+          "type": "object",
+          "properties": {
+            "max_retries": { "type": "integer", "minimum": 1 },
+            "backoff_seconds": { "type": "integer", "minimum": 0 },
+            "backoff_max_seconds": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["max_retries"]
+        },
+        "retention": {
+          "type": "object",
+          "properties": {
+            "events_seconds": { "type": "integer", "minimum": 1 },
+            "metrics_seconds": { "type": "integer", "minimum": 1 },
+            "deliveries_seconds": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
     "idempotency_key": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]{8,128}$"
@@ -267,7 +307,8 @@
         "tags": { "type": "array", "items": { "type": "string" } },
         "notes": { "type": "string" },
         "interactive": { "type": "boolean" },
-        "trigger": { "$ref": "#/$defs/trigger" }
+        "trigger": { "$ref": "#/$defs/trigger" },
+        "policy": { "$ref": "#/$defs/policy" }
       }
     },
     "payload_job.stop": {

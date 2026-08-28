@@ -25,8 +25,11 @@ def _fail_start(manager: JobManager, job_id: str, exc: Exception) -> int:
 def _publish_workload(manager: JobManager, job_id: str, pid: int) -> bool:
     def publish() -> int:
         with manager.db_lock:
+            # The row may still be 'launching' if the server claimed it in
+            # prepare_launch and is mid-spawn; accept either so the workload
+            # publication never aborts a valid runner.
             changed = manager.db.execute(
-                "UPDATE jobs SET pid=?, runner_heartbeat_at=?, updated_at=? WHERE job_id=? AND status='running' AND stop_requested_at IS NULL",
+                "UPDATE jobs SET pid=?, runner_heartbeat_at=?, updated_at=? WHERE job_id=? AND status IN ('running','launching') AND stop_requested_at IS NULL",
                 (pid, now_iso(), now_iso(), job_id),
             ).rowcount
             manager.db.commit()

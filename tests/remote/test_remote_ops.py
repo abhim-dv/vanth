@@ -88,7 +88,7 @@ def make_jobs_db():
           started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
           notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
           env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
-          trigger_json TEXT
+          trigger_json TEXT, policy_json TEXT
         );
         CREATE TABLE events (
           event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -172,6 +172,26 @@ def test_handle_request_forced_exception_rolls_back_everything(tmp_path, monkeyp
     assert store.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
     # The origin mapping DDL + row were inside the same transaction, so nothing
     # from the failed acceptance is visible (table either absent or empty).
+
+
+def test_handle_request_persists_policy_on_remote_job(tmp_path):
+    """policy is forwarded through the remote protocol and persisted on the
+    remote queued job row (review P1-5)."""
+    remote, store, fake = make_remote(tmp_path)
+    policy = {"restart": {"max_retries": 2, "backoff_seconds": 5}}
+    response = remote.handle_request(request_frame(payload={"command": "echo hi", "policy": policy}))
+    assert response["kind"] == "response"
+    job_id = response["result"]["job_id"]
+    row = store.db.execute("SELECT policy_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    assert json.loads(row["policy_json"]) == policy
+
+
+def test_handle_request_rejects_invalid_policy(tmp_path):
+    remote, store, fake = make_remote(tmp_path)
+    response = remote.handle_request(request_frame(payload={"command": "echo hi", "policy": {"on_failure": {"after_n": 0, "action": "alert"}}}))
+    assert response["kind"] == "error"
+    assert "policy" in response["message"]
+    assert store.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
     table = store.db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='remote_job_origins'"
     ).fetchone()

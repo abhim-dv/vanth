@@ -64,7 +64,7 @@ def make_world(tmp_path, job_rows=None):
           started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
           notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
           env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
-          trigger_json TEXT
+          trigger_json TEXT, policy_json TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
           event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,

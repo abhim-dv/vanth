@@ -226,3 +226,19 @@ def test_bare_vanth_piped_still_runs_mcp(monkeypatch):
     monkeypatch.setattr(server, "_run_mcp_server", lambda: ran.__setitem__("mcp", True))
     server.main([])
     assert ran["mcp"] is True
+
+
+def test_unknown_interactive_command_does_not_hang(monkeypatch, capsys):
+    """Review P2-2: `vanth statsu` (a typo) in a terminal must not enter the
+    MCP stdio read loop and look hung; it routes to a usage error and exits 2."""
+    import vanth.server as server
+
+    monkeypatch.setattr(server.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(server.sys.stdout, "isatty", lambda: True)
+    called = {"mcp": False}
+    monkeypatch.setattr(server, "_run_mcp_server", lambda: called.__setitem__("mcp", True))
+    with pytest.raises(SystemExit) as exc:
+        server.main(["statsu"])
+    assert exc.value.code == 2
+    assert "unknown command" in capsys.readouterr().err
+    assert called["mcp"] is False

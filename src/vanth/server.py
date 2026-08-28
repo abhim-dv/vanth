@@ -305,8 +305,6 @@ class JobManager:
         self._metric_ingest_keys: set[str] = set()
         self._delivery_threads: set[threading.Thread] = set()
         self._delivery_threads_lock = threading.Lock()
-        self._restart_timers: dict[str, threading.Timer] = {}
-        self._restart_timers_lock = threading.Lock()
         self.max_delivery_concurrency = max(1, int(os.environ.get("VANTH_DELIVERY_MAX_CONCURRENT", "4")))
         self.max_running_jobs = max(0, int(os.environ.get("VANTH_MAX_RUNNING_JOBS", "0")))
         self.max_retention_seconds = max(0, int(os.environ.get("VANTH_RETENTION_SECONDS", "0")))
@@ -519,7 +517,7 @@ class JobManager:
         # failed/running histories. Queued/cancelled/timeout jobs pause the
         # watch (timeout means the run itself failed; on_failure handles it).
         status = row["status"]
-        if status in {"queued", "cancelled"}:
+        if status in {"queued", "cancelled", "launching"}:
             return
         last_start = row["started_at"]
         try:
@@ -529,6 +527,16 @@ class JobManager:
         if last_start_dt is None:
             return
         elapsed = (now - last_start_dt).total_seconds()
+        # Per-run rearm (review P2-1): when the job row's started_at changes
+        # (e.g. an automatic restart reused the same row), the dead-man flags
+        # belong to the PREVIOUS run and must not suppress the new run's
+        # schedule_missed/job_stuck. Detect the change and clear them.
+        if state.get("observed_started_at") != last_start:
+            for key in ("stuck_emitted", "missed_emitted_at_elapsed"):
+                if key in state:
+                    state.pop(key)
+            state["observed_started_at"] = last_start
+            self._save_policy_state(job_id, state)
         if status == "running":
             # Started but running far past its expected cadence -> stuck.
             if elapsed > horizon and not state.get("stuck_emitted"):
@@ -556,9 +564,12 @@ class JobManager:
             state["missed_emitted_at_elapsed"] = int(elapsed)
             self._save_policy_state(job_id, state)
         elif elapsed <= interval:
-            # Fresh run happened; clear sticky flags.
+            # Fresh run happened; clear sticky flags (keep run-tracking +
+            # failure-streak + retention bookkeeping).
             if state.get("missed_emitted_at_elapsed") or state.get("stuck_emitted"):
-                self._save_policy_state(job_id, {"failure_streak": state.get("failure_streak", 0)})
+                for key in ("missed_emitted_at_elapsed", "stuck_emitted"):
+                    state.pop(key, None)
+                self._save_policy_state(job_id, state)
 
     def _watch_on_failure(self, row: sqlite3.Row, on_failure: dict[str, Any]) -> None:
         job_id = row["job_id"]
@@ -566,36 +577,54 @@ class JobManager:
         action = on_failure["action"]
         state = self._policy_state(job_id)
         streak = int(state.get("failure_streak", 0))
-        reacted = bool(state.get("reacted_at_streak"))
         status = row["status"]
         if status == "failed":
-            if reacted and int(state.get("reacted_at_streak", 0)) == streak:
-                return  # already reacted to this exact failure
+            # Count each failed EXECUTION exactly once (review P1-2): the
+            # failure event is the unit, identified by its event_id. A failed
+            # row that stays failed across many watcher ticks is not re-counted.
+            # ``_last_failure_event_id`` stores the terminal event we already
+            # folded into the streak; only a NEW terminal event advances it.
+            # Restart relaunches reuse the same job row, so the watcher is the
+            # only place that can distinguish runs.
+            if state.get("last_failure_event_id"):
+                return  # already counted this failed run
+            last_terminal = self.db.execute(
+                "SELECT event_id, created_at FROM events WHERE job_id=? AND type='failed' ORDER BY event_id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if last_terminal is None:
+                return
             new_streak = streak + 1
-            if new_streak >= after_n and not (reacted and state.get("reacted_for_streak") == new_streak):
+            if new_streak >= after_n and not (state.get("reacted_at_streak") == new_streak):
                 self._react_to_failure(row, on_failure, new_streak)
                 state["reacted_at_streak"] = new_streak
-                state["reacted_for_streak"] = new_streak
             state["failure_streak"] = new_streak
+            state["last_failure_event_id"] = last_terminal["event_id"]
             self._save_policy_state(job_id, state)
         elif status in {"completed", "timeout", "cancelled", "orphaned"}:
-            if streak:
-                # Non-failure terminal outcome: timeout still counts as a
-                # failure signal? Healthchecks counts timeout as failure.
-                # We keep it simple: timeout continues the streak, others reset.
-                if status != "timeout":
-                    state["failure_streak"] = 0
-                    state.pop("reacted_at_streak", None)
-                    state.pop("reacted_for_streak", None)
-                    self._save_policy_state(job_id, state)
+            # A non-failure terminal outcome resets the run identity: the NEXT
+            # failure is a fresh run. timeout keeps its existing semantics
+            # (handled by the failed branch when it maps to a failed event;
+            # otherwise it continues the streak as before). Only reset when we
+            # actually have a streak to clear, so the watcher stays a no-op for
+            # jobs that never failed.
+            if state.get("failure_streak") or state.get("last_failure_event_id"):
+                state["failure_streak"] = 0
+                state.pop("reacted_at_streak", None)
+                state.pop("last_failure_event_id", None)
+                self._save_policy_state(job_id, state)
 
     def _watch_restart(self, row: sqlite3.Row, restart: dict[str, Any]) -> None:
         """Relaunch failed jobs with linear-until-cap backoff, up to max_retries.
 
-        The restart bookkeeping lives in policy_state (restart_attempts,
-        restart_after). A successful completion resets the attempt counter;
-        exhausting the budget emits a ``gave_up`` event (level=error) that
-        flows to wake targets. Disabled jobs are skipped.
+        Restart bookkeeping lives in policy_state (restart_attempts,
+        restart_after). ``restart_after`` is the single persisted deadline for
+        the NEXT relaunch; the dispatcher claims it exactly once per iteration
+        when it is due. No in-memory timers: a daemon restart cannot lose or
+        double-schedule a pending relaunch, and polling never consumes the
+        budget. A successful completion resets the attempt counter; exhausting
+        the budget emits a ``gave_up`` event (level=error) that flows to wake
+        targets. Disabled jobs are skipped.
         """
         job_id = row["job_id"]
         status = row["status"]
@@ -612,8 +641,22 @@ class JobManager:
                 self._save_policy_state(job_id, state)
             return
         attempts = int(state.get("restart_attempts", 0))
+        restart_after = state.get("restart_after")
+        if restart_after:
+            try:
+                due_at = datetime.fromisoformat(str(restart_after).replace("Z", "+00:00"))
+            except ValueError:
+                due_at = None
+            if due_at is None or datetime.now(timezone.utc) < due_at:
+                return  # pending relaunch not due yet; budget already claimed
+            # The persisted deadline is due: launch the already-budgeted
+            # relaunch. No further budget is consumed here.
+            self._launch_due_restart(job_id, attempts, restart_after, max_retries, state)
+            return
         if attempts >= max_retries:
             if not state.get("gave_up"):
+                state["gave_up"] = True
+                self._save_policy_state(job_id, state)
                 self._emit(
                     job_id,
                     "gave_up",
@@ -621,73 +664,103 @@ class JobManager:
                     data={"restart_attempts": attempts, "max_retries": max_retries},
                     level="error",
                 )
-                state["gave_up"] = True
-                self._save_policy_state(job_id, state)
             return
-        restart_after = state.get("restart_after")
-        if restart_after:
-            try:
-                if datetime.now(timezone.utc) < datetime.fromisoformat(str(restart_after).replace("Z", "+00:00")):
-                    return  # backoff not elapsed yet
-            except ValueError:
-                pass  # malformed stamp: fall through and restart now
-        # Mark the attempt BEFORE launching so a crash between the two writes
-        # cannot loop forever on one budget.
+        # Fresh failure, no pending deadline: claim the budget and persist the
+        # single restart deadline. Subsequent ticks return above while
+        # restart_after is still in the future, so polling cannot consume more
+        # of the budget (review P1-1).
         delay = min(backoff_base * (attempts + 1), backoff_max) if backoff_max else backoff_base * (attempts + 1)
         state["restart_attempts"] = attempts + 1
         state.pop("gave_up", None)
         state["last_restart_delay_seconds"] = delay
+        state["restart_after"] = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
         self._save_policy_state(job_id, state)
+        if delay == 0:
+            # No backoff: relaunch immediately on this tick.
+            self._launch_due_restart(job_id, attempts + 1, state["restart_after"], max_retries, state)
 
-        def launch() -> None:
-            launch_info = self.prepare_launch(job_id)
-            if launch_info is None:
-                self.logger.warning("restart launch refused job_id=%s attempt=%s", job_id, attempts + 1)
-                return
-            self._launch_prepared(launch_info)
-            self._emit(
-                job_id,
-                "restarted",
-                message=f"Restart attempt {attempts + 1}/{max_retries} after failure (delay {delay}s)",
-                data={"restart_attempt": attempts + 1, "max_retries": max_retries, "delay_seconds": delay},
-            )
+    def _launch_due_restart(self, job_id: str, attempt: int, restart_after: str, max_retries: int, state: dict[str, Any]) -> None:
+        """Atomically claim and launch a due restart deadline (once).
 
-        if delay > 0:
-            # Schedule the relaunch on the shared timer thread pool: sleep in
-            # a daemon thread so the dispatch loop never blocks.
-            timer = threading.Timer(
-                delay,
-                lambda: self._retry_locked_silent(launch),
-            )
-            timer.daemon = True
-            with self._restart_timers_lock:
-                old = self._restart_timers.pop(job_id, None)
-                if old is not None:
-                    old.cancel()
-                self._restart_timers[job_id] = timer
-            timer.start()
-        else:
-            launch()
+        Inside one write transaction we verify the job is still failed, the
+        deadline is unchanged, and the job is not disabled, then clear
+        ``restart_after`` and launch. Any concurrent tick that read the same
+        deadline finds it cleared and skips.
+        """
+        launch_info = self._claim_due_restart(job_id, restart_after)
+        if launch_info is None:
+            self.logger.warning("restart launch refused job_id=%s attempt=%s", job_id, attempt)
+            return
+        delay = int(state.get("last_restart_delay_seconds", 0))
+        self._launch_prepared(launch_info)
+        self._emit(
+            job_id,
+            "restarted",
+            message=f"Restart attempt {attempt}/{max_retries} after failure (delay {delay}s)",
+            data={"restart_attempt": attempt, "max_retries": max_retries, "delay_seconds": delay},
+        )
 
-    def _retry_locked_silent(self, fn) -> None:
-        try:
-            self._retry_locked(fn)
-        except Exception:
-            self.logger.exception("restart launch failed")
+    def _claim_due_restart(self, job_id: str, restart_after: str) -> dict[str, Any] | None:
+        """Atomically claim a due restart deadline and prepare its launch.
+
+        One dispatcher tick wins the claim: within a single write transaction
+        we verify the job is still failed and the deadline is unchanged, then
+        clear ``restart_after`` and call ``prepare_launch`` while holding the
+        DB lock so no other thread can double-launch. Returns the launch dict,
+        or ``None`` when the job is no longer eligible.
+        """
+        def claim() -> dict[str, Any] | None:
+            with self.db_lock:
+                row = self.db.execute(
+                    "SELECT status, policy_disabled, policy_state_json FROM jobs WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()
+                if row is None or row["status"] != "failed" or row["policy_disabled"]:
+                    return None
+                try:
+                    state = json.loads(row["policy_state_json"] or "{}")
+                except (TypeError, ValueError):
+                    state = {}
+                if state.get("restart_after") != restart_after:
+                    return None  # another thread already claimed this deadline
+                state["restart_after"] = None
+                self.db.execute(
+                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
+                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
+                )
+                self.db.commit()
+                # prepare_launch writes the spec + reads state under the same
+                # connection; holding the lock here guarantees serialized
+                # claim-then-prepare so a concurrent launch cannot interleave.
+                return self.prepare_launch(job_id)
+        return self._retry_locked(claim)
 
     def _apply_retention(self, job_id: str, retention: dict[str, int]) -> None:
         """Prune old per-stream rows for one job (policy.retention block).
 
-        Runs at most once per retention stream per poll-window via a cheap
-        `deleted` counter in policy_state; deletion is idempotent so retries
-        are harmless. Terminal events (needed for status history) are kept —
+        Throttled (review P1-6): instead of running DELETE+commit every 0.2s
+        dispatch tick, a per-job ``retention_next_at`` deadline in policy_state
+        limits pruning to at most once per ``retention_min_interval_seconds``
+        (default 60s, overridable via env). Deletion runs inside a single
+        transaction with rollback-on-error (no partial deletion on failure),
+        and deleting deliveries cascades to their delivery_attempts so no rows
+        are orphaned. Terminal events (needed for status history) are kept —
         only non-terminal, non-metric bookkeeping rows expire.
         """
+        state = self._policy_state(job_id)
+        min_interval = int(os.environ.get("VANTH_RETENTION_MIN_INTERVAL_SECONDS", "60"))
+        next_at = state.get("retention_next_at")
+        if next_at:
+            try:
+                if datetime.now(timezone.utc) < datetime.fromisoformat(str(next_at).replace("Z", "+00:00")):
+                    return  # throttled; not due yet
+            except ValueError:
+                pass
         cutoff_base = datetime.now(timezone.utc)
         deleted_total = 0
         with self.db_lock:
             try:
-                for column, table in (("events", "events"), ("metrics", "metric_series"), ("deliveries", "deliveries")):
+                for column in ("events", "metrics", "deliveries"):
                     seconds = retention.get(column)
                     if not seconds:
                         continue
@@ -703,16 +776,28 @@ class JobManager:
                             (job_id, cutoff),
                         )
                     else:
+                        # Cascade: drop settled deliveries AND their attempts so
+                        # delivery_attempts are never orphaned by pruning.
+                        self.db.execute(
+                            "DELETE FROM delivery_attempts WHERE delivery_id IN "
+                            "(SELECT delivery_id FROM deliveries WHERE job_id=? AND created_at < ? AND status IN ('delivered','failed'))",
+                            (job_id, cutoff),
+                        )
                         cur = self.db.execute(
                             "DELETE FROM deliveries WHERE job_id=? AND created_at < ? AND status IN ('delivered','failed')",
                             (job_id, cutoff),
                         )
                     deleted_total += cur.rowcount
-            finally:
-                # A DELETE opens an implicit transaction even when it matches
-                # nothing; leaving it open blocks runner processes for the
-                # full busy_timeout. Always settle it.
                 self.db.commit()
+            except Exception:
+                # A DELETE opened an implicit transaction; roll back so partial
+                # deletion is never committed (review P1-6).
+                self.db.rollback()
+                raise
+        # Record the throttle deadline even when nothing was deleted (idempotent
+        # no-op runs still must not burn a write transaction every tick).
+        state["retention_next_at"] = (cutoff_base + timedelta(seconds=min_interval)).isoformat().replace("+00:00", "Z")
+        self._save_policy_state(job_id, state)
         if deleted_total:
             self.logger.info("retention pruned job_id=%s rows=%s", job_id, deleted_total)
 
@@ -879,11 +964,6 @@ class JobManager:
             self.begin_shutdown()
             self._closed = True
             self.dispatcher_stop.set()
-            with self._restart_timers_lock:
-                timers = list(self._restart_timers.values())
-                self._restart_timers.clear()
-            for timer in timers:
-                timer.cancel()
             if self.dispatcher_thread and self.dispatcher_thread is not threading.current_thread():
                 self.dispatcher_thread.join(timeout=2)
             deadline = time.monotonic() + float(os.environ.get("VANTH_SHUTDOWN_TIMEOUT", "10"))
@@ -1551,7 +1631,16 @@ class JobManager:
                 raise
             except Exception as exc:
                 self.processes.pop(job_id, None)
-                self._transition_terminal(job_id, "failed", 1)
+                # The row was claimed 'launching' by prepare_launch; the spawn
+                # failed so fall it to 'failed' unconditionally (the terminal
+                # guard's WHERE status='running' would skip a launching row).
+                stamp = now_iso()
+                with self.db_lock:
+                    self.db.execute(
+                        "UPDATE jobs SET status='failed', exit_code=1, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=?",
+                        (stamp, stamp, job_id),
+                    )
+                    self.db.commit()
                 self._emit(
                     job_id,
                     "failed",
@@ -1591,7 +1680,7 @@ class JobManager:
             "message": "Job started",
         }
 
-    def prepare_launch(self, job_id: str) -> dict[str, Any]:
+    def prepare_launch(self, job_id: str) -> dict[str, Any] | None:
         """Prepare a job already inserted in a runnable state for launch.
 
         Writes the spec JSON (command/cwd/env/timeout/etc. from the row) and
@@ -1599,36 +1688,77 @@ class JobManager:
         local dispatcher and the remote dispatcher so a remote launch never
         calls ``JobManager.start`` directly. Returns ``None`` when the job is
         unknown or not launchable.
+
+        The runnable check is ATOMIC (review P1-3): under one transaction the
+        row's status and policy_disabled flag are verified, then the status is
+        claimed as ``launching``. Any concurrent caller sees a non-runnable
+        status and cannot double-launch the same job row — this closes the
+        ``run_job``-launches-an-already-running-job hole.
         """
         self._ensure_open()
-        row = self._row(
-            "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json FROM jobs WHERE job_id=?",
-            (job_id,),
-        )
-        if not row:
-            return None
-        disabled = self._row("SELECT policy_disabled FROM jobs WHERE job_id=?", (job_id,))
-        if disabled and disabled["policy_disabled"]:
-            return None
-        interactive = json.loads(row["run_json"] or "{}").get("interactive") is True
-        spec = {
-            "command": row["command"],
-            "cwd": row["cwd"],
-            "env": json.loads(row["env_json"] or "{}"),
-            "timeout_seconds": row["timeout_seconds"],
-            "max_log_bytes": self.max_log_bytes,
-            "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
-            "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
-            "interactive": interactive,
-        }
-        spec_path = self._write_spec(job_id, spec)
-        return {
-            "job_id": job_id,
-            "stdout_path": Path(spec["stdout_path"]),
-            "stderr_path": Path(spec["stderr_path"]),
-            "events_path": self.events_dir / f"{job_id}.jsonl",
-            "spec_path": spec_path,
-        }
+        launch: dict[str, Any] | None = None
+
+        def claim() -> dict[str, Any] | None:
+            nonlocal launch
+            with self.db_lock:
+                row = self.db.execute(
+                    "SELECT job_id, status, policy_disabled FROM jobs WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["status"] not in {"queued", "failed", "orphaned", "launching"}:
+                    # Already running (or a transient claimed/terminal state a
+                    # concurrent launcher owns). Never double-spawn.
+                    return None
+                if row["policy_disabled"]:
+                    return None
+                # Claim the row for launch: a concurrent prepare_launch or a
+                # watcher seeing this status will treat it as not-runnable.
+                self.db.execute(
+                    "UPDATE jobs SET status='launching', updated_at=? WHERE job_id=?",
+                    (now_iso(), job_id),
+                )
+                self.db.commit()
+            # Read the run spec AFTER the claim so the row reflects the claimed
+            # state; spec fields are immutable so this is just a fresh read.
+            spec_row = self._row(
+                "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json FROM jobs WHERE job_id=?",
+                (job_id,),
+            )
+            if not spec_row:
+                return None
+            interactive = json.loads(spec_row["run_json"] or "{}").get("interactive") is True
+            spec = {
+                "command": spec_row["command"],
+                "cwd": spec_row["cwd"],
+                "env": json.loads(spec_row["env_json"] or "{}"),
+                "timeout_seconds": spec_row["timeout_seconds"],
+                "max_log_bytes": self.max_log_bytes,
+                "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
+                "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
+                "interactive": interactive,
+            }
+            spec_path = self._write_spec(job_id, spec)
+            launch = {
+                "job_id": job_id,
+                "stdout_path": Path(spec["stdout_path"]),
+                "stderr_path": Path(spec["stderr_path"]),
+                "events_path": self.events_dir / f"{job_id}.jsonl",
+                "spec_path": spec_path,
+            }
+            return launch
+
+        result = self._retry_locked(claim)
+        if result is None and self._closed:
+            # A shutdown raced the claim; the row may be left 'launching'.
+            with self.db_lock:
+                self.db.execute(
+                    "UPDATE jobs SET status='orphaned', updated_at=? WHERE job_id=? AND status='launching'",
+                    (now_iso(), job_id),
+                )
+                self.db.commit()
+        return result
 
     def _launch_prepared(self, launch: dict[str, Any]) -> dict[str, Any]:
         """Launch a job prepared by :meth:`prepare_launch` (wraps ``_launch``).
@@ -1670,6 +1800,11 @@ class JobManager:
         )
         if not row:
             raise ValueError(f"Unknown job_id: {job_id}")
+        # A job disabled by policy (on_failure disable action) must not be
+        # relaunched through the public rerun API (review P1-3).
+        disabled = self._row("SELECT policy_disabled FROM jobs WHERE job_id=?", (job_id,))
+        if disabled and disabled["policy_disabled"]:
+            raise ValueError("job is disabled by policy (on_failure disable); clear the flag to relaunch")
         # Carry the failure streak across reruns: the policy state of the
         # source job seeds the new job, so after_n counts consecutive failures
         # of the *logical* job, not one runner instance.
@@ -3224,6 +3359,30 @@ def job_start(
     local daemon. Remote mutations require ``idempotency_key`` (8..128 chars in
     ``[A-Za-z0-9_-]``); when omitted the daemon mints one.
     """
+    # Thread identity is resolved HERE, in the MCP process that owns the
+    # calling task (review P1-4). The persistent daemon's environment belongs
+    # to whichever client originally spawned it, so resolving inside the
+    # daemon would inherit a wrong/absent thread. Explicit ids always win.
+    origin_thread_id = (
+        origin_thread_id
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("OPENCODE_SESSION_ID")
+    )
+    # Copy caller-owned wake-target dicts before injecting the inherited
+    # thread id: never mutate the dict the MCP tool caller passed in.
+    copied_targets: list[dict[str, Any]] | None = None
+    if wake_targets is not None:
+        copied_targets = [dict(target) for target in wake_targets]
+        if origin_thread_id:
+            for target in copied_targets:
+                if target.get("type") == "opencode_thread" and not (
+                    target.get("session_id") or target.get("sessionId")
+                ):
+                    target["session_id"] = origin_thread_id
+                elif target.get("type") == "codex_thread" and not (
+                    target.get("thread_id") or target.get("threadId")
+                ):
+                    target["thread_id"] = origin_thread_id
     return get_client().post(
         "/jobs",
         {
@@ -3233,7 +3392,7 @@ def job_start(
             "env": env,
             "timeout_seconds": timeout_seconds,
             "notify_on": notify_on,
-            "wake_targets": wake_targets,
+            "wake_targets": copied_targets,
             "origin_thread_id": origin_thread_id,
             "tags": tags,
             "notes": notes,
@@ -3840,13 +3999,24 @@ def main(argv: list[str] | None = None) -> None:
     # terminal would otherwise start the MCP stdio server and appear to
     # "hang" reading JSON-RPC from the keyboard. Real MCP clients always
     # run us with pipes, never a TTY on stdin.
-    if not args and sys.stdin.isatty() and sys.stdout.isatty():
+    interactive = sys.stdin.isatty()
+    if interactive and not args:
         print(
             "vanth: refusing to start the MCP stdio server in an interactive "
             "terminal.\n"
             "  - Terminal dashboard:            vanth-monitor\n"
             "  - Human subcommands:             vanth doctor | status | setup\n"
             "  - MCP clients launch `vanth` with pipes automatically.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if interactive:
+        # An unknown human command (typo like `vanth statsu`) or a bare
+        # invocation with redirected stdout must not silently hang inside the
+        # MCP read loop. Route unknown interactive invocations to the CLI,
+        # which prints usage/errors and exits (review P2-2).
+        print(
+            f"vanth: unknown command {args[0]!r}",
             file=sys.stderr,
         )
         raise SystemExit(2)

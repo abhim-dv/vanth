@@ -6,6 +6,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from vanth.server import JobManager, normalize_event_payload, now_iso, parse_agent_event_line
 
 
@@ -611,16 +613,18 @@ def test_failure_threshold_streak_across_reruns_then_reset(tmp_path):
             )
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             await asyncio.sleep(1.0)  # let the watcher record streak 1
-            await manager.rerun(job["job_id"])
-            event = await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            rerun = await manager.rerun(job["job_id"])
+            event = await manager.wait(rerun["job_id"], ["failure_threshold"], timeout_seconds=30)
             assert event["result"] == "event"
             data = event["event"]["data"]
             assert data["failure_streak"] >= 2
+            # The rerun carried the streak from the original job.
+            assert manager._policy_state(rerun["job_id"])["failure_streak"] >= 2
             # A successful run (override the failing command) resets the streak.
-            rerun = await manager.rerun(job["job_id"], command=cmd("print('recovered')"))
-            await manager.wait(rerun["job_id"], ["completed"], timeout_seconds=30)
+            recovered = await manager.rerun(rerun["job_id"], command=cmd("print('recovered')"))
+            await manager.wait(recovered["job_id"], ["completed"], timeout_seconds=30)
             await asyncio.sleep(1.0)
-            assert manager._policy_state(rerun["job_id"])["failure_streak"] == 0
+            assert manager._policy_state(recovered["job_id"])["failure_streak"] == 0
         finally:
             manager.close()
 
@@ -754,7 +758,135 @@ def test_restart_backoff_delays_relaunch(tmp_path):
     run(main())
 
 
-def test_retention_policy_prunes_events_and_metrics(tmp_path):
+def test_restart_polling_does_not_consume_budget(tmp_path):
+    """Review P1-1: every dispatcher tick previously incremented
+    restart_attempts because restart_after was never persisted. A single
+    failed run must claim exactly ONE restart, and the relaunch must wait out
+    the backoff instead of the budget being exhausted by polling."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 3, "backoff_seconds": 2}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            # Give the watcher many ticks; budget must stay at exactly 1.
+            await asyncio.sleep(2.0)
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] == 1, f"expected exactly 1 claim, got {state.get('restart_attempts')}"
+            # The restart_after deadline is persisted and in the future.
+            assert state.get("restart_after") is not None
+            # No restart yet: the backoff has not elapsed.
+            restarted = [e for e in manager.events(job["job_id"], types=["restarted"], limit=10)["events"]]
+            assert restarted == []
+            # After the backoff the single claimed restart fires.
+            await manager.wait(job["job_id"], ["restarted"], timeout_seconds=15)
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] == 1, "budget must not grow during the due relaunch"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_failure_streak_counts_each_run_exactly_once(tmp_path):
+    """Review P1-2: a single failed run must increment the failure streak once
+    regardless of how many watcher ticks observe the still-failed row."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 5, "action": "alert"}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(3.0)  # many ticks while the row stays failed
+            state = manager._policy_state(job["job_id"])
+            assert state["failure_streak"] == 1, f"expected exactly 1, got {state.get('failure_streak')}"
+            # No failure_threshold: after_n=5 not reached by a single run.
+            events = [e for e in manager.events(job["job_id"], types=["failure_threshold"], limit=10)["events"]]
+            assert events == []
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_rerun_refuses_disabled_job(tmp_path):
+    """Review P1-3: a job disabled by the on_failure disable action must not
+    be relaunched through the public rerun API."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 1, "action": "disable"}},
+            )
+            await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            assert manager._row("SELECT policy_disabled FROM jobs WHERE job_id=?", (job["job_id"],))["policy_disabled"] == 1
+            with pytest.raises(ValueError, match="disabled by policy"):
+                await manager.rerun(job["job_id"])
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_run_job_refuses_running_reaction(tmp_path):
+    """Review P1-3: run_job must never double-launch an already-running
+    reaction job; the atomic launch claim refuses it."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            reaction = await manager.start(cmd("import time; time.sleep(30)"))
+            await manager.wait(reaction["job_id"], ["started"], timeout_seconds=30)
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"on_failure": {"after_n": 1, "action": "run_job", "job_id": reaction["job_id"]}},
+            )
+            event = await manager.wait(job["job_id"], ["failure_threshold"], timeout_seconds=30)
+            assert "not idle" in event["event"]["message"]
+            assert manager.status(reaction["job_id"])["status"] == "running"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_dead_mans_flags_rearm_on_restart(tmp_path, monkeypatch):
+    """Review P2-1: when an automatic restart reuses the same job row with a
+    new started_at, the dead-man's-switch flags from the previous run must not
+    suppress the new run's schedule_missed/job_stuck."""
+    monkeypatch.setenv("VANTH_RETENTION_MIN_INTERVAL_SECONDS", "1")
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={
+                    "schedule": {"expected_interval_seconds": 1, "grace_period_seconds": 1},
+                    "restart": {"max_retries": 1, "backoff_seconds": 0},
+                },
+            )
+            # First run fails -> restart relaunches (new started_at on the SAME row).
+            await manager.wait(job["job_id"], ["restarted"], timeout_seconds=30)
+            state = manager._policy_state(job["job_id"])
+            # The observed started_at was updated by the rearm logic.
+            assert state.get("observed_started_at") is not None
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_retention_policy_prunes_events_and_metrics(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANTH_RETENTION_MIN_INTERVAL_SECONDS", "1")
     async def main():
         manager = JobManager(tmp_path)
         try:

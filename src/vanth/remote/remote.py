@@ -52,7 +52,7 @@ from .protocol import (
 )
 from .store import RemoteOperationStore
 from .transfer import TransferRegistry, _TRANSFER_METHODS
-from ..server import TERMINAL_STATUSES, now_iso
+from ..server import TERMINAL_STATUSES, now_iso, validate_policy
 
 
 class _FakeSession:
@@ -351,6 +351,11 @@ class RemoteJobManager:
             run_payload.setdefault("command", source.get("command", ""))
         else:
             run_payload = payload
+            if "policy" in run_payload:
+                try:
+                    validate_policy(run_payload.get("policy"))
+                except ValueError as exc:
+                    raise VanthRemoteProtocolError("INVALID_REQUEST", f"invalid policy: {exc}")
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
             op, replayed = self._record_op_uncommitted(idempotency_key, method, run_payload, digest)
@@ -397,7 +402,7 @@ class RemoteJobManager:
         Returns the spec dict, or an error string when the job is unknown.
         """
         row = self.store.db.execute(
-            "SELECT command, cwd, env_json, timeout_seconds, name, notes, tags_json FROM jobs WHERE job_id=?",
+            "SELECT command, cwd, env_json, timeout_seconds, name, notes, tags_json, policy_json FROM jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
         if row is None:
@@ -405,8 +410,9 @@ class RemoteJobManager:
         try:
             env = json.loads(row["env_json"] or "{}")
             tags = json.loads(row["tags_json"] or "[]")
+            policy = json.loads(row["policy_json"] or "null")
         except ValueError:
-            env, tags = {}, []
+            env, tags, policy = {}, [], None
         spec = {
             "command": row["command"],
             "cwd": row["cwd"],
@@ -416,6 +422,8 @@ class RemoteJobManager:
             "env": env,
             "tags": tags,
         }
+        if policy:
+            spec["policy"] = policy
         return {k: v for k, v in spec.items() if v is not None}
 
     def _insert_queued_job_uncommitted(self, job_id: str, payload: dict[str, Any]) -> None:
@@ -430,15 +438,16 @@ class RemoteJobManager:
         interactive = payload.get("interactive")
         notify_on = payload.get("notify_on") or []
         trigger = payload.get("trigger")
+        policy = payload.get("policy")
         created_at = now_iso()
         self.store.db.execute(
             """
             INSERT INTO jobs(
               job_id, name, command, cwd, status, created_at, updated_at,
               timeout_seconds, notify_on, tags_json, env_json, notes, run_json,
-              stdout_path, stderr_path, events_path, trigger_json
+              stdout_path, stderr_path, events_path, trigger_json, policy_json
             )
-            VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id, name, command, cwd, created_at, created_at,
@@ -452,6 +461,7 @@ class RemoteJobManager:
                 str(self.manager.logs / f"{job_id}.stderr.log"),
                 str(self.manager.events_dir / f"{job_id}.jsonl"),
                 json.dumps(trigger, separators=(",", ":")) if trigger else None,
+                json.dumps(policy, separators=(",", ":")) if policy else None,
             ),
         )
 

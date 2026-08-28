@@ -4,6 +4,47 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Review fixes (RC27 policy + delivery reliability)
+
+- **Restart budget consumed by launch, not polling (P1)** — the restart policy
+  previously incremented `restart_attempts` and rescheduled an in-memory timer
+  on every dispatcher tick because `restart_after` was never persisted. A probe
+  exhausted three retries before the first timer fired. Restart bookkeeping now
+  lives entirely in `policy_state`: one `restart_after` deadline is claimed
+  atomically by a single dispatcher tick, no timers are involved (a daemon
+  restart can't lose or double-schedule a pending relaunch), and polling never
+  consumes budget.
+- **Failure streaks count executions, not ticks (P1)** — a single failed run
+  previously advanced `failure_streak` once per watcher poll (a `sys.exit(1)`
+  with `after_n=3` tripped `failure_threshold` after three watcher calls). The
+  watcher now records the terminal event id and folds each failed run into the
+  streak exactly once.
+- **Atomic launch gating (P1)** — `prepare_launch` now atomically verifies
+  status + `policy_disabled` under one transaction and claims the row
+  (`launching`) so concurrent callers cannot double-spawn; `run_job` can no
+  longer launch an already-running reaction job (the probe's two-live-PIDs
+  case), and the public `job_rerun` refuses a policy-disabled job.
+- **Thread identity resolved in the MCP process (P1)** — `job_start` resolves
+  `origin_thread_id` from the calling MCP task's environment (CODEX_THREAD_ID /
+  OPENCODE_SESSION_ID) before POSTing to the daemon, and copies caller-owned
+  wake-target dicts before injecting the inherited id (no caller mutation).
+- **Remote jobs support policy end-to-end (P1)** — `policy` is accepted by the
+  remote protocol (`START_OPTIONAL_FIELDS` + JSON schema), validated remotely,
+  persisted on the remote queued job row, and carried across remote rerun.
+- **Retention throttled + transactional (P1)** — per-job pruning runs at most
+  once per `VANTH_RETENTION_MIN_INTERVAL_SECONDS` (default 60s) instead of a
+  DELETE+commit on every 0.2s tick; deletion is rollback-on-error
+  (no partial commits) and deleting deliveries cascades to their
+  `delivery_attempts` (no orphans).
+- **Dead-man's flags rearm on restart (P2)** — `_watch_schedule` tracks the
+  observed `started_at` and clears `stuck_emitted`/`missed_emitted_at_elapsed`
+  when an automatic restart reuses the same job row, so subsequent runs emit
+  their own `job_stuck`/`schedule_missed`.
+- **Interactive typo no longer hangs (P2)** — `vanth statsu` (unknown arg) in a
+  terminal now prints `unknown command` and exits 2 instead of entering the MCP
+  stdio loop; the TTY guard keys on interactive stdin alone (redirected stdout
+  no longer masks it).
+
 ### Webhook wake target (notification channel beyond agent threads)
 
 - **New `webhook` wake target type** — POSTs the delivery payload (same shape
