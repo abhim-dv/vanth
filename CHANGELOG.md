@@ -4,6 +4,23 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Webhook wake target (notification channel beyond agent threads)
+
+- **New `webhook` wake target type** — POSTs the delivery payload (same shape
+  every adapter receives: `event`, `prompt`, `delivery_id`, `target`) as JSON
+  to any HTTP(S) URL. One generic channel covers ntfy, Gotify, Telegram bots,
+  Slack/Discord webhooks, PagerDuty Events, etc. — the roadmap's most-requested
+  integration set (Discord, Telegram, Gotify, MQTT, IFTTT) without per-service
+  code.
+- Target config: `url` (required, http/https), `headers` (string key/value map
+  for auth tokens / service presets), `timeout_seconds`. 2xx
+  (200/201/202/204) marks the delivery `delivered`; other statuses or
+  transport errors mark it failed (retried per `max_attempts` /
+  `retry_delay_seconds`, then dead-lettered).
+- Works everywhere wake targets work: `job_start` wake_targets, `daemon_wake`
+  shorthand (`type="webhook", url=...`), and the remote protocol (schema enum
+  updated).
+
 ### Delivery queue management + wake delivery reliability
 
 - **Bulk delivery-queue clearing** — `vanth deliveries clear` (daemon route

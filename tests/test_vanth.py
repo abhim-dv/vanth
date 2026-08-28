@@ -846,3 +846,187 @@ def test_clear_deliveries_stale_only_scopes_to_terminal_jobs(tmp_path):
             manager.close()
 
     run(main())
+
+
+class _WebhookSink:
+    def __init__(self):
+        self.received = []
+        self.status = 200
+        self.pending = threading.Event()
+
+    def __call__(self, payload, status=200):
+        self.received.append(payload)
+        self.status = status
+        self.pending.set()
+
+
+def _start_webhook_server(handler):
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            content_type = self.headers.get("Content-Type", "")
+            handler(json.loads(body))
+            self.send_response(handler.status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def test_webhook_delivery_dispatches_immediately(tmp_path):
+    async def main():
+        import http.server
+        import urllib.parse
+
+        sink = _WebhookSink()
+        server, thread = _start_webhook_server(sink)
+        try:
+            manager = JobManager(tmp_path / "state")
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/hook"
+                code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'webhook me'}), flush=True)"
+                started = await manager.start(
+                    cmd(code),
+                    wake_targets=[
+                        {
+                            "type": "webhook",
+                            "events": ["checkpoint"],
+                            "url": url,
+                        }
+                    ],
+                )
+                await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+                assert sink.pending.wait(timeout=5)
+                assert len(sink.received) == 1
+                payload = sink.received[0]
+                assert payload["event"]["message"] == "webhook me"
+                assert payload["event"]["job_id"] == started["job_id"]
+                assert payload["delivery_id"].startswith("del_")
+                assert payload["target"]["url"] == url
+                assert payload["target"]["type"] == "webhook"
+                assert "prompt" in payload
+                delivery = poll_delivery(manager, started["job_id"], "delivered")
+                assert delivery is not None and delivery["status"] == "delivered"
+            finally:
+                manager.begin_shutdown()
+                manager.close()
+        finally:
+            server.shutdown()
+            thread.join()
+
+    run(main())
+
+
+def test_webhook_non_2xx_marks_delivery_failed(tmp_path):
+    async def main():
+        class _FailSink:
+            status = 500
+
+            def __call__(self, payload, status=200):
+                pass
+
+        sink = _FailSink()
+        server, thread = _start_webhook_server(sink)
+        try:
+            manager = JobManager(tmp_path / "state")
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/hook"
+                code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
+                started = await manager.start(
+                    cmd(code),
+                    wake_targets=[
+                        {
+                            "type": "webhook",
+                            "events": ["checkpoint"],
+                            "url": url,
+                            "max_attempts": 1,
+                            "retry_delay_seconds": 0,
+                        }
+                    ],
+                )
+                await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+                deadline = time.monotonic() + 5
+                delivery = None
+                while time.monotonic() < deadline:
+                    delivery = poll_delivery(manager, started["job_id"], "failed")
+                    if delivery and delivery["status"] == "failed":
+                        break
+                    time.sleep(0.05)
+                assert delivery is not None
+                assert delivery["status"] == "failed"
+                assert "HTTP 500" in (delivery["last_error"] or "")
+            finally:
+                manager.begin_shutdown()
+                manager.close()
+        finally:
+            server.shutdown()
+            thread.join()
+
+    run(main())
+
+
+def test_webhook_target_validation(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path / "state")
+        try:
+            code = "import time; time.sleep(5)"
+            for bad in [
+                {"type": "webhook", "events": ["completed"]},
+                {"type": "webhook", "events": ["completed"], "url": "not-a-url"},
+                {"type": "webhook", "events": ["completed"], "url": "ftp://example.com/hook"},
+                {"type": "webhook", "events": ["completed"], "url": "http://x", "headers": {"X-Token": 123}},
+            ]:
+                try:
+                    await manager.start(cmd(code), wake_targets=[bad])
+                    raise AssertionError(f"expected validation failure for {bad!r}")
+                except ValueError:
+                    pass
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_webhook_auto_dispatch_false_queues_only(tmp_path):
+    async def main():
+        sink = _WebhookSink()
+        server, thread = _start_webhook_server(sink)
+        try:
+            manager = JobManager(tmp_path / "state")
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/hook"
+                code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
+                started = await manager.start(
+                    cmd(code),
+                    wake_targets=[
+                        {
+                            "type": "webhook",
+                            "events": ["checkpoint"],
+                            "url": url,
+                            "auto_dispatch": False,
+                        }
+                    ],
+                )
+                await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+                time.sleep(0.5)
+                assert not sink.pending.is_set(), "webhook must not fire with auto_dispatch=False"
+                deliveries = manager.deliveries(started["job_id"])["deliveries"]
+                assert deliveries and deliveries[0]["status"] == "pending"
+            finally:
+                manager.begin_shutdown()
+                manager.close()
+        finally:
+            server.shutdown()
+            thread.join()
+
+    run(main())

@@ -1,6 +1,6 @@
-﻿[project]
+[project]
 name = "vanth"
-version = "1.6.0rc28"
+version = "1.6.0rc29"
 description = "Event-driven background jobs for agents"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -169,7 +169,7 @@ MCP client / HTTP client
    vanthd (localhost HTTP daemon, bearer-token auth)
         |                 |                    |
         |                 |                    +---> wake adapters
-        |                 |                          (local_command / codex_thread / opencode_thread)
+        |                 |                          (local_command / codex_thread / opencode_thread / webhook)
         |                 |
         |                 +----> jobs.sqlite (durable source of truth)
         |
@@ -713,6 +713,29 @@ confirmed-missing session fails fast (dead-lettered immediately, no retry
 burn) with `opencode session not found: <id>`. The probe never blocks a valid
 dispatch; on any ambiguity it proceeds. Opt out per-target with
 `"skip_probe": true` or globally with `VANTH_OPENCODE_SKIP_PROBE=1`.
+
+### webhook
+
+POSTs the delivery payload as JSON to any HTTP(S) endpoint — a generic
+channel that covers ntfy, Gotify, Telegram bots, Slack/Discord webhooks,
+PagerDuty Events, and more:
+
+```json
+{
+  "type": "webhook",
+  "url": "https://hooks.slack.com/services/...",
+  "events": ["failed", "completed"],
+  "headers": { "Authorization": "Bearer <token>" },
+  "timeout_seconds": 10
+}
+```
+
+The payload is the same delivery payload every adapter receives (`event`,
+`prompt`, `delivery_id`, `target`), POSTed with `Content-Type: application/json`.
+2xx responses (200/201/202/204) mark the delivery `delivered`; anything else
+is a failed delivery (retried per `max_attempts`/`retry_delay_seconds`, then
+dead-lettered). `headers` lets you add auth tokens or presets for specific
+services.
 
 ### Shared delivery options
 

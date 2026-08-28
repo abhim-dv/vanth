@@ -178,11 +178,13 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["local_command", "codex_thread", "opencode_thread"]
+          "enum": ["local_command", "codex_thread", "opencode_thread", "webhook"]
         },
         "events": { "type": "array", "items": { "type": "string" } },
         "notify_on": { "type": "array", "items": { "type": "string" } },
         "command": { "type": ["string", "array"], "items": { "type": "string" } },
+        "url": { "type": "string" },
+        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
         "thread_id": { "type": "string" },
         "threadId": { "type": "string" },
         "session_id": { "type": "string" },

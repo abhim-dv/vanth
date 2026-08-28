@@ -217,7 +217,7 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked"}
-WAKE_TARGET_TYPES = {"local_command", "codex_thread", "opencode_thread"}
+WAKE_TARGET_TYPES = {"local_command", "codex_thread", "opencode_thread", "webhook"}
 
 
 def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
@@ -241,7 +241,24 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             raise ValueError("wake target command must be a non-empty string or argv list")
         if target_type == "local_command" and command is None:
             raise ValueError("local_command target requires command")
-        if target_type != "local_command" and command is None:
+        if target_type == "webhook":
+            url = target.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError("webhook target requires url")
+            try:
+                scheme = urllib.parse.urlparse(url).scheme
+            except ValueError as exc:
+                raise ValueError("webhook target url must be a valid URL") from exc
+            if scheme not in {"http", "https"}:
+                raise ValueError("webhook target url must be an http(s) URL")
+            headers = target.get("headers")
+            if headers is not None and not isinstance(headers, dict):
+                raise ValueError("webhook target headers must be an object")
+            if headers is not None:
+                for key, value in headers.items():
+                    if not isinstance(key, str) or not isinstance(value, str):
+                        raise ValueError("webhook target headers must be string key/value pairs")
+        if target_type not in {"local_command", "webhook"} and command is None:
             thread_id = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
             if not isinstance(thread_id, str) or not thread_id:
                 raise ValueError(f"{target_type} target requires thread_id")
@@ -1199,12 +1216,19 @@ class JobManager:
             target_type = target.get("type")
             if not command and target_type in {"codex_thread", "opencode_thread"} and target.get("auto_dispatch") is False:
                 return
-            if not command and target_type not in {"codex_thread", "opencode_thread"}:
+            if not command and target_type not in {"codex_thread", "opencode_thread", "webhook"}:
                 return
             delivery = self._claim_delivery(delivery["delivery_id"])
             if not delivery:
                 return
             payload = delivery["payload"]
+            if not command and target_type == "webhook":
+                try:
+                    self._dispatch_webhook(payload)
+                    self._complete_delivery(delivery, "delivered")
+                except Exception as exc:
+                    self._complete_delivery(delivery, "failed", str(exc))
+                return
             if not command and target_type == "codex_thread":
                 try:
                     send_delivery_to_codex(payload)
@@ -1288,6 +1312,34 @@ class JobManager:
             self.db.commit()
             row = self.db.execute("SELECT * FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)).fetchone()
         return self._delivery_dict(row)
+
+    def _dispatch_webhook(self, payload: dict[str, Any]) -> None:
+        """POST a delivery payload to an HTTP(S) webhook endpoint.
+
+        Raises on non-2xx status or transport error; the caller marks the
+        delivery failed (and retries per max_attempts/retry_delay_seconds).
+        """
+        target = payload["target"]
+        url = target["url"]
+        headers = dict(target.get("headers") or {})
+        headers.setdefault("Content-Type", "application/json")
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        timeout = float(target.get("timeout_seconds", 30))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = response.getcode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"webhook returned HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"webhook request failed: {exc.reason}") from exc
+        if status not in (200, 201, 202, 204):
+            raise RuntimeError(f"webhook returned HTTP {status}")
 
     def _delivery_payload(self, event: dict[str, Any], target: sqlite3.Row, delivery_id: str) -> dict[str, Any]:
         config = json.loads(target["config_json"] or "{}")
@@ -3628,7 +3680,7 @@ def _build_wake_target(
     When ``target`` is given it is returned unchanged (backward compatible).
     Otherwise a target is built from ``type`` / ``events`` / ``config``.
     ``type`` is required and must be a supported wake target type
-    (local_command, codex_thread, opencode_thread); events default to
+    (local_command, codex_thread, opencode_thread, webhook); events default to
     ["completed", "failed"].
     """
     if target is not None:
@@ -3657,7 +3709,7 @@ def daemon_wake(
 
     Pass a full target dict ({"type", "events", ...config}) as ``target``, or
     use the shorthand: ``type`` (required, one of local_command / codex_thread
-    / opencode_thread) plus optional ``events`` and extra config kwargs.
+    / opencode_thread / webhook) plus optional ``events`` and extra config kwargs.
     Events default to ["completed", "failed"].
     """
     resolved = _build_wake_target(target, events, type, config)

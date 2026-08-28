@@ -748,8 +748,8 @@ agent-facing wake without requiring a matching wake-target event.
 
 Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
 the shorthand: `type` (required, one of `local_command` / `codex_thread` /
-`opencode_thread`) plus optional `events` and extra config kwargs. Events
-default to `["completed", "failed"]`.
+`opencode_thread` / `webhook`) plus optional `events` and extra config kwargs.
+Events default to `["completed", "failed"]`.
 
 **Parameters**
 
@@ -758,7 +758,7 @@ default to `["completed", "failed"]`.
 | `job_id` | `string` | required | Job to wake on |
 | `target` | `object?` | `None` | Full wake-target dict (`{type, events, ...config}`); given, used as-is |
 | `events` | `string[]?` | `["completed","failed"]` | Shorthand; non-empty list of event types (e.g. `["checkpoint"]`) |
-| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_thread` / `opencode_thread` |
+| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_thread` / `opencode_thread` / `webhook` |
 | `...` | `object?` | `{}` | Extra config kwargs merged into the shorthand target |
 
 **Response**
