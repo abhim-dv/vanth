@@ -53,6 +53,7 @@ class _CodexAppServer:
         self.stdout: queue.Queue[str] = queue.Queue()
         self.stderr: queue.Queue[str] = queue.Queue()
         self.stderr_tail: list[str] = []
+        self.completed_turns: list[dict[str, Any]] = []
         # Match runner.py/server.py: detach the codex child from the daemon's console group on Windows.
         creationflags = 0
         if sys.platform == "win32":
@@ -119,6 +120,13 @@ class _CodexAppServer:
                 message = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # Stash turn/completed notifications seen while waiting for a
+            # response: they can arrive before the ack for the turn/start
+            # request (notification ordering is not guaranteed), and the
+            # turn-completion waiter must not miss them.
+            if message.get("method") == "turn/completed":
+                self.completed_turns.append(message.get("params", {}).get("turn") or {})
+                continue
             if message.get("id") != request_id:
                 continue
             if "error" in message:
@@ -129,6 +137,55 @@ class _CodexAppServer:
         if not self.stderr_tail:
             return message
         return f"{message}: {' | '.join(self.stderr_tail)}"
+
+    def wait_for_turn_completed(self, request_id: int, turn_id: str | None) -> dict[str, Any]:
+        """Wait until the turn started by ``request_id`` finishes.
+
+        The app-server emits ``turn/completed`` (with the final Turn) when the
+        model finishes, errors, or is interrupted. Waiting here is what makes
+        "delivered" mean "the wake actually ran" rather than "the turn was
+        accepted". The turn id is matched when known; the request id is kept
+        as a fallback for older servers that echo it differently.
+        """
+        # Check notifications already drained while reading the ack first.
+        for turn in list(self.completed_turns):
+            if turn_id is None or turn.get("id") in (None, turn_id):
+                self.completed_turns.remove(turn)
+                status = turn.get("status")
+                if status == "failed":
+                    error = (turn.get("error") or {}).get("message", "turn failed")
+                    raise CodexBridgeError(self._error(f"codex turn failed: {error}"))
+                return turn
+        while True:
+            while not self.stderr.empty():
+                self.stderr_tail.append(self.stderr.get())
+                self.stderr_tail = self.stderr_tail[-5:]
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexBridgeError(self._error("timed out waiting for turn/completed"))
+            try:
+                line = self.stdout.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                if self.proc.poll() is not None:
+                    raise CodexBridgeError(self._error(f"codex app-server exited with {self.proc.returncode}"))
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            method = message.get("method")
+            if method == "turn/completed":
+                turn = message.get("params", {}).get("turn") or {}
+                if turn_id is None or turn.get("id") in (None, turn_id):
+                    status = turn.get("status")
+                    if status == "failed":
+                        error = (turn.get("error") or {}).get("message", "turn failed")
+                        raise CodexBridgeError(self._error(f"codex turn failed: {error}"))
+                    return turn
+            # Responses to unrelated requests and other notifications are drained
+            # silently; a response error for OUR turn is surfaced.
+            if message.get("id") == request_id and "error" in message:
+                raise CodexBridgeError(self._error(message["error"].get("message", "codex app-server error")))
 
 
 def send_message_to_thread(
@@ -164,7 +221,15 @@ def send_message_to_thread(
         server.send(2, "thread/resume", {"threadId": thread_id, "excludeTurns": True})
         server.response(2)
         server.send(3, "turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]})
-        return server.response(3)
+        turn = server.response(3)
+        turn_id = (turn.get("turn") or {}).get("id")
+        # A turn/start acknowledgment only means the turn was ACCEPTED
+        # (status inProgress). The bridge closes the app-server process when
+        # this function returns, which would kill an in-flight turn before
+        # the model acts on it. Wait for turn/completed so "delivered" means
+        # the agent actually processed the wake, not merely received it.
+        completed = server.wait_for_turn_completed(request_id=3, turn_id=turn_id)
+        return {"thread_id": thread_id, "turn": completed}
     finally:
         server.close()
 
@@ -181,7 +246,7 @@ def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
         thread_id,
         prompt,
         codex_command=target.get("codex_command"),
-        timeout_seconds=int(target.get("timeout_seconds", 30)),
+        timeout_seconds=int(target.get("timeout_seconds", 300)),
     )
 
 

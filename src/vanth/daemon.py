@@ -686,6 +686,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().mark_delivery(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/retry"):
                 ok(self, get_manager().retry_delivery(parsed.path.split("/")[2]))
+            elif parsed.path == "/deliveries/clear":
+                ok(self, get_manager().clear_deliveries(**payload))
             elif parsed.path == "/cleanup":
                 ok(self, get_manager().cleanup(**payload))
             elif parsed.path == "/reap-orphans":

@@ -163,6 +163,8 @@ def test_codex_thread_delivery_dispatches_via_app_server(tmp_path):
             """
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 calls = Path(sys.argv[1])
@@ -176,9 +178,16 @@ for line in sys.stdin:
         result = {"thread": {"id": req["params"]["threadId"], "status": {"type": "idle"}}}
     elif method == "turn/start":
         result = {"turn": {"id": "turn_test", "status": "inProgress"}}
-    else:
-        result = {}
-    print(json.dumps({"id": req["id"], "result": result}), flush=True)
+
+    def respond():
+        if method == "turn/start":
+            # Emit the turn/completed notification AFTER the ack, as the real
+            # app-server does; the bridge must wait for it.
+            time.sleep(0.05)
+            print(json.dumps({"method": "turn/completed", "params": {"threadId": req["params"]["threadId"], "turn": {"id": "turn_test", "status": "completed"}}}), flush=True)
+        print(json.dumps({"id": req["id"], "result": result}), flush=True)
+
+    threading.Thread(target=respond, daemon=True).start()
 """.strip(),
             encoding="utf-8",
         )
@@ -768,6 +777,72 @@ def test_retention_policy_prunes_events_and_metrics(tmp_path):
             series = manager.metrics_query(job["job_id"])["series"]
             assert isinstance(series, dict)
         finally:
+            manager.close()
+
+    run(main())
+
+
+def test_clear_deliveries_dry_run_then_drain(tmp_path):
+    """Overflow valve: a backed-up delivery queue (disk-full scenario) can be
+    previewed with dry_run, then drained in bulk by the agent."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            code = "import json; print('AGENT_EVENT ' + json.dumps({'type': 'checkpoint', 'message': 'x'}), flush=True)"
+            started = await manager.start(
+                cmd(code),
+                wake_targets=[{"type": "codex_thread", "thread_id": "t_drain", "events": ["checkpoint"], "auto_dispatch": False}],
+            )
+            await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
+            deliveries = manager.deliveries(started["job_id"], status="pending")["deliveries"]
+            assert len(deliveries) == 1
+
+            preview = manager.clear_deliveries(job_id=started["job_id"], status="pending", dry_run=True)
+            assert preview["matched"] == 1 and preview["drained"] == 0
+            still = manager.deliveries(started["job_id"], status="pending")["deliveries"]
+            assert len(still) == 1, "dry_run must not touch the queue"
+
+            result = manager.clear_deliveries(job_id=started["job_id"], status="pending", dry_run=False)
+            assert result["drained"] == 1
+            after = manager.deliveries(started["job_id"])["deliveries"]
+            assert all(d["status"] == "failed" for d in after)
+            assert all("drained" in (d["last_error"] or "") for d in after)
+        finally:
+            manager.close()
+
+    run(main())
+
+
+def test_clear_deliveries_stale_only_scopes_to_terminal_jobs(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            code = "import json; print('AGENT_EVENT ' + json.dumps({'type': 'checkpoint', 'message': 'x'}), flush=True)"
+            done = await manager.start(
+                cmd(code),
+                wake_targets=[{"type": "codex_thread", "thread_id": "t_stale", "events": ["checkpoint"], "auto_dispatch": False}],
+            )
+            await manager.wait(done["job_id"], ["checkpoint"], timeout_seconds=30)
+            # The dispatch thread may still be transitioning the delivery row;
+            # poll until the row exists in a settled state.
+            deadline = time.monotonic() + 5
+            preview = None
+            while time.monotonic() < deadline:
+                preview = manager.clear_deliveries(stale_only=True, dry_run=True)
+                if preview["matched"] >= 1:
+                    break
+                await asyncio.sleep(0.1)
+            assert preview is not None and preview["matched"] >= 1, "terminal-job delivery must match stale_only"
+            # A delivery for a NON-terminal job must not match.
+            longjob = await manager.start(
+                cmd("import time; time.sleep(60)"),
+                wake_targets=[{"type": "codex_thread", "thread_id": "t_live", "events": ["checkpoint"], "auto_dispatch": False}],
+            )
+            await asyncio.sleep(0.5)
+            fresh = manager.clear_deliveries(stale_only=True, job_id=longjob["job_id"], dry_run=True)
+            assert fresh["matched"] == 0
+        finally:
+            manager.begin_shutdown()
             manager.close()
 
     run(main())

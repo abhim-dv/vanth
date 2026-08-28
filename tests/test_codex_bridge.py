@@ -57,6 +57,7 @@ class _RecordingServer(_StubServer):
         self.sent: list[tuple[int, str, dict[str, Any]]] = []
         self.responses: dict[int, dict[str, Any]] = {}
         self.closed = False
+        self.completed_turns: list[dict[str, Any]] = []
 
     def send(self, request_id: int, method: str, params: dict[str, Any]) -> None:
         self.sent.append((request_id, method, params))
@@ -65,6 +66,9 @@ class _RecordingServer(_StubServer):
         if request_id not in self.responses:
             raise CodexBridgeError("fake server returned no response")
         return self.responses[request_id]
+
+    def wait_for_turn_completed(self, request_id: int, turn_id: str | None) -> dict[str, Any]:
+        return {"id": turn_id or "fake", "status": "completed"}
 
     def close(self) -> None:
         self.closed = True
@@ -90,7 +94,7 @@ def test_initialize_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> No
     _server_factory(monkeypatch, server)
 
     result = send_message_to_thread("thread-1", "wake", timeout_seconds=30)
-    assert result == {"ok": True}
+    assert result["turn"]["status"] == "completed"
     assert calls["n"] == 3
     assert server.closed
 
@@ -133,7 +137,7 @@ def test_send_message_returns_server_never_resumes_without_initialize(monkeypatc
     _server_factory(monkeypatch, server)
 
     result = send_message_to_thread("thread-1", "wake", timeout_seconds=30)
-    assert result == {"ok": True}
+    assert result["turn"]["status"] == "completed"
     methods = [m for _, m, _ in server.sent]
     assert methods == ["initialize", "thread/resume", "turn/start"]
 

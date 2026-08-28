@@ -140,7 +140,10 @@ def send_delivery_to_opencode(payload: dict[str, Any]) -> dict[str, Any]:
         session_id,
         prompt,
         opencode_command=target.get("opencode_command"),
-        timeout_seconds=int(target.get("timeout_seconds", 30)),
+        # A busy session cannot take a new turn until the active one finishes;
+        # the delivery worker is a background thread, so default to a generous
+        # wait (5 min) instead of 30s. Per-target override still wins.
+        timeout_seconds=int(target.get("timeout_seconds", 300)),
         directory=directory,
         attach=attach,
         skip_probe=skip_probe,

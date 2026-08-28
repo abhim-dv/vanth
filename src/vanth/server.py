@@ -1259,7 +1259,10 @@ class JobManager:
         final_status = status
         next_attempt_at = None
         if status == "failed" and attempt < int(target.get("max_attempts", 1)):
-            delay = int(target.get("retry_delay_seconds", 5))
+            # Backoff grows per attempt (5s, 15s, 45s... capped at 5 min) so a
+            # busy target session gets progressively longer to finish its
+            # current turn instead of being retried into the same wall.
+            delay = min(int(target.get("retry_delay_seconds", 5)) * (3 ** (attempt - 1)), 300)
             final_status = "retrying"
             next_attempt_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
         delivered_at = now_iso() if final_status == "delivered" else None
@@ -2598,6 +2601,74 @@ class JobManager:
         delivery = self._delivery_dict(row)
         return delivery
 
+    def clear_deliveries(
+        self,
+        job_id: str | None = None,
+        status: str | None = None,
+        older_than_seconds: int | None = None,
+        stale_only: bool = False,
+        limit: int = 1000,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Bulk-drain the wake/delivery queue (agent-controllable overflow valve).
+
+        Matches deliveries by optional job_id, status, and age; ``stale_only``
+        restricts to deliveries whose SOURCE EVENT is terminal-and-old — i.e.
+        notifications that lost their moment (the "disk full, everything
+        floods at once" case). Returns what was (or would be) drained.
+        """
+        validate_limit(limit, "limit", 10000)
+        if status is not None and status not in {"pending", "retrying", "dispatching", "delivered", "failed"}:
+            raise ValueError("invalid delivery status")
+        if older_than_seconds is not None and (isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0):
+            raise ValueError("older_than_seconds must be a non-negative integer")
+        where = []
+        args: list[Any] = []
+        if job_id is not None:
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("job_id must be a non-empty string")
+            where.append("d.job_id=?")
+            args.append(job_id)
+        if status is not None:
+            where.append("d.status=?")
+            args.append(status)
+        if older_than_seconds is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+            where.append("d.created_at < ?")
+            args.append(cutoff)
+        if stale_only:
+            # Only drain deliveries whose event no longer matters: the source
+            # job already reached a terminal state AND the delivery is old
+            # enough that the payload cannot be acted on promptly. We accept
+            # any terminal event; freshness is bounded by the source event's
+            # created_at (event must itself be at least as old as the
+            # older_than cutoff when given, otherwise any age).
+            where.append(
+                "EXISTS (SELECT 1 FROM events e JOIN jobs j ON j.job_id=e.job_id "
+                "WHERE e.event_id=d.event_id AND j.status IN ('completed','failed','timeout','cancelled','orphaned'))"
+            )
+        sql_where = ("WHERE " + " AND ".join(where)) if where else ""
+        with self.db_lock:
+            count_row = self.db.execute(
+                f"SELECT COUNT(*) AS n FROM deliveries d {sql_where}", tuple(args)
+            ).fetchone()
+            matched = int(count_row["n"])
+            if dry_run or matched == 0:
+                return {"matched": matched, "drained": 0, "dry_run": dry_run}
+            rows = self.db.execute(
+                f"SELECT d.delivery_id, d.status FROM deliveries d {sql_where} LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+            ids = [r["delivery_id"] for r in rows]
+            placeholders = ",".join("?" for _ in ids)
+            cur = self.db.execute(
+                f"UPDATE deliveries SET status='failed', last_error='drained via clear_deliveries', next_attempt_at=NULL, claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL "
+                f"WHERE delivery_id IN ({placeholders})",
+                tuple(ids),
+            )
+            self.db.commit()
+        return {"matched": matched, "drained": int(cur.rowcount), "dry_run": False, "ids": ids[:25]}
+
     def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
              follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None) -> dict[str, Any]:
         validate_limit(max_bytes, "max_bytes", max(self.max_log_bytes, 8192))
@@ -3193,6 +3264,44 @@ def job_retry_delivery(delivery_id: str) -> dict[str, Any]:
 @mcp.tool()
 def job_delivery_attempts(delivery_id: str, limit: int = 20) -> dict[str, Any]:
     return get_client().get(f"/deliveries/{delivery_id}/attempts", {"limit": limit})
+
+
+@mcp.tool()
+def job_clear_deliveries(
+    job_id: str | None = None,
+    status: str | None = None,
+    older_than_seconds: int | None = None,
+    stale_only: bool = False,
+    limit: int = 1000,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Bulk-drain stale wake deliveries (notification queue overflow valve).
+
+    Use when a flood of stale notifications arrives at once (e.g. after the
+    machine was offline or a disk filled up). Marks matching deliveries as
+    permanently failed so they stop retrying.
+
+    Filters (combine freely):
+      - ``job_id``: only deliveries for one job
+      - ``status``: 'pending' | 'retrying' | 'dispatching' | 'delivered' | 'failed'
+      - ``older_than_seconds``: only deliveries created before the cutoff
+      - ``stale_only``: only deliveries whose source job is already terminal
+      - ``limit``: drain at most N (default 1000)
+      - ``dry_run``: preview counts without changing anything (default true)
+
+    View the queue first with job_deliveries(status='retrying'/'pending').
+    """
+    return get_client().post(
+        "/deliveries/clear",
+        {
+            "job_id": job_id,
+            "status": status,
+            "older_than_seconds": older_than_seconds,
+            "stale_only": stale_only,
+            "limit": limit,
+            "dry_run": dry_run,
+        },
+    )
 
 
 @mcp.tool()

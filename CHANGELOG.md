@@ -4,6 +4,29 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Delivery queue management + wake delivery reliability
+
+- **Bulk delivery-queue clearing** — `vanth deliveries clear` (daemon route
+  `POST /deliveries/clear`, MCP tool `job_clear_deliveries`). Filter by
+  `job_id`, `status`, `older_than_seconds`, or `stale_only` (only deliveries
+  whose source job is terminal). `dry_run` defaults to true so agents can
+  preview what a drain would remove before committing; `limit` caps batch
+  size.
+- **Wake "delivered" now means the model actually ran** — the codex bridge
+  previously returned `delivered` the instant `turn/start` acknowledged the
+  turn (`inProgress`), then tore down the app-server process, killing the
+  in-flight turn before the model acted on the wake. The bridge now waits
+  for the `turn/completed` notification (matching the started turn id) and
+  only then reports success; a failed turn is surfaced as a delivery error.
+- **Turn-completion notification ordering** — the bridge buffers
+  `turn/completed` notifications that arrive before the `turn/start`
+  response (notification ordering is not guaranteed) so the completion
+  waiter never misses them.
+- **Wake delivery timeouts raised** — bridge default delivery timeout
+  raised 30s -> 300s (opencode + codex), and `_complete_delivery` now
+  retries with exponential backoff (5s x 3^(n-1), capped at 300s) instead
+  of giving up after the first busy-session failure.
+
 ### Restart policies + retention pruning (job policies, continued)
 
 - **Restart policies** — `policy.restart: {max_retries, backoff_seconds,
