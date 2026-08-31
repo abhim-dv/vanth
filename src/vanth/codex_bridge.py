@@ -283,6 +283,43 @@ def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def send_delivery_to_codex_desktop(payload: dict[str, Any]) -> dict[str, Any]:
+    """Deliver a wake into a running Codex Desktop task via the native
+    app-tools host pipe (review rc36 P0).
+
+    This is the Desktop route: it calls ``codex_app/send_message_to_thread`` on
+    the inherited ``CODEX_APP_TOOLS_PIPE_PATH`` so the follow-up lands in the
+    already-running Desktop task. It NEVER spawns a second app-server and never
+    falls back to the CLI thread bridge. The pipe is read from the current
+    (MCP/client) process's inherited environment — never from a job target or
+    daemon message.
+    """
+    from .codex_pipe import CodexPipeUnavailable, send_desktop_message
+
+    target = payload.get("target") or {}
+    target_type = target.get("type")
+    thread_id = _target_thread_id(target)
+    prompt = payload.get("prompt")
+    if not isinstance(thread_id, str) or not thread_id:
+        raise CodexBridgeError(f"{target_type} target requires thread_id")
+    if not isinstance(prompt, str) or not prompt:
+        raise CodexBridgeError("delivery payload requires prompt")
+    delivery_id = payload.get("delivery_id") or "vanth-delivery"
+    try:
+        result = send_desktop_message(
+            destination_thread_id=thread_id,
+            prompt=prompt,
+            caller_thread_id=target.get("caller_thread_id"),
+            call_id=f"vanth-{delivery_id}",
+            timeout_seconds=int(target.get("timeout_seconds", 300)),
+        )
+    except CodexPipeUnavailable:
+        raise
+    except Exception as exc:
+        raise CodexBridgeError(f"Codex Desktop wake failed: {exc}") from exc
+    return {"thread_id": thread_id, "desktop": True, "result": result}
+
+
 def main() -> None:
     payload = json.load(sys.stdin)
     result = send_delivery_to_codex(payload)

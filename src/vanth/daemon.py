@@ -613,6 +613,11 @@ class Handler(BaseHTTPRequestHandler):
                     query.get("job_ids") or None,
                     int(query.get("limit", ["5000"])[0]),
                 ))
+            elif parsed.path == "/relay/poll":
+                ok(self, {"deliveries": get_manager().relay_poll(
+                    client_id=query.get("client_id", [""])[0],
+                    timeout_seconds=float(query.get("timeout_seconds", ["30"])[0]),
+                )})
             else:
                 error(self, "Not found", 404)
         except (ValueError, TypeError, OverflowError) as exc:
@@ -692,6 +697,21 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().cleanup(**payload))
             elif parsed.path == "/reap-orphans":
                 ok(self, get_manager().reap_orphans())
+            elif parsed.path == "/relay/register":
+                ok(self, get_manager().relay_register(
+                    client_id=payload.get("client_id", ""),
+                    client_type=payload.get("client_type", ""),
+                    destinations=payload.get("destinations", []),
+                ))
+            elif parsed.path == "/relay/unregister":
+                ok(self, get_manager().relay_unregister(payload.get("client_id", "")))
+            elif parsed.path == "/relay/ack":
+                ok(self, get_manager().relay_ack(
+                    client_id=payload.get("client_id", ""),
+                    delivery_id=payload.get("delivery_id", ""),
+                    status=payload.get("status", ""),
+                    error=payload.get("error"),
+                ))
             elif parsed.path == "/remotes/pair":
                 from .remote.pairing import pair_remote
 

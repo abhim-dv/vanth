@@ -120,18 +120,39 @@ def send_message_to_session(
         # subprocess as the documented OPENCODE_SERVER_USERNAME /
         # OPENCODE_SERVER_PASSWORD variables, without writing secrets to disk or
         # into wake-target config/delivery payloads.
+        #
+        # Review rc36 P2: ONLY the unambiguous ``username_env`` / ``password_env``
+        # keys are accepted. The legacy ``auth.username`` / ``auth.password``
+        # aliases were ambiguous (an identifier-looking literal such as "bot" is
+        # indistinguishable from a variable reference) and a missing referenced
+        # variable silently became an empty string. A referenced-but-absent
+        # variable is now an explicit error instead of a confusing auth failure.
+        if not isinstance(auth, dict):
+            raise OpenCodeBridgeError("auth must be an object with username_env/password_env keys")
+        legacy = set(auth).intersection({"username", "password"})
+        if legacy:
+            raise OpenCodeBridgeError(
+                "auth.username/auth.password are ambiguous legacy aliases (a literal "
+                "value like 'bot' is indistinguishable from a variable reference); "
+                f"use username_env/password_env instead (got: {sorted(legacy)})"
+            )
         env = os.environ.copy()
-        if isinstance(auth, dict):
-            username_env = auth.get("username_env") or auth.get("username")
-            password_env = auth.get("password_env") or auth.get("password")
-            if username_env:
-                if not isinstance(username_env, str) or not username_env.isidentifier():
-                    raise OpenCodeBridgeError("auth.username must be an environment variable NAME (not a literal value)")
-                env["OPENCODE_SERVER_USERNAME"] = env.get(username_env, "")
-            if password_env:
-                if not isinstance(password_env, str) or not password_env.isidentifier():
-                    raise OpenCodeBridgeError("auth.password must be an environment variable NAME (not a literal value)")
-                env["OPENCODE_SERVER_PASSWORD"] = env.get(password_env, "")
+        for key, var_name, target_key in (
+            ("username_env", "username", "OPENCODE_SERVER_USERNAME"),
+            ("password_env", "password", "OPENCODE_SERVER_PASSWORD"),
+        ):
+            if key not in auth:
+                continue
+            value = auth[key]
+            if not isinstance(value, str) or not value.isidentifier():
+                raise OpenCodeBridgeError(
+                    f"auth.{key} must be an environment variable NAME (e.g. {target_key}), not a literal value"
+                )
+            if value not in os.environ:
+                raise OpenCodeBridgeError(
+                    f"auth.{key} references environment variable {value!r} which is not set"
+                )
+            env[target_key] = os.environ[value]
 
     try:
         result = subprocess.run(

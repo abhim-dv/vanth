@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 import pytest
 
@@ -393,7 +394,10 @@ def test_running_runner_survives_manager_restart(tmp_path):
         manager.close()
 
         restarted = JobManager(tmp_path)
-        assert restarted.status(started["job_id"])["status"] in {"running", "completed"}
+        # With claim-token launches (review rc36 P1), a freshly-started job may
+        # still be in the transient 'launching' state when a manager restarts;
+        # the runner (a separate process) promotes it to 'running' and completes.
+        assert restarted.status(started["job_id"])["status"] in {"running", "launching", "completed"}
         completed = await restarted.wait(started["job_id"], ["completed"], timeout_seconds=30)
         assert completed["event"]["type"] == "completed"
         assert "after" in restarted.tail(started["job_id"])["content"]
@@ -1988,6 +1992,164 @@ def test_pending_restart_clear_is_token_guarded(tmp_path):
             # The owning token clears it (as the promotion path does).
             manager._clear_pending_restart_after(job["job_id"], token_a)
             assert manager._policy_state(job["job_id"]).get("pending_restart_after") is None
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_recover_between_insert_and_popen_cannot_orphan_pre_spawn(tmp_path):
+    """Review rc36 P1: every direct start is inserted 'launching' with a claim
+    token (never 'running' with a NULL worker_pid), so a second manager's
+    recovery CANNOT orphan a fresh pre-spawn row. Manager B snapshots the
+    pre-spawn row (worker_pid IS NULL); if the runner publishes a live pid
+    before B's CAS, B's transition must affect zero rows and must not kill or
+    terminalize the job."""
+    import os as _os
+
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            # Simulate manager A: claim as launching with worker_pid still NULL.
+            token = "claim_" + uuid.uuid4().hex[:16]
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET status='launching', claim_token=? WHERE job_id=?",
+                    (token, job["job_id"]),
+                )
+                manager.db.commit()
+
+            # Manager B's stale-claim recovery observes worker_pid IS NULL and
+            # attempts to abandon the claim (aging it past the grace window).
+            # The runner meanwhile publishes a live worker_pid.
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 4242, token)
+
+            # B's recovery CAS binds worker_pid IS NULL; the live publish
+            # changed it, so the CAS must affect ZERO rows.
+            recovered, target = manager._abandon_launch_claim(
+                job["job_id"], token, expected_worker_pid=None
+            )
+            assert not recovered, "stale recovery must not orphan a live runner that published after a NULL snapshot"
+            status = manager.status(job["job_id"])["status"]
+            assert status == "running", f"live run must survive, got {status}"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_popen_failure_after_newer_run_is_token_guarded(tmp_path):
+    """Review rc36 P1: A's Popen failure handler is claim-token guarded, so a
+    stale starter can never mark a NEWER run failed."""
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token_a = launch["claim_token"]
+
+            # Manager B establishes a newer run with a different claim token.
+            token_b = "claim_" + uuid.uuid4().hex[:16]
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET status='launching', claim_token=? WHERE job_id=?",
+                    (token_b, job["job_id"]),
+                )
+                manager.db.commit()
+
+            # A's Popen failure handler with its OLD token must not clobber B's
+            # row (a guarded write affecting zero rows).
+            stamp = now_iso()
+            with manager.db_lock:
+                changed = manager.db.execute(
+                    "UPDATE jobs SET status='failed', exit_code=1, ended_at=?, updated_at=?, stop_requested_at=NULL "
+                    "WHERE job_id=? AND claim_token=? AND status='launching'",
+                    (stamp, stamp, job["job_id"], token_a),
+                ).rowcount
+                manager.db.commit()
+            assert changed == 0, "stale starter must not mark a newer run failed"
+            row = manager._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "launching" and row["claim_token"] == token_b
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_reconcile_null_worker_snapshot_cas_loses_after_live_publish(tmp_path):
+    """Review rc36 P1: a stale reconciler/watcher snapshots worker_pid IS NULL;
+    the runner publishes a live pid; the reconciler's terminal CAS (binding
+    worker_pid IS NULL) must lose and must not orphan the live run."""
+    import os as _os
+
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token = launch["claim_token"]
+
+            # Runner publishes a live workload/worker (the row becomes running).
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 4242, token)
+
+            # A stale watcher/reconciler that snapshotted worker_pid IS NULL
+            # (before the publish) now tries to terminalize. The sentinel binds
+            # `worker_pid IS NULL`, which no longer matches.
+            changed = manager._transition_terminal(
+                job["job_id"], "orphaned", worker_pid=None
+            )
+            assert not changed, "stale NULL-worker terminal write must lose"
+            assert manager.status(job["job_id"])["status"] == "running"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_stale_claim_recovery_null_snapshot_cas_loses(tmp_path):
+    """Review rc36 P1: stale-claim recovery snapshots worker_pid IS NULL; the
+    runner publishes a live worker_pid; recovery's launching-only CAS must
+    affect zero rows and never kill or terminalize the job."""
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token = launch["claim_token"]
+
+            # The runner publishes a live worker between the snapshot and CAS.
+            import os as _os
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND status='launching'",
+                    (_os.getpid(), now_iso(), job["job_id"]),
+                )
+                manager.db.commit()
+                stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=manager.launch_claim_timeout + 5)).isoformat().replace("+00:00", "Z")
+                manager.db.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND status='launching'",
+                    (stale, job["job_id"]),
+                )
+                manager.db.commit()
+
+            # Recovery snapshot observed worker_pid == this live pid; the CAS
+            # matches and would orphan — so this asserts the OPPOSITE snapshot:
+            # the recovery snapshot saw NULL, the runner then wrote a live pid.
+            # Bind NULL explicitly to prove the guard loses.
+            recovered, _ = manager._abandon_launch_claim(job["job_id"], token, expected_worker_pid=None)
+            assert not recovered, "recovery with a NULL-observed worker must lose against a live publish"
+            assert manager.status(job["job_id"])["status"] == "launching"
         finally:
             manager.begin_shutdown()
             manager.close()

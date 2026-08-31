@@ -4,6 +4,73 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc36-review release blockers: Desktop wake relay, launch-identity hardening (rc37)
+
+#### Codex Desktop wake via client relay (P0)
+
+- **`codex_desktop` wake restored as a distinct target** (removed in rc36 because
+  the HTTP relay it referenced does not exist). It now wakes a RUNNING Desktop
+  task through the native app-tools host pipe (`CODEX_APP_TOOLS_PIPE_PATH`),
+  calling `codex_app/send_message_to_thread` so the follow-up lands in the
+  already-running Desktop app — never a second app-server.
+- **Client-side outbound relay architecture.** The persistent daemon never
+  discovers client processes or stores rotating pipe names. The MCP/client
+  integration owns a relay that (1) opens a durable localhost subscription to
+  the daemon registering the task ids it can wake, (2) long-polls for due
+  `codex_desktop` deliveries, (3) delivers through the pipe, and (4)
+  acknowledges only after admission succeeds. A disconnect leaves the delivery
+  pending; a reconnect re-registers and resumes from the last acknowledged
+  delivery id. Both Codex (pipe adapter) and OpenCode (session/attach adapter)
+  share one subscription/ack protocol.
+- **Private pipe is contained inside the Codex MCP process** and is taken only
+  from its inherited environment — never from a job target or daemon message.
+- **Fail-closed and opt-in:** with no inherited `CODEX_APP_TOOLS_PIPE_PATH` or
+  capability, `codex_desktop` delivery fails with an actionable "Desktop
+  integration unavailable" error and NEVER routes to the CLI thread bridge.
+- The pipe client (`vanth.codex_pipe`) is a small replaceable adapter: 4-byte
+  LE length-prefixed JSON-RPC frames, 8 MiB cap, exact/fragmented reads,
+  per-connection serialization, response-id verification, `tools/list`
+  capability preflight before `tools/call`.
+- New daemon relay endpoints: `/relay/register`, `/relay/unregister`,
+  `/relay/poll`, `/relay/ack` (schema v12, `relay_subscriptions` table).
+
+#### Launch-identity hardening (P1)
+
+- **Every direct start now carries a claim token.** `start()` inserts the job
+  `launching` with a durable `claim_token` (like the `prepare_launch` path) and
+  the runner promotes it atomically; the no-token `running`-with-NULL-worker
+  state machine is removed. A second manager can no longer orphan a fresh
+  pre-spawn row (its recovery CAS asserts `worker_pid IS NULL`), and a stale
+  starter can no longer mark a newer run failed (every failure/recovery/watcher/
+  terminal write is claim-token guarded).
+- **Observed NULL worker is CAS'd, not skipped.** `_transition_terminal` and
+  `_abandon_launch_claim` use a sentinel to distinguish "no worker guard" from
+  "the snapshot observed `worker_pid IS NULL`"; an explicit NULL binds
+  `worker_pid IS ?` so a runner that published a live pid after a NULL snapshot
+  is never orphaned (legacy no-token recovery/reconcile included).
+- `stop()` handles a `launching` row (sets `stop_requested_at` so the runner
+  cannot promote; transitions to `cancelled` deterministically) instead of
+  returning "already terminal" during the brief pre-promotion window.
+- Adversarial tests: recover-between-insert-and-Popen, Popen-failure-after-
+  newer-run, reconcile-NULL-snapshot-vs-live-publish, stale-claim-NULL-snapshot
+  CAS, plus the two existing cross-process CAS tests.
+
+#### Compatibility & contract (P1/P2)
+
+- **Python wake wrappers restored.** `daemon_wake`/`job_wake_now`/
+  `job_add_wake_target` MCP tools keep the explicit `config` dict (FastMCP
+  cannot bind `**config`); the module-level `daemon_wake_python` /
+  `job_wake_now_python` / `job_add_wake_target_python` wrappers accept the old
+  `**config` kwargs style for direct Python callers.
+- **OpenCode auth uses only `username_env`/`password_env`.** The ambiguous
+  legacy `auth.username`/`auth.password` aliases are rejected outright, and a
+  referenced-but-unset variable is an explicit error (no silent empty string).
+- **Wake docs updated:** the stale `...` kwargs parameter row is gone (replaced
+  by the `config` object), `synthetic_event_type: "wake_now"` is documented, and
+  a response-contract assertion test was added.
+
+Full suite: 665 passed, 6 skipped across a clean full run.
+
 ### rc35-review release blockers: Desktop wake, OpenCode TUI wake, restart/ownership races (rc36)
 
 #### Codex transport (P0)

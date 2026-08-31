@@ -750,8 +750,16 @@ a wake for an event that already happened. Use `job_wake_now` for that.
 
 Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
 the shorthand: `type` (required, one of `local_command` / `codex_cli_thread` /
-`opencode_thread` / `webhook`) plus optional `events` and `config` (extra
-target config). Events default to `["completed", "failed"]`.
+`codex_desktop` / `opencode_thread` / `webhook`) plus optional `events` and
+`config` (a single object holding the extra target config). Events default to
+`["completed", "failed"]`.
+
+`codex_cli_thread` / `codex_desktop` targets inherit the calling Codex task's
+thread id (resolved by the MCP wrapper from `CODEX_THREAD_ID`); an explicit
+`thread_id` always wins. `codex_desktop` wakes a RUNNING Desktop task through
+its native app-tools host pipe — it requires the Desktop integration to be
+active (`CODEX_APP_TOOLS_PIPE_PATH` inherited by the client) and fails closed
+(never falls back to the CLI thread bridge) when it is not.
 
 `opencode_thread` targets require an explicit `session_id` (OpenCode does not
 inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit
@@ -766,8 +774,8 @@ isolated backend and does not wake the visible client.
 | `job_id` | `string` | required | Job to register the wake target on |
 | `target` | `object?` | `None` | Full wake-target dict (`{type, events, ...config}`); given, used as-is |
 | `events` | `string[]?` | `["completed","failed"]` | Shorthand; non-empty list of event types (e.g. `["checkpoint"]`) |
-| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `opencode_thread` / `webhook` |
-| `...` | `object?` | `{}` | Extra config kwargs merged into the shorthand target |
+| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `codex_desktop` / `opencode_thread` / `webhook` |
+| `config` | `object?` | `{}` | Extra target config (e.g. `{"command": ..., "thread_id": ..., "session_id": ..., "attach": ...}`) merged into the shorthand target |
 
 **Response**
 
@@ -792,14 +800,24 @@ waiting for a matching event. Same target contract as `job_add_wake_target`;
 ```json
 { "result": "ok", "job_id": "job_abc123", "target_id": "target_...",
   "target_type": "local_command", "events": ["completed", "failed"],
-  "woken": true, "synthetic_event_type": "completed", "requested_status": "completed" }
+  "woken": true, "synthetic_event_type": "wake_now", "requested_status": "running" }
 ```
+
+Note the response contract (review rc36 P2): `synthetic_event_type` is always
+the literal `"wake_now"` — wake_now never fabricates a `"completed"`/`"failed"`
+event for a job that is still running or already failed.
 
 ### `daemon_wake` (deprecated)
 
 Kept for backward compatibility. Alias of `job_add_wake_target` — it registers
 a wake target for future events only. Use `job_wake_now` to surface a wake
 immediately, or `job_add_wake_target` to register a target.
+
+Python callers that previously passed the extra target config as plain keyword
+arguments (e.g. `daemon_wake(job_id, type="local_command", command=...)`) can
+use the module-level `daemon_wake_python` / `job_wake_now_python` /
+`job_add_wake_target_python` wrappers, which accept that `**config` style. The
+MCP tools take an explicit `config` dict.
 
 ### `job_cleanup_preview`
 

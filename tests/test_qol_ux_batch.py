@@ -80,7 +80,7 @@ def test_trigger_starts_child_when_parent_completes(tmp_path):
         child_id = child["job_id"]
         assert manager.status(child_id)["status"] == "queued"
         assert manager.status(child_id)["trigger"] == {"job_id": parent, "status": "completed"}
-        assert manager.status(parent)["status"] in {"running", "completed", "failed"}
+        assert manager.status(parent)["status"] in {"running", "launching", "completed", "failed"}
         wait_terminal(manager, child_id)
         assert manager.status(child_id)["status"] == "completed"
         # child should have run after parent

@@ -240,7 +240,9 @@ def test_auth_forwards_credential_references(monkeypatch: pytest.MonkeyPatch) ->
     """Review P0-3: authenticated opencode servers are supported through
     non-persisted credential references — only ENV VAR NAMES are accepted (never
     literal values), forwarded as the documented OPENCODE_SERVER_USERNAME /
-    OPENCODE_SERVER_PASSWORD variables."""
+    OPENCODE_SERVER_PASSWORD variables. Review rc36 P2: only the unambiguous
+    username_env / password_env keys are honored (the legacy username/password
+    aliases are ambiguous)."""
     monkeypatch.setenv("MY_USER", "bot")
     monkeypatch.setenv("MY_PASS", "s3cret")
     seen = {}
@@ -256,7 +258,7 @@ def test_auth_forwards_credential_references(monkeypatch: pytest.MonkeyPatch) ->
             "target": {
                 "session_id": "ses_1",
                 "skip_probe": True,
-                "auth": {"username": "MY_USER", "password": "MY_PASS"},
+                "auth": {"username_env": "MY_USER", "password_env": "MY_PASS"},
             },
         }
     )
@@ -267,13 +269,16 @@ def test_auth_forwards_credential_references(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_auth_rejects_literal_values(monkeypatch: pytest.MonkeyPatch) -> None:
     """Review P0-3: literal secret values must NOT be accepted in auth (they
-    would be serialized into wake-target config / delivery payloads)."""
+    would be serialized into wake-target config / delivery payloads). Review
+    rc36 P2: the legacy username/password aliases are rejected outright (too
+    ambiguous), and a referenced-but-absent variable is an explicit error."""
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', ""),
     )
-    with pytest.raises(OpenCodeBridgeError, match="environment variable NAME"):
+    # Legacy alias: ambiguous and now rejected outright.
+    with pytest.raises(OpenCodeBridgeError, match="username_env"):
         send_delivery_to_opencode(
             {
                 "prompt": "wake",
@@ -281,6 +286,30 @@ def test_auth_rejects_literal_values(monkeypatch: pytest.MonkeyPatch) -> None:
                     "session_id": "ses_1",
                     "skip_probe": True,
                     "auth": {"username": "literal-bot", "password": "literal-pass"},
+                },
+            }
+        )
+    # A referenced variable that is not set must fail explicitly (no silent "").
+    with pytest.raises(OpenCodeBridgeError, match="not set"):
+        send_delivery_to_opencode(
+            {
+                "prompt": "wake",
+                "target": {
+                    "session_id": "ses_1",
+                    "skip_probe": True,
+                    "auth": {"username_env": "UNSET_USER_VAR", "password_env": "UNSET_PASS_VAR"},
+                },
+            }
+        )
+    # A literal value in username_env (non-identifier) is still rejected.
+    with pytest.raises(OpenCodeBridgeError, match="environment variable NAME"):
+        send_delivery_to_opencode(
+            {
+                "prompt": "wake",
+                "target": {
+                    "session_id": "ses_1",
+                    "skip_probe": True,
+                    "auth": {"username_env": "literal-bot"},
                 },
             }
         )

@@ -99,3 +99,69 @@ def test_add_wake_target_rejects_unsupported_type(tmp_path):
             manager.add_wake_target(job_id, {"type": "http", "events": ["completed"]})
     finally:
         manager.close()
+
+
+def test_python_compat_wrappers_accept_legacy_kwargs(monkeypatch, tmp_path):
+    """Review rc36 P1: the MCP tools use an explicit ``config`` dict (FastMCP
+    cannot bind ``**config``), but old direct Python callers passed the extra
+    target config as plain keyword arguments. The ``*_python`` wrappers restore
+    that ``**config`` style. Each wrapper delegates through the same
+    ``_build_wake_target`` logic and posts to the daemon."""
+    from vanth.server import (
+        daemon_wake_python,
+        job_add_wake_target_python,
+        job_wake_now_python,
+    )
+
+    posted = {}
+
+    class FakeClient:
+        def post(self, path, payload):
+            posted["path"] = path
+            posted["payload"] = payload
+            return {"result": "ok", "job_id": "job_1", "target_id": "target_1", "target_type": payload["target"]["type"], "events": payload["target"].get("events")}
+
+    import vanth.server as server_mod
+    original = server_mod.get_client
+    server_mod.get_client = lambda: FakeClient()
+    try:
+        # Legacy kwargs style: daemon_wake(job_id, type=..., command=...).
+        result = daemon_wake_python("job_1", type="local_command", command=["echo", "hi"])
+        assert result["result"] == "ok"
+        assert posted["path"] == "/jobs/job_1/wake"
+        assert posted["payload"]["target"]["type"] == "local_command"
+        assert posted["payload"]["target"]["command"] == ["echo", "hi"]
+        assert posted["payload"]["target"]["events"] == ["completed", "failed"]
+
+        result = job_add_wake_target_python("job_1", type="webhook", url="http://x/", events=["checkpoint"])
+        assert posted["payload"]["target"]["type"] == "webhook"
+        assert posted["payload"]["target"]["url"] == "http://x/"
+        assert posted["payload"]["target"]["events"] == ["checkpoint"]
+
+        # job_wake_now_python posts to /wake-now.
+        job_wake_now_python("job_1", type="local_command", command=["echo", "hi"])
+        assert posted["path"] == "/jobs/job_1/wake-now"
+
+        # Missing type still raises through _build_wake_target.
+        with pytest.raises(ValueError, match="type is required"):
+            daemon_wake_python("job_1", command=["echo", "hi"])
+    finally:
+        server_mod.get_client = original
+
+
+def test_wake_now_response_contract(tmp_path):
+    """Review rc36 P2: wake_now's response must carry the literal
+    ``synthetic_event_type: "wake_now"`` (never a fabricated completed/failed)
+    plus the real job status as ``requested_status``."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = start_job(manager, "print('x')")
+        result = manager.wake_now(
+            job_id,
+            {"type": "local_command", "events": ["completed"], "command": [sys.executable, "-c", "import sys; sys.exit(0)"]},
+        )
+        assert result["woken"] is True
+        assert result["synthetic_event_type"] == "wake_now"
+        assert result["requested_status"] == manager.status(job_id)["status"]
+    finally:
+        manager.close()

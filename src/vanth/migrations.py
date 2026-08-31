@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 12
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -82,6 +82,10 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           UNIQUE(event_id, target_id)
         );
         CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status, next_attempt_at, created_at);
+        CREATE TABLE IF NOT EXISTS relay_subscriptions (
+          client_id TEXT PRIMARY KEY, client_type TEXT NOT NULL,
+          destinations_json TEXT NOT NULL, updated_at TEXT NOT NULL, last_poll_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS delivery_attempts (
           attempt_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL, attempt INTEGER NOT NULL,
           claim_token TEXT, target_type TEXT, started_at TEXT, ended_at TEXT,
@@ -104,7 +108,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at);
-        PRAGMA user_version=11;
+        PRAGMA user_version=12;
         """
     )
 
@@ -229,6 +233,17 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 _add_missing(db, "jobs", {"claim_token": "TEXT"})
                 db.execute("PRAGMA user_version=11")
                 version = 11
+            if version < 12:
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS relay_subscriptions (
+                      client_id TEXT PRIMARY KEY, client_type TEXT NOT NULL,
+                      destinations_json TEXT NOT NULL, updated_at TEXT NOT NULL, last_poll_at TEXT
+                    )
+                    """
+                )
+                db.execute("PRAGMA user_version=12")
+                version = 12
             db.commit()
         except Exception:
             db.rollback()
