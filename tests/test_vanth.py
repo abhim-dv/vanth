@@ -480,6 +480,10 @@ def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
     Per review P2-2 the daemon no longer infers the thread from its own
     environment: the caller (MCP wrapper) resolves it and passes
     ``origin_thread_id`` explicitly. This test passes it the same way.
+
+    ``opencode_thread`` does NOT auto-inherit a session id (OpenCode never
+    injects OPENCODE_SESSION_ID — review P1-1): callers must pass an explicit
+    session_id. codex targets inherit the calling thread id.
     """
     async def main():
         manager = JobManager(tmp_path)
@@ -489,8 +493,7 @@ def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
                 notify_on=["completed"],
                 origin_thread_id="ses_origin",
                 wake_targets=[
-                    {"type": "opencode_thread"},                      # inherits
-                    {"type": "opencode_thread", "session_id": "ses_explicit"},  # wins
+                    {"type": "opencode_thread", "session_id": "ses_explicit"},  # explicit wins
                     {"type": "codex_thread", "auto_dispatch": False},  # inherits
                 ],
             )
@@ -507,7 +510,6 @@ def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
                 key = config.get("session_id") or ("codex:" + str(config.get("thread_id")))
                 by_session.setdefault(key, 0)
                 by_session[key] += 1
-            assert by_session.get("ses_origin") == 1, by_session
             assert by_session.get("ses_explicit") == 1, by_session
             assert by_session.get("codex:ses_origin") == 1, by_session
         finally:
@@ -1896,6 +1898,93 @@ def test_abandoned_restart_claim_preserves_budgeted_retry(tmp_path):
             # due deadline).
             events = manager.events(job["job_id"], types=["orphaned"])["events"]
             assert events == [], "an abandoned restart claim must not emit orphaned"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+
+def test_parent_worker_pid_write_does_not_clear_pending_restart_intent(tmp_path):
+    """Review rc34 P1-1: the parent must NOT clear pending_restart_after when it
+    records worker_pid. The row is still 'launching' at that point; if the runner
+    dies before promotion, recovery must still find the pending deadline to
+    restore. Only the runner's token-guarded promotion transaction clears it."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.6)
+            state = manager._policy_state(job["job_id"])
+            deadline = state.get("restart_after")
+            assert deadline is not None
+
+            launch = manager._claim_due_restart(job["job_id"], deadline)
+            assert launch is not None
+            token = launch["claim_token"]
+            state = manager._policy_state(job["job_id"])
+            assert state.get("pending_restart_after") == deadline
+
+            # The parent records worker_pid (row still 'launching') — this must
+            # NOT clear the pending intent.
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND claim_token=? AND status='launching'",
+                    (424242, now_iso(), job["job_id"], token),
+                )
+                manager.db.commit()
+            state = manager._policy_state(job["job_id"])
+            assert state.get("pending_restart_after") == deadline, "parent worker_pid write must not clear pending restart intent"
+
+            # The runner dies before promotion: the claim is abandoned and
+            # recovery restores the deadline (budgeted retry survives).
+            with manager.db_lock:
+                stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=manager.launch_claim_timeout + 5)).isoformat().replace("+00:00", "Z")
+                manager.db.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND status='launching'",
+                    (stale, job["job_id"]),
+                )
+                manager.db.commit()
+            manager._recover_stale_launch_claims()
+            assert manager.status(job["job_id"])["status"] == "failed"
+            state = manager._policy_state(job["job_id"])
+            assert state.get("restart_after") == deadline, "deadline must be restored after abandoned pre-promotion claim"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_pending_restart_clear_is_token_guarded(tmp_path):
+    """Review rc34 P1-1: _clear_pending_restart_after must require the owning
+    claim token, so a delayed runner from a newer claim can never erase that
+    claim's pending restart intent."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.6)
+            deadline = manager._policy_state(job["job_id"]).get("restart_after")
+            assert deadline is not None
+
+            launch = manager._claim_due_restart(job["job_id"], deadline)
+            token_a = launch["claim_token"]
+            assert manager._policy_state(job["job_id"]).get("pending_restart_after") == deadline
+
+            # A stale runner holding a DIFFERENT token must not clear it.
+            manager._clear_pending_restart_after(job["job_id"], "claim_wrongtoken")
+            assert manager._policy_state(job["job_id"]).get("pending_restart_after") == deadline, "wrong token must not clear intent"
+
+            # The owning token clears it (as the promotion path does).
+            manager._clear_pending_restart_after(job["job_id"], token_a)
+            assert manager._policy_state(job["job_id"]).get("pending_restart_after") is None
         finally:
             manager.begin_shutdown()
             manager.close()

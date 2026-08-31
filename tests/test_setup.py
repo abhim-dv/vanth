@@ -41,7 +41,13 @@ def test_register_all_clients_and_idempotence(tmp_path, monkeypatch):
 
     # opencode
     oc = json.loads(opencode_path.read_text(encoding="utf-8"))
-    assert oc["mcp"]["vanth"] == {"type": "local", "command": ["vanth"], "enabled": True, "timeout": 15000}
+    assert oc["mcp"]["vanth"] == {
+        "type": "local",
+        "command": ["vanth"],
+        "enabled": True,
+        "timeout": 15000,
+        "environment": {"VANTH_HOME": str(home)},
+    }
     assert oc["mcp"]["other"] is not None  # untouched
 
     # codex

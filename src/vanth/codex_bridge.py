@@ -15,6 +15,19 @@ class CodexBridgeError(RuntimeError):
     pass
 
 
+class CodexActiveWriterError(CodexBridgeError):
+    """Codex Desktop's own app-server owns the task.
+
+    A second app-server cannot take a turn on a thread that already has an
+    active writer (``thread ... already has an active writer``). This is a
+    PERMANENT condition for a Desktop task while it is live — retrying against
+    the same wall is pointless. Callers should treat it as non-retryable
+    (dead-letter) rather than burning backoff.
+    """
+
+    pass
+
+
 _INITIALIZE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
 
 
@@ -22,9 +35,19 @@ def _default_codex_command() -> list[str]:
     configured = os.environ.get("VANTH_CODEX_BIN")
     if configured:
         return [configured]
-    win_default = Path(r"C:\codex\codex.exe")
-    if sys.platform == "win32" and win_default.exists():
-        return [str(win_default)]
+    # Prefer the Desktop-managed binary (which matches the running Desktop
+    # app's protocol) over the standalone CLI build. Desktop's binary lives
+    # under %LOCALAPPDATA%\\Programs\\codex on Windows; the legacy hard-coded
+    # C:\\codex\\codex.exe may be a different (older) build (review P0-2).
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            desktop_bin = Path(local_appdata) / "Programs" / "codex" / "codex.exe"
+            if desktop_bin.exists():
+                return [str(desktop_bin)]
+        legacy = Path(r"C:\codex\codex.exe")
+        if legacy.exists():
+            return [str(legacy)]
     return ["codex"]
 
 
@@ -130,7 +153,10 @@ class _CodexAppServer:
             if message.get("id") != request_id:
                 continue
             if "error" in message:
-                raise CodexBridgeError(self._error(message["error"].get("message", "codex app-server error")))
+                error_text = message["error"].get("message", "codex app-server error")
+                if "active writer" in error_text.lower():
+                    raise CodexActiveWriterError(self._error(f"codex desktop task already has an active writer: {error_text}"))
+                raise CodexBridgeError(self._error(error_text))
             return message.get("result", {})
 
     def _error(self, message: str) -> str:
@@ -222,8 +248,7 @@ def send_message_to_thread(
         server.response(2)
         server.send(3, "turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]})
         turn = server.response(3)
-        turn_id = (turn.get("turn") or {}).get("id")
-        # A turn/start acknowledgment only means the turn was ACCEPTED
+        turn_id = (turn.get("turn") or {}).get("id")        # A turn/start acknowledgment only means the turn was ACCEPTED
         # (status inProgress). The bridge closes the app-server process when
         # this function returns, which would kill an in-flight turn before
         # the model acts on it. Wait for turn/completed so "delivered" means
@@ -234,14 +259,79 @@ def send_message_to_thread(
         server.close()
 
 
+def _target_thread_id(target: dict[str, Any]) -> str | None:
+    return target.get("thread_id") or target.get("threadId")
+
+
+def send_message_to_desktop_thread(
+    thread_id: str,
+    prompt: str,
+    *,
+    desktop_endpoint: str | None = None,
+    timeout_seconds: int = 30,
+) -> dict[str, Any]:
+    """Deliver a wake to a Codex DESKTOP task.
+
+    Experimental (review P0-2). Codex Desktop's existing app-server OWNS the
+    task; starting a second ``codex app-server`` and calling ``thread/resume``
+    fails with ``already has an active writer``. This transport instead posts to
+    Desktop's ``send_message_to_thread`` operation.
+
+    The Desktop-native ``send_message_to_thread`` route works through the
+    already-running app, but its named-pipe protocol is undocumented. This
+    adapter treats that private protocol as experimental and NEVER quietly
+    depends on it as a stable release feature. If no endpoint is configured, the
+    delivery fails with a clear error rather than silently using the CLI
+    app-server on a Desktop task.
+    """
+    if not desktop_endpoint:
+        raise CodexBridgeError(
+            "codex_desktop target requires 'desktop_endpoint' (the Codex Desktop "
+            "app-server address); Desktop wakes are experimental because Desktop "
+            "owns the active writer for live tasks"
+        )
+    import urllib.request
+
+    payload = json.dumps({"threadId": thread_id, "prompt": prompt}, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        desktop_endpoint.rstrip("/") + "/send_message_to_thread",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        # Desktop reports writer ownership as a distinct condition; surface it
+        # as permanent so the delivery is not retried into the same wall.
+        if exc.code == 409:
+            raise CodexActiveWriterError("codex desktop task already has an active writer") from exc
+        raise CodexBridgeError(f"codex desktop send_message_to_thread returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise CodexBridgeError(f"codex desktop send_message_to_thread failed: {exc.reason}") from exc
+    if status not in (200, 201, 202, 204):
+        raise CodexBridgeError(f"codex desktop send_message_to_thread returned HTTP {status}")
+    return {"thread_id": thread_id, "desktop": True, "response": body}
+
+
 def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
     target = payload.get("target") or {}
-    thread_id = target.get("thread_id") or target.get("threadId")
+    target_type = target.get("type")
+    thread_id = _target_thread_id(target)
     prompt = payload.get("prompt")
     if not isinstance(thread_id, str) or not thread_id:
-        raise CodexBridgeError("codex_thread target requires thread_id")
+        raise CodexBridgeError(f"{target_type} target requires thread_id")
     if not isinstance(prompt, str) or not prompt:
         raise CodexBridgeError("delivery payload requires prompt")
+    if target_type == "codex_desktop":
+        return send_message_to_desktop_thread(
+            thread_id,
+            prompt,
+            desktop_endpoint=target.get("desktop_endpoint"),
+            timeout_seconds=int(target.get("timeout_seconds", 300)),
+        )
     return send_message_to_thread(
         thread_id,
         prompt,

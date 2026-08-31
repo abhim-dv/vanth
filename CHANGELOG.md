@@ -4,6 +4,81 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Wake-contract, Codex Desktop/OpenCode transport, and rc34-review crash fixes (rc35)
+
+#### Wake contract (P0)
+
+- **`daemon_wake` was only registering a target for a future event.** Calling it
+  after a job completed returned `result: ok` without waking anything. Added a
+  genuine **`job_wake_now`** MCP tool + `JobManager.wake_now` that registers the
+  target AND enqueues an immediate synthetic delivery, so a wake surfaces even
+  when the triggering event already fired. `daemon_wake` is kept as a
+  deprecated alias of `job_add_wake_target` (register-for-future only), and a
+  new `job_add_wake_target` tool names the original semantics honestly.
+- **Target-ID resolution is shared.** `start` and `wake_now` now use one
+  `resolve_wake_target_identity` helper (caller thread id injected into
+  codex targets; explicit ids always win).
+
+#### Codex Desktop vs CLI transport (P0)
+
+- **Split transports.** `codex_cli_thread` (alias `codex_thread`) keeps the
+  existing app-server implementation for unloaded CLI tasks. New
+  **`codex_desktop`** type is EXPERIMENTAL and requires an explicit
+  `desktop_endpoint`; it posts to the Desktop app's `send_message_to_thread`
+  operation instead of starting a second app-server (which Desktop rejects with
+  `already has an active writer`). It never silently falls back to the CLI
+  app-server.
+- **`active writer` is permanent/non-retryable.** A new `CodexActiveWriterError`
+  is raised when the app-server reports an active writer; the delivery
+  dispatcher dead-letters it (max_attempts=1) instead of retrying into the same
+  wall.
+- The default codex binary prefers the Desktop-managed build under
+  `%LOCALAPPDATA%\Programs\codex` over the legacy `C:\codex\codex.exe` to
+  avoid protocol drift between the CLI and Desktop builds.
+
+#### OpenCode transport (P0/P1)
+
+- **The session probe now runs against the target cwd** so a valid
+  cross-project session is not misclassified as missing and dead-lettered.
+- **Authenticated servers** are supported through non-persisted credential
+  references (env forwarding: `OPENCODE_USERNAME` / `OPENCODE_PASSWORD` /
+  `OPENCODE_TOKEN` from a referenced env var) — never written to disk.
+- **OpenCode cannot auto-inherit a session id** (`OPENCODE_SESSION_ID` is not
+  injected into MCP subprocesses), so `opencode_thread` targets now REQUIRE an
+  explicit `session_id` instead of silently defaulting to a wrong/absent value.
+- `register_opencode` now pins `VANTH_HOME` so a custom-state installation
+  cannot reach a different daemon.
+
+#### rc34-review crash/ownership fixes
+
+- **Parent no longer clears `pending_restart_after` before the runner is live
+  (P1).** Only the runner's token-guarded `launching -> running` promotion
+  clears the pending restart deadline; the parent's `worker_pid` write leaves it
+  intact so a crash between the two still restores the budgeted retry.
+  `_clear_pending_restart_after` now requires the owning claim token — a
+  delayed runner can never erase a newer claim's intent.
+- **No-token run identity is the ORIGINAL `started_at` captured before Popen
+  (P1).** The parent write no longer re-reads `started_at` after Popen (which
+  could capture a newer restart's timestamp and clobber its worker_pid).
+- **Shutdown no longer orphans another process's claim (P1).** `prepare_launch`
+  no longer mutates a `launching` row when it did not acquire the claim; a
+  lost-to-shutdown claim is left for the dispatch loop's stale-claim recovery.
+- **Heartbeat is run-identity guarded (P1).** A stale runner from run A can no
+  longer keep run B's row fresh (masking a dead B runner): heartbeat writes are
+  guarded by the claim token (or the runner's published workload pid), and the
+  heartbeat loop stops when the guarded update affects zero rows.
+- **Process termination is coupled to current ownership (P2).** Recovery,
+  reconciliation, and the runner watcher now re-validate run identity before
+  killing a workload PID, so a newer run that took ownership (or a reused PID)
+  is never terminated; a failed kill keeps the job running (no orphaned,
+  untracked workload).
+- **Test-infra portability.** `tests/remote/test_rc14_regressions.py` now
+  derives its import path from `__file__` instead of a hardcoded
+  `F:/git/vanth/tests/remote`, so the suite is reproducible from a clean
+  checkout at any path.
+
+Full suite: 645 passed, 6 skipped across two clean runs.
+
 ### Launch-claim concurrency and crash-consistency fixes (rc34)
 
 Six P1 concurrency/crash defects found in a review of the rc33 launch-token

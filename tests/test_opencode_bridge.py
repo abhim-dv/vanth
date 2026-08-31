@@ -209,3 +209,49 @@ def test_probe_skipped_when_attach_set(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert len(calls) == 1
     assert "list" not in calls[0]
+
+
+def test_probe_uses_target_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review P0-3: the session-existence probe must run against the target
+    cwd so a valid cross-project session is not classified as missing."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "list" in argv:
+            return subprocess.CompletedProcess(argv, 0, '[{"id": "ses_proj"}]\n', "")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    send_delivery_to_opencode(
+        {"prompt": "wake", "target": {"session_id": "ses_proj", "cwd": "F:/work/project"}}
+    )
+    assert len(calls) == 2
+    assert "list" in calls[0] and "--dir" in calls[0] and "F:/work/project" in calls[0]
+    assert "run" in calls[1] and "--dir" in calls[1]
+
+
+def test_auth_forwards_credential_references(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review P0-3: authenticated opencode servers are supported through
+    non-persisted credential references (forwarded via env, never written)."""
+    monkeypatch.setenv("MY_TOKEN", "s3cret")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    send_delivery_to_opencode(
+        {
+            "prompt": "wake",
+            "target": {
+                "session_id": "ses_1",
+                "skip_probe": True,
+                "auth": {"bearer_env": "MY_TOKEN", "username": "bot"},
+            },
+        }
+    )
+    assert "env" in seen
+    assert seen["env"].get("OPENCODE_TOKEN") == "s3cret"
+    assert seen["env"].get("OPENCODE_USERNAME") == "bot"

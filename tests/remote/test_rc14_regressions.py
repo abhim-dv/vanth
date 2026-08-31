@@ -5,10 +5,11 @@ import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, "F:/git/vanth/tests/remote")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_remote_ops import FakeManager, make_jobs_db, request_frame  # noqa: E402
 from test_snapshot import FakeSessionTransport, connect, make_world  # noqa: E402
 

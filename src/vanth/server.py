@@ -38,7 +38,7 @@ except Exception:
 from mcp.server.fastmcp import FastMCP
 
 from .client import VanthClient
-from .codex_bridge import send_delivery_to_codex
+from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .paths import canonical_home
@@ -217,7 +217,34 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked"}
-WAKE_TARGET_TYPES = {"local_command", "codex_thread", "opencode_thread", "webhook"}
+WAKE_TARGET_TYPES = {"local_command", "codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread", "webhook"}
+
+
+def resolve_wake_target_identity(
+    targets: list[dict[str, Any]],
+    origin_thread_id: str | None,
+) -> list[dict[str, Any]]:
+    """Copy caller-owned wake-target dicts and inject the inherited thread id.
+
+    Shared by ``start`` and ``wake_now`` so both resolve target identity the
+    same way (review P0-1b). ``origin_thread_id`` is resolved in the MCP process
+    that owns the calling task (never inferred inside the persistent daemon). A
+    copy is returned — the caller's dicts are never mutated.
+
+    ``codex_cli_thread`` inherits the calling thread id as its thread id (the
+    CLI app-server targets an unloaded CLI task). ``opencode_thread`` does NOT
+    auto-inherit: OpenCode does not inject ``OPENCODE_SESSION_ID`` into MCP
+    subprocesses (review P1-1), so an inherited value would be wrong; callers
+    must pass an explicit ``session_id`` until a client plugin supplies it.
+    """
+    copied = [dict(target) for target in targets]
+    if origin_thread_id:
+        for target in copied:
+            target_type = target.get("type")
+            if target_type in {"codex_cli_thread", "codex_thread"} and not (target.get("thread_id") or target.get("threadId")):
+                target["thread_id"] = origin_thread_id
+            # opencode_thread intentionally NOT auto-inherited (review P1-1).
+    return copied
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -274,7 +301,22 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
                 for key, value in headers.items():
                     if not isinstance(key, str) or not isinstance(value, str):
                         raise ValueError("webhook target headers must be string key/value pairs")
-        if target_type not in {"local_command", "webhook"} and command is None:
+        if target_type == "codex_desktop":
+            # Experimental Desktop transport: requires the Desktop app-server
+            # endpoint. Desktop owns the active writer for live tasks, so this
+            # is never silently routed through the CLI app-server (review P0-2).
+            desktop_endpoint = target.get("desktop_endpoint")
+            if not isinstance(desktop_endpoint, str) or not desktop_endpoint:
+                raise ValueError("codex_desktop target requires desktop_endpoint (experimental)")
+        if target_type == "opencode_thread" and command is None:
+            # OpenCode cannot auto-inherit a session id (review P1-1): the id is
+            # never injected by the client, so a missing one must be rejected
+            # here rather than silently defaulted to a wrong/absent value.
+            # thread_id/threadId is accepted as a legacy alias for session_id.
+            session_id = target.get("session_id") or target.get("sessionId") or target.get("thread_id") or target.get("threadId")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("opencode_thread target requires explicit session_id")
+        elif target_type not in {"local_command", "webhook"} and command is None:
             thread_id = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
             if not isinstance(thread_id, str) or not thread_id:
                 raise ValueError(f"{target_type} target requires thread_id")
@@ -378,21 +420,41 @@ class JobManager:
         for row in rows:
             if self._pid_alive(row["worker_pid"]):
                 continue
-            workload = self._row("SELECT pid FROM jobs WHERE job_id=?", (row["job_id"],))
-            if workload and workload["pid"]:
-                if not self._terminate_pid(int(workload["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
-                    self.logger.error("recovery could not terminate workload job_id=%s pid=%s", row["job_id"], workload["pid"])
+            job_id = row["job_id"]
+            # Review rc34 P2: revalidate OWNERSHIP immediately before the kill.
+            # The snapshot above is stale by the time we act; re-read the current
+            # row and only proceed if it is still running under OUR run identity
+            # (token for launch-path rows, worker_pid for legacy rows). This
+            # couples the kill decision to a still-current identity so a newer
+            # run that took ownership is never terminated.
+            current = self._row(
+                "SELECT status, pid, worker_pid, claim_token FROM jobs WHERE job_id=?", (job_id,)
+            )
+            if current is None or current["status"] != "running":
+                continue
+            if row["claim_token"]:
+                if current["claim_token"] != row["claim_token"]:
+                    continue
+            elif current["worker_pid"] != row["worker_pid"]:
+                continue
+            workload_pid = current["pid"]
+            if workload_pid:
+                if not self._terminate_pid(int(workload_pid), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                    # Keep the job running: the workload could not be killed and
+                    # may still be alive; orphaning it would leave a live,
+                    # untracked workload. A later pass retries.
+                    self.logger.error("recovery could not terminate workload job_id=%s pid=%s", job_id, workload_pid)
                     continue
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
-            # Review rc33 P1-5: the terminal transition is run-IDENTITY guarded
-            # (claim_token for launch-path rows, worker_pid for legacy rows) so a
-            # concurrent run that took ownership is never orphaned by this pass.
+            # The guarded terminal transition is run-IDENTITY guarded (rc33
+            # P1-5); it returns 0 if a newer run took ownership between the
+            # revalidation above and this write.
             if row["claim_token"]:
-                transitioned = self._transition_terminal(row["job_id"], terminal, claim_token=row["claim_token"])
+                transitioned = self._transition_terminal(job_id, terminal, claim_token=row["claim_token"])
             else:
-                transitioned = self._transition_terminal(row["job_id"], terminal, worker_pid=row["worker_pid"])
+                transitioned = self._transition_terminal(job_id, terminal, worker_pid=row["worker_pid"])
             if transitioned:
-                self._emit(row["job_id"], terminal, message="Job runner was not alive during recovery")
+                self._emit(job_id, terminal, message="Job runner was not alive during recovery")
 
     def _reconcile_running_jobs(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_stale_after)
@@ -404,25 +466,35 @@ class JobManager:
         for row in rows:
             if self._pid_alive(row["worker_pid"]):
                 continue
-            if row["pid"]:
-                if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
-                    self.logger.error("heartbeat reconciliation could not terminate workload job_id=%s pid=%s", row["job_id"], row["pid"])
+            job_id = row["job_id"]
+            # Review rc34 P2: revalidate ownership immediately before the kill
+            # (see _recover_jobs) so a newer run that took ownership is never
+            # terminated.
+            current = self._row(
+                "SELECT status, pid, worker_pid, claim_token FROM jobs WHERE job_id=?", (job_id,)
+            )
+            if current is None or current["status"] != "running":
+                continue
+            if row["claim_token"]:
+                if current["claim_token"] != row["claim_token"]:
+                    continue
+            elif current["worker_pid"] != row["worker_pid"]:
+                continue
+            if current["pid"]:
+                if not self._terminate_pid(int(current["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                    self.logger.error("heartbeat reconciliation could not terminate workload job_id=%s pid=%s", job_id, current["pid"])
                     continue
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
             # Review rc33 P1-5: the terminal transition is run-IDENTITY guarded.
-            # The stale-'running' snapshot was taken above; between that read and
-            # this write a newer restart can take ownership of the row (new
-            # claim_token / worker_pid). The guarded transition only finalizes
-            # the row if it is STILL running under OUR recorded worker, so an old
-            # reconciliation pass can never orphan a newer run. Claim-token rows
-            # are guarded by the token (which also pins the run identity);
-            # legacy rows are guarded by the worker_pid of the stale run.
+            # It only finalizes the row if it is STILL running under OUR recorded
+            # worker/token, so an old reconciliation pass can never orphan a
+            # newer run.
             if row["claim_token"]:
-                transitioned = self._transition_terminal(row["job_id"], terminal, claim_token=row["claim_token"])
+                transitioned = self._transition_terminal(job_id, terminal, claim_token=row["claim_token"])
             else:
-                transitioned = self._transition_terminal(row["job_id"], terminal, worker_pid=row["worker_pid"])
+                transitioned = self._transition_terminal(job_id, terminal, worker_pid=row["worker_pid"])
             if transitioned:
-                self._emit(row["job_id"], terminal, message="Runner heartbeat is stale and the runner is not alive")
+                self._emit(job_id, terminal, message="Runner heartbeat is stale and the runner is not alive")
 
     def begin_shutdown(self) -> None:
         self.shutdown_requested.set()
@@ -1323,7 +1395,7 @@ class JobManager:
             # still running. Per-target timeout_seconds overrides; thread
             # targets without one use the bridge default (300).
             target_type = row["target_type"]
-            default_timeout = 300 if target_type in {"codex_thread", "opencode_thread"} else 30
+            default_timeout = 300 if target_type in {"codex_thread", "codex_cli_thread", "codex_desktop", "opencode_thread"} else 30
             timeout = int(target.get("timeout_seconds", default_timeout))
             lease_seconds = timeout + max(1, self.delivery_lease_margin)
             due = (
@@ -1372,9 +1444,9 @@ class JobManager:
             target = delivery["payload"].get("target", {})
             command = target.get("command")
             target_type = target.get("type")
-            if not command and target_type in {"codex_thread", "opencode_thread"} and target.get("auto_dispatch") is False:
+            if not command and target_type in {"codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread"} and target.get("auto_dispatch") is False:
                 return
-            if not command and target_type not in {"codex_thread", "opencode_thread", "webhook"}:
+            if not command and target_type not in {"codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread", "webhook"}:
                 return
             delivery = self._claim_delivery(delivery["delivery_id"])
             if not delivery:
@@ -1387,10 +1459,24 @@ class JobManager:
                 except Exception as exc:
                     self._complete_delivery(delivery, "failed", str(exc))
                 return
-            if not command and target_type == "codex_thread":
+            if not command and target_type in {"codex_cli_thread", "codex_thread", "codex_desktop"}:
                 try:
                     send_delivery_to_codex(payload)
                     self._complete_delivery(delivery, "delivered")
+                except CodexActiveWriterError as exc:
+                    # Desktop owns the active writer: permanently non-retryable.
+                    # (review P0-2).
+                    effective_delivery = {
+                        **delivery,
+                        "payload": {
+                            **delivery["payload"],
+                            "target": {
+                                **delivery["payload"].get("target", {}),
+                                "max_attempts": 1,
+                            },
+                        },
+                    }
+                    self._complete_delivery(effective_delivery, "failed", str(exc))
                 except Exception as exc:
                     self._complete_delivery(delivery, "failed", str(exc))
                 return
@@ -1563,17 +1649,7 @@ class JobManager:
         # wake-target dicts are copied before any inherited id or event is
         # injected — the caller's objects are never mutated.
         if wake_targets is not None:
-            wake_targets = [dict(target) for target in wake_targets]
-        if wake_targets and origin_thread_id:
-            for target in wake_targets:
-                if target.get("type") == "opencode_thread" and not (
-                    target.get("session_id") or target.get("sessionId")
-                ):
-                    target["session_id"] = origin_thread_id
-                elif target.get("type") == "codex_thread" and not (
-                    target.get("thread_id") or target.get("threadId")
-                ):
-                    target["thread_id"] = origin_thread_id
+            wake_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
         validate_wake_targets(wake_targets)
         if notify_on:
             for target in wake_targets or []:
@@ -1662,7 +1738,14 @@ class JobManager:
                 "events_path": str(events_path),
                 "message": f"Job queued; will start when {trigger['job_id']} reaches {trigger['status']}",
             }
-        return self._launch(job_id, stdout_path, stderr_path, events_path, spec_path)
+        # The ORIGINAL started_at captured at insert time is the run identity
+        # for the no-token parent write (review rc34 P1-2). It must be captured
+        # before Popen so a restart that reuses the row while the parent is
+        # spawning cannot be overwritten with a newer run's timestamp.
+        original_started_at = created_at if not queued else None
+        return self._launch(
+            job_id, stdout_path, stderr_path, events_path, spec_path, run_identity=original_started_at
+        )
 
     def _validate_trigger(self, trigger: dict[str, str] | None) -> dict[str, str] | None:
         if trigger is None:
@@ -1704,6 +1787,7 @@ class JobManager:
         spec_path: Path,
         *,
         claim_token: str | None = None,
+        run_identity: str | None = None,
     ) -> dict[str, Any]:
         creationflags = 0
         if sys.platform == "win32":
@@ -1807,7 +1891,9 @@ class JobManager:
                 if ours:
                     # The runner beat us to the promotion (or finished the job
                     # before we recorded worker_pid). This is the success path.
-                    self._clear_pending_restart_after(job_id)
+                    # The runner already cleared any pending restart intent in
+                    # its promotion transaction (review rc34 P1-1); no clear
+                    # here.
                     return {
                         "job_id": job_id,
                         "status": current["status"],
@@ -1834,7 +1920,10 @@ class JobManager:
                     "stderr_path": str(stderr_path),
                     "events_path": str(events_path),
                 }
-            self._clear_pending_restart_after(job_id)
+            # The runner clears pending_restart_after in its token-guarded
+            # promotion transaction (review rc34 P1-1). The parent must NOT
+            # clear it here: the row may still be 'launching' and a crash before
+            # promotion would lose the already-budgeted retry.
             return {
                 "job_id": job_id,
                 "status": "running",
@@ -1847,21 +1936,24 @@ class JobManager:
         with self.db_lock:
             # No-token (start()/queued) path: the parent records 'running'
             # because the row was inserted 'running' with started_at already
-            # set. The write is guarded by the ORIGINAL started_at so a
-            # completion/cancellation/orphan transition that happened while the
-            # parent was returning from Popen (a fast job) is never overwritten
-            # (review rc33 P1-2). Guarded on status: the row may have moved to a
-            # terminal state; started_at changes on every (re)launch so a newer
-            # run's identity is preserved.
+            # set. The write is guarded by the ORIGINAL started_at captured
+            # BEFORE Popen (``run_identity``), so a completion/cancellation/
+            # orphan transition that happened while the parent was returning
+            # from Popen (a fast job) is never overwritten (review rc33 P1-2).
+            # Re-reading started_at AFTER Popen would capture a newer run's
+            # identity (review rc34 P1-2): if initial launch A is delayed long
+            # enough for A to finish and restart B to become running, A would
+            # read B's timestamp and overwrite B's worker_pid. We therefore use
+            # the caller-supplied original identity.
             row = self.db.execute(
-                "SELECT started_at, status, pid FROM jobs WHERE job_id=?", (job_id,)
+                "SELECT status FROM jobs WHERE job_id=?", (job_id,)
             ).fetchone()
             if row is not None:
                 claimed_status = row["status"]
                 if claimed_status == "running":
                     self.db.execute(
                         "UPDATE jobs SET worker_pid=?, runner_heartbeat_at=?, updated_at=? WHERE job_id=? AND status='running' AND started_at=?",
-                        (proc.pid, now_iso(), now_iso(), job_id, row["started_at"]),
+                        (proc.pid, now_iso(), now_iso(), job_id, run_identity),
                     )
                     self.db.commit()
                 elif claimed_status in TERMINAL_STATUSES:
@@ -1870,9 +1962,6 @@ class JobManager:
                     # notice the row is terminal and self-terminate; the watcher
                     # cleans up.
                     pass
-        # Outside the lock (it is not reentrant): the launch is confirmed live;
-        # clear any abandoned-claim restart intent (review rc33 P1-6).
-        self._clear_pending_restart_after(job_id)
         current = self._row("SELECT status, worker_pid FROM jobs WHERE job_id=?", (job_id,))
         return {
             "job_id": job_id,
@@ -2034,19 +2123,12 @@ class JobManager:
         self._ensure_open()
         token = self._claim_launch(job_id)
         if token is None:
-            if self._closed:
-                # A shutdown raced the claim; the row may be left 'launching'
-                # and no runner will ever be spawned for it.
-                with self.db_lock:
-                    self.db.execute(
-                        "UPDATE jobs SET status='orphaned', updated_at=? WHERE job_id=? AND status='launching' AND claim_token IS NOT NULL",
-                        (now_iso(), job_id),
-                    )
-                    self.db.commit()
-                # Restore a restart deadline that was cleared with this claim
-                # (review rc33 P1-6): shutdown before spawn must not lose the
-                # budgeted retry.
-                self._restore_pending_restart_after(job_id, token, status="orphaned")
+            # We did NOT acquire the claim — another process owns the row (or
+            # it is no longer runnable). Never mutate the row here: marking a
+            # non-null 'launching' claim orphaned could corrupt a LIVE claim
+            # owned by another manager (review rc34 P1-3). A claim that was
+            # lost to shutdown is recovered by the dispatch loop's stale-claim
+            # recovery instead.
             return None
         return self._build_launch(job_id, token)
 
@@ -2098,20 +2180,36 @@ class JobManager:
                 return True
         return self._retry_locked(restore)
 
-    def _clear_pending_restart_after(self, job_id: str) -> None:
+    def _clear_pending_restart_after(self, job_id: str, claim_token: str | None = None) -> None:
         """Clear the abandoned-claim restart intent once a launch is confirmed
         (runner promoted or the parent recorded worker_pid). Without this, a
         stale ``pending_restart_after`` from an earlier claim could be restored
-        for a LATER abandoned claim whose own deadline differs (review rc33 P1-6).
+        for a LATER abandoned claim whose own deadline differs (review rc33
+        P1-6).
+
+        Review rc34 P1-1: the clear REQUIRES the owning claim token. A delayed
+        runner from a newer claim must never erase the newer claim's intent, so
+        the update is guarded by ``claim_token`` AND the token-guarded
+        ``status='running'`` promotion (it only runs after the launch is
+        confirmed live). With no token (the start() path), a legacy no-op is
+        applied (no pending intent exists there anyway).
         """
         self._ensure_open()
 
         def clear() -> None:
             with self.db_lock:
+                if not claim_token:
+                    # Only a claim-OWNED launch clears the pending restart
+                    # intent (review rc34 P1-1). The no-token start() path has
+                    # no pending_restart_after and must never clear another
+                    # claim's.
+                    return
                 row = self.db.execute(
-                    "SELECT policy_state_json FROM jobs WHERE job_id=?", (job_id,)
+                    "SELECT claim_token, policy_state_json FROM jobs WHERE job_id=?", (job_id,)
                 ).fetchone()
                 if row is None:
+                    return
+                if row["claim_token"] != claim_token:
                     return
                 try:
                     state = json.loads(row["policy_state_json"] or "{}")
@@ -2357,11 +2455,14 @@ class JobManager:
                 # period wait) so the job can be relaunched promptly. Guarded by
                 # claim_token so a concurrent recovery can't double-orphan. A
                 # restart claim preserves its budgeted retry intent (P1-6).
-                if row["pid"]:
-                    if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
-                        self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                # Review rc34 P2: establish ownership FIRST (win the atomic
+                # launching-only transition) before terminating any workload
+                # PID, so a PID reused by a newer run is never killed.
                 recovered, target = self._abandon_launch_claim(job_id, claim_token)
                 if recovered:
+                    if row["pid"]:
+                        if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                            self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
                     self._emit(
                         job_id,
                         target,
@@ -2389,9 +2490,15 @@ class JobManager:
                     return
             elif row["worker_pid"] and watcher_pid and int(row["worker_pid"]) != int(watcher_pid):
                 return
-            if row["pid"] and not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
-                self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
-                return
+            # The runner process has exited; terminate its workload child. The
+            # kill decision is coupled to the still-current run identity
+            # revalidated above (review rc34 P2). If the kill fails, keep the
+            # job running: the workload may still be alive and orphaning it
+            # would leave a live, untracked process.
+            if row["pid"]:
+                if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
+                    self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                    return
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
             if self._transition_terminal(job_id, terminal, claim_token=claim_token):
                 self._emit(job_id, terminal, message="Job runner exited before recording a terminal status")
@@ -3794,7 +3901,11 @@ class JobManager:
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
 
     def add_wake_target(self, job_id: str, target: dict[str, Any]) -> dict[str, Any]:
-        """Schedule a self-resume wake target against a job after the fact."""
+        """Schedule a self-resume wake target against a job after the fact.
+
+        Registers a target for FUTURE events. Use :meth:`wake_now` to surface a
+        wake immediately (even if the triggering event already fired).
+        """
         self._ensure_open()
         if not isinstance(target, dict):
             raise ValueError("target must be an object")
@@ -3812,6 +3923,64 @@ class JobManager:
             inserted = self._insert_wake_targets(job_id, [{"type": target_type, "events": events, **config}], now_iso())
             self.db.commit()
         return {"result": "ok", "job_id": job_id, "target_id": inserted[0], "target_type": target_type, "events": events}
+
+    def wake_now(self, job_id: str, target: dict[str, Any], origin_thread_id: str | None = None) -> dict[str, Any]:
+        """Surface a wake NOW, regardless of whether the triggering event fired.
+
+        ``daemon_wake`` historically only registered a target for a FUTURE event
+        (review P0-1); calling it after a job completed did nothing. This is the
+        genuine "wake immediately" operation: it registers the target and
+        enqueues a synthetic delivery right away so the wake reaches the target
+        session without waiting for a matching event.
+
+        ``origin_thread_id`` is inherited the same way ``start`` inherits it
+        (``codex_cli_thread``/``codex_thread`` get the calling thread id);
+        ``opencode_thread`` requires an explicit ``session_id`` (review P1-1).
+        """
+        self._ensure_open()
+        if not isinstance(target, dict):
+            raise ValueError("target must be an object")
+        targets = resolve_wake_target_identity([target], origin_thread_id)
+        resolved = targets[0]
+        validate_wake_targets([resolved])
+        target_type = resolved.get("type")
+        events = resolved.get("events")
+        if events is None:
+            events = resolved.get("notify_on") or ["completed", "failed"]
+        if not events:
+            raise ValueError("target events must not be empty")
+        row = self._row("SELECT job_id, status FROM jobs WHERE job_id=?", (job_id,))
+        if not row:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        config = {key: value for key, value in resolved.items() if key not in {"type", "events", "notify_on"}}
+        with self.db_lock:
+            inserted = self._insert_wake_targets(job_id, [{"type": target_type, "events": events, **config}], now_iso())
+            # Enqueue an immediate synthetic delivery for the FIRST configured
+            # event so the wake fires now (review P0-1). The target is also kept
+            # registered so future events of these types keep waking it.
+            synthetic = {
+                "event_id": "evt_synthetic_" + uuid.uuid4().hex[:12],
+                "job_id": job_id,
+                "seq": 0,
+                "type": events[0],
+                "level": "info",
+                "message": "wake_now requested by caller",
+                "data": {"synthetic": True, "requested_status": row["status"]},
+                "source": "server",
+                "created_at": now_iso(),
+            }
+            self._enqueue_deliveries_uncommitted(synthetic)
+            self.db.commit()
+        return {
+            "result": "ok",
+            "job_id": job_id,
+            "target_id": inserted[0],
+            "target_type": target_type,
+            "events": events,
+            "woken": True,
+            "synthetic_event_type": events[0],
+            "requested_status": row["status"],
+        }
 
     async def send(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(None, self.send_sync, job_id, input, eof)
@@ -3912,26 +4081,15 @@ def job_start(
     # calling task (review P1-4). The persistent daemon's environment belongs
     # to whichever client originally spawned it, so resolving inside the
     # daemon would inherit a wrong/absent thread. Explicit ids always win.
+    # opencode_thread targets are NOT auto-inherited (OpenCode never injects
+    # OPENCODE_SESSION_ID — review P1-1); callers must pass session_id.
     origin_thread_id = (
         origin_thread_id
         or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("OPENCODE_SESSION_ID")
     )
-    # Copy caller-owned wake-target dicts before injecting the inherited
-    # thread id: never mutate the dict the MCP tool caller passed in.
     copied_targets: list[dict[str, Any]] | None = None
     if wake_targets is not None:
-        copied_targets = [dict(target) for target in wake_targets]
-        if origin_thread_id:
-            for target in copied_targets:
-                if target.get("type") == "opencode_thread" and not (
-                    target.get("session_id") or target.get("sessionId")
-                ):
-                    target["session_id"] = origin_thread_id
-                elif target.get("type") == "codex_thread" and not (
-                    target.get("thread_id") or target.get("threadId")
-                ):
-                    target["thread_id"] = origin_thread_id
+        copied_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
     return get_client().post(
         "/jobs",
         {
@@ -4388,8 +4546,8 @@ def _build_wake_target(
     When ``target`` is given it is returned unchanged (backward compatible).
     Otherwise a target is built from ``type`` / ``events`` / ``config``.
     ``type`` is required and must be a supported wake target type
-    (local_command, codex_thread, opencode_thread, webhook); events default to
-    ["completed", "failed"].
+    (local_command, codex_cli_thread, codex_desktop, opencode_thread, webhook);
+    events default to ["completed", "failed"].
     """
     if target is not None:
         if not isinstance(target, dict):
@@ -4406,6 +4564,51 @@ def _build_wake_target(
 
 
 @mcp.tool()
+def job_add_wake_target(
+    job_id: str,
+    target: dict[str, Any] | None = None,
+    events: list[str] | None = None,
+    type: str | None = None,
+    **config: Any,
+) -> dict[str, Any]:
+    """Register a wake target against a job for FUTURE events.
+
+    Pass a full target dict ({"type", "events", ...config}) as ``target``, or
+    use the shorthand: ``type`` (required, one of local_command /
+    codex_cli_thread / codex_desktop / opencode_thread / webhook) plus optional
+    ``events`` and extra config kwargs. Events default to ["completed", "failed"].
+
+    This only schedules a target for events that will occur AFTER registration.
+    To surface a wake immediately (even if the event already fired), use
+    ``job_wake_now``. ``opencode_thread`` targets require an explicit
+    ``session_id`` (OpenCode cannot auto-inherit one — review P1-1).
+    """
+    resolved = _build_wake_target(target, events, type, config)
+    return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
+
+
+@mcp.tool()
+def job_wake_now(
+    job_id: str,
+    target: dict[str, Any] | None = None,
+    events: list[str] | None = None,
+    type: str | None = None,
+    **config: Any,
+) -> dict[str, Any]:
+    """Surface a wake for a job IMMEDIATELY, even if the event already fired.
+
+    This is the genuine "wake now" operation (review P0-1): it registers the
+    target AND enqueues a synthetic delivery right away, so the wake reaches the
+    target session without waiting for a matching event. Use ``target`` as a
+    full dict, or the ``type`` + ``events`` + config shorthand (same contract as
+    ``job_add_wake_target``). ``opencode_thread`` targets require an explicit
+    ``session_id``.
+    """
+    resolved = _build_wake_target(target, events, type, config)
+    return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
+
+
+@mcp.tool()
 def daemon_wake(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -4413,12 +4616,11 @@ def daemon_wake(
     type: str | None = None,
     **config: Any,
 ) -> dict[str, Any]:
-    """Schedule a self-resume wake target against a running/known job.
+    """DEPRECATED: register a wake target. Kept for backward compatibility.
 
-    Pass a full target dict ({"type", "events", ...config}) as ``target``, or
-    use the shorthand: ``type`` (required, one of local_command / codex_thread
-    / opencode_thread / webhook) plus optional ``events`` and extra config kwargs.
-    Events default to ["completed", "failed"].
+    Use ``job_add_wake_target`` to register a target for future events, or
+    ``job_wake_now`` to surface a wake immediately. This alias registers the
+    target only (matching the original semantics).
     """
     resolved = _build_wake_target(target, events, type, config)
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})

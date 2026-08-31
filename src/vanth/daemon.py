@@ -733,6 +733,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().metric_ingest(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wake"):
                 ok(self, get_manager().add_wake_target(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wake-now"):
+                ok(self, get_manager().wake_now(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/artifacts"):
                 ok(self, get_manager().artifact_add(parsed.path.split("/")[2], **payload))
             elif parsed.path == "/artifacts/put":

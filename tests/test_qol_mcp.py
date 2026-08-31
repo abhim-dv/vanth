@@ -250,6 +250,51 @@ def test_daemon_wake_default_events_and_errors(tmp_path):
         manager.close()
 
 
+def test_wake_now_enqueues_immediate_delivery_after_completion(tmp_path):
+    """Review P0-1: daemon_wake historically only registered a target for a
+    FUTURE event; calling it after a job completed did nothing. wake_now is the
+    genuine immediate-wake operation: it enqueues a delivery right away even
+    though the triggering event already fired."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = start_job(manager, "print('done already')")
+        wait_event(manager, job_id, "completed")
+
+        result = manager.wake_now(
+            job_id,
+            {"type": "local_command", "events": ["completed"], "command": [sys.executable, "-c", "import sys; sys.exit(0)"]},
+        )
+        assert result["result"] == "ok"
+        assert result["woken"] is True
+        assert result["synthetic_event_type"] == "completed"
+
+        deadline = time.monotonic() + 10
+        deliveries = []
+        while time.monotonic() < deadline:
+            deliveries = manager.deliveries(job_id)["deliveries"]
+            if any(d["target_type"] == "local_command" and d["status"] in ("pending", "delivered", "retrying", "failed") for d in deliveries):
+                break
+            time.sleep(0.05)
+        assert any(
+            d["target_type"] == "local_command"
+            for d in deliveries
+        ), "wake_now must create a delivery even after the event already fired"
+    finally:
+        manager.close()
+
+
+def test_wake_now_opencode_requires_explicit_session(tmp_path):
+    """Review P1-1: OpenCode cannot auto-inherit a session id, so wake_now must
+    reject an opencode_thread target without an explicit session_id."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = start_job(manager, "print('x')")
+        with pytest.raises(ValueError, match="explicit session_id"):
+            manager.wake_now(job_id, {"type": "opencode_thread", "events": ["completed"]})
+    finally:
+        manager.close()
+
+
 def test_cleanup_preview_lists_without_deleting(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:

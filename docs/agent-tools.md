@@ -23,10 +23,11 @@ The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_artifact_add`, `job_artifacts`, `job_dashboard`.
 
 The following are part of the planned v1.4 surface (in progress, not yet
-released): `job_metric_ingest`, `job_artifact_read`, `daemon_wake`,
-`job_cleanup_preview`. The parallel additions `job_rerun` override params,
-`job_status_batch`, `job_wait` `return_progress`, and `job_tail` `follow` /
-`timeout_seconds` are documented below as part of the planned surface.
+released): `job_metric_ingest`, `job_artifact_read`, `job_add_wake_target`,
+`job_wake_now`, `job_cleanup_preview`. The parallel additions `job_rerun`
+override params, `job_status_batch`, `job_wait` `return_progress`, and
+`job_tail` `follow` / `timeout_seconds` are documented below as part of the
+planned surface.
 
 ---
 
@@ -741,24 +742,28 @@ out of a job — the read side of `job_artifact_add`.
   "sha256": "...", "meta": {}, "content": "...", "truncated": false }
 ```
 
-### `daemon_wake`
+### `job_add_wake_target`
 
-Request the daemon's attention from inside a job context — surfaces an
-agent-facing wake without requiring a matching wake-target event.
+Register a wake target against a job for **future** events. This only fires
+when the triggering event occurs **after** registration — it does NOT surface
+a wake for an event that already happened. Use `job_wake_now` for that.
 
 Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
-the shorthand: `type` (required, one of `local_command` / `codex_thread` /
-`opencode_thread` / `webhook`) plus optional `events` and extra config kwargs.
-Events default to `["completed", "failed"]`.
+the shorthand: `type` (required, one of `local_command` / `codex_cli_thread` /
+`codex_desktop` / `opencode_thread` / `webhook`) plus optional `events` and
+extra config kwargs. Events default to `["completed", "failed"]`.
+
+`opencode_thread` targets require an explicit `session_id` — OpenCode does not
+inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit it.
 
 **Parameters**
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `job_id` | `string` | required | Job to wake on |
+| `job_id` | `string` | required | Job to register the wake target on |
 | `target` | `object?` | `None` | Full wake-target dict (`{type, events, ...config}`); given, used as-is |
 | `events` | `string[]?` | `["completed","failed"]` | Shorthand; non-empty list of event types (e.g. `["checkpoint"]`) |
-| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_thread` / `opencode_thread` / `webhook` |
+| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `codex_desktop` / `opencode_thread` / `webhook` |
 | `...` | `object?` | `{}` | Extra config kwargs merged into the shorthand target |
 
 **Response**
@@ -770,6 +775,28 @@ Events default to `["completed", "failed"]`.
 
 Errors: `ValueError` when `events` is empty or not a list of strings, or
 `type` is empty.
+
+### `job_wake_now`
+
+Surface a wake **immediately**, even if the triggering event already fired.
+This is the genuine "wake now" operation: it registers the target AND enqueues
+a synthetic delivery right away, so the wake reaches the target session without
+waiting for a matching event. Same target contract as `job_add_wake_target`;
+`opencode_thread` targets require an explicit `session_id`.
+
+**Response**
+
+```json
+{ "result": "ok", "job_id": "job_abc123", "target_id": "target_...",
+  "target_type": "local_command", "events": ["completed", "failed"],
+  "woken": true, "synthetic_event_type": "completed", "requested_status": "completed" }
+```
+
+### `daemon_wake` (deprecated)
+
+Kept for backward compatibility. Alias of `job_add_wake_target` — it registers
+a wake target for future events only. Use `job_wake_now` to surface a wake
+immediately, or `job_add_wake_target` to register a target.
 
 ### `job_cleanup_preview`
 

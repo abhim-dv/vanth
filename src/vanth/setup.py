@@ -109,6 +109,10 @@ def register_opencode(path: Path, home: Path) -> tuple[bool, str]:
             "command": ["vanth"],
             "enabled": True,
             "timeout": 15000,
+            # Review P0-3: without VANTH_HOME, a custom-state installation could
+            # reach a different daemon (the default home). Always pin the
+            # configured home so MCP talks to THIS daemon.
+            "environment": {"VANTH_HOME": str(home)},
         }
         return data
 

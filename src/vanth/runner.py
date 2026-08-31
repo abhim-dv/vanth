@@ -66,9 +66,11 @@ def _publish_workload(
         if changed and claim_token:
             # The launch is confirmed live; clear any abandoned-claim restart
             # intent left over from the claim transaction (review rc33 P1-6).
-            # Outside the lock above: _clear_pending_restart_after acquires
-            # db_lock itself and the lock is not reentrant.
-            manager._clear_pending_restart_after(job_id)
+            # The clear is token-guarded (review rc34 P1-1): it only applies to
+            # OUR claim's intent, so a delayed runner can never erase a newer
+            # claim's pending deadline. Outside the lock above because the lock
+            # is not reentrant.
+            manager._clear_pending_restart_after(job_id, claim_token)
         return changed
 
     return bool(manager._retry_locked(publish))
@@ -211,19 +213,42 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
     heartbeat_stop = threading.Event()
 
     def heartbeat() -> None:
-        def beat() -> None:
+        # Review rc34 P1-4: the heartbeat write is run-IDENTITY guarded so a
+        # stale runner from run A can never keep run B's row fresh (masking a
+        # dead B runner). Claim-token runs are guarded by claim_token; legacy
+        # runs are guarded by the workload pid THIS runner published (the row's
+        # worker_pid is the parent-observed Popen pid, which differs from the
+        # runner's os.getpid() on Windows). When the guarded update affects zero
+        # rows, the row is no longer ours (a newer run owns it, or it is
+        # terminal) — stop the heartbeat loop.
+        def beat() -> int:
             with manager.db_lock:
-                manager.db.execute(
-                    "UPDATE jobs SET runner_heartbeat_at=?, updated_at=? WHERE job_id=? AND status='running'",
-                    (now_iso(), now_iso(), job_id),
-                )
+                if claim_token:
+                    changed = manager.db.execute(
+                        "UPDATE jobs SET runner_heartbeat_at=?, updated_at=? "
+                        "WHERE job_id=? AND status='running' AND claim_token=?",
+                        (now_iso(), now_iso(), job_id, claim_token),
+                    ).rowcount
+                else:
+                    changed = manager.db.execute(
+                        "UPDATE jobs SET runner_heartbeat_at=?, updated_at=? "
+                        "WHERE job_id=? AND status='running' AND pid=?",
+                        (now_iso(), now_iso(), job_id, proc.pid),
+                    ).rowcount
                 manager.db.commit()
+            return changed
 
         while not heartbeat_stop.wait(manager.heartbeat_interval):
             try:
-                manager._retry_locked(beat)
+                changed = manager._retry_locked(beat)
             except Exception:
                 manager.logger.exception("runner heartbeat update failed job_id=%s", job_id)
+                continue
+            if changed == 0:
+                # The row is no longer ours (terminal, or a newer run owns the
+                # token/pid). Stop heartbeating to avoid masking recovery.
+                heartbeat_stop.set()
+                break
 
     heartbeat_thread = threading.Thread(target=heartbeat, name=f"vanth-heartbeat-{job_id}", daemon=True)
     heartbeat_thread.start()
