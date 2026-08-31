@@ -374,7 +374,7 @@ class JobManager:
             return False
 
     def _recover_jobs(self) -> None:
-        rows = self.db.execute("SELECT job_id, worker_pid, stop_requested_at FROM jobs WHERE status='running'").fetchall()
+        rows = self.db.execute("SELECT job_id, worker_pid, stop_requested_at, claim_token FROM jobs WHERE status='running'").fetchall()
         for row in rows:
             if self._pid_alive(row["worker_pid"]):
                 continue
@@ -384,14 +384,21 @@ class JobManager:
                     self.logger.error("recovery could not terminate workload job_id=%s pid=%s", row["job_id"], workload["pid"])
                     continue
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
-            if self._transition_terminal(row["job_id"], terminal):
+            # Review rc33 P1-5: the terminal transition is run-IDENTITY guarded
+            # (claim_token for launch-path rows, worker_pid for legacy rows) so a
+            # concurrent run that took ownership is never orphaned by this pass.
+            if row["claim_token"]:
+                transitioned = self._transition_terminal(row["job_id"], terminal, claim_token=row["claim_token"])
+            else:
+                transitioned = self._transition_terminal(row["job_id"], terminal, worker_pid=row["worker_pid"])
+            if transitioned:
                 self._emit(row["job_id"], terminal, message="Job runner was not alive during recovery")
 
     def _reconcile_running_jobs(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_stale_after)
         cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
         rows = self.db.execute(
-            "SELECT job_id, worker_pid, pid, stop_requested_at FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < ?)",
+            "SELECT job_id, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < ?)",
             (cutoff_text,),
         ).fetchall()
         for row in rows:
@@ -402,7 +409,19 @@ class JobManager:
                     self.logger.error("heartbeat reconciliation could not terminate workload job_id=%s pid=%s", row["job_id"], row["pid"])
                     continue
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
-            if self._transition_terminal(row["job_id"], terminal):
+            # Review rc33 P1-5: the terminal transition is run-IDENTITY guarded.
+            # The stale-'running' snapshot was taken above; between that read and
+            # this write a newer restart can take ownership of the row (new
+            # claim_token / worker_pid). The guarded transition only finalizes
+            # the row if it is STILL running under OUR recorded worker, so an old
+            # reconciliation pass can never orphan a newer run. Claim-token rows
+            # are guarded by the token (which also pins the run identity);
+            # legacy rows are guarded by the worker_pid of the stale run.
+            if row["claim_token"]:
+                transitioned = self._transition_terminal(row["job_id"], terminal, claim_token=row["claim_token"])
+            else:
+                transitioned = self._transition_terminal(row["job_id"], terminal, worker_pid=row["worker_pid"])
+            if transitioned:
                 self._emit(row["job_id"], terminal, message="Runner heartbeat is stale and the runner is not alive")
 
     def begin_shutdown(self) -> None:
@@ -418,6 +437,8 @@ class JobManager:
         exit_code: int | None = None,
         *,
         claim_token: str | None = None,
+        worker_pid: int | None = None,
+        require_launching: bool = False,
     ) -> bool:
         if status not in TERMINAL_STATUSES:
             raise ValueError(f"invalid terminal status: {status}")
@@ -429,15 +450,37 @@ class JobManager:
                 if claim_token:
                     # Claim-OWNED transition (review rc32 P1-3): only the run
                     # holding this token may move the row to a terminal state.
-                    # Guards both the 'running' (normal) and 'launching'
-                    # (runner failed before publishing) states so a stale run
-                    # can never clobber a newer launch, and a run that finished
-                    # while the row was still 'launching' still records its
-                    # terminal outcome (no more rejected transitions).
+                    # By default this guards both the 'running' (normal) and
+                    # 'launching' (runner failed before publishing) states so a
+                    # stale run can never clobber a newer launch, and a run that
+                    # finished while the row was still 'launching' still records
+                    # its terminal outcome (no more rejected transitions).
+                    #
+                    # require_launching (review rc33 P1-4): stale-claim recovery
+                    # must NOT orphan a runner that already promoted to
+                    # 'running'. Only the atomic launching-only transition
+                    # establishes ownership; after it wins, processes are
+                    # reconciled. If the runner promoted first, the guard returns
+                    # 0 and the live run is left alone.
+                    if require_launching:
+                        status_guard = "status='launching'"
+                    else:
+                        status_guard = "status IN ('running','launching')"
                     changed = self.db.execute(
                         "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL "
-                        "WHERE job_id=? AND claim_token=? AND status IN ('running','launching')",
+                        f"WHERE job_id=? AND claim_token=? AND {status_guard}",
                         (status, exit_code, stamp, stamp, job_id, claim_token),
+                    ).rowcount
+                elif worker_pid is not None:
+                    # No-token RUN-IDENTITY guarded transition (review rc33
+                    # P1-5): only finalize a stale row if the recorded worker is
+                    # still OUR process. A newer restart that took ownership has
+                    # a different worker_pid (and status may now be running under
+                    # a new run), so this guard cannot orphan a newer run.
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL "
+                        "WHERE job_id=? AND status='running' AND worker_pid=?",
+                        (status, exit_code, stamp, stamp, job_id, worker_pid),
                     ).rowcount
                 else:
                     changed = self.db.execute(
@@ -1636,13 +1679,16 @@ class JobManager:
             raise ValueError(f"Unknown trigger job_id: {job_id}")
         return {"job_id": job_id, "status": status}
 
-    def _write_spec(self, job_id: str, spec: dict[str, Any]) -> Path:
+    def _write_spec(self, job_id: str, spec: dict[str, Any], *, spec_name: str | None = None) -> Path:
         """Write a job's run spec JSON and return its path.
 
         Shared by ``start`` and the remote dispatcher so both local and remote
-        launches reuse one serialization path.
+        launches reuse one serialization path. ``spec_name`` overrides the
+        default ``{job_id}.json``; the launch path passes a CLAIM-SPECIFIC name
+        (``{job_id}-{claim_token}.json``) so a delayed runner from an old claim
+        can never read the replacement token of a newer run (review rc33 P1-3).
         """
-        path = self.specs_dir / f"{job_id}.json"
+        path = self.specs_dir / (spec_name or f"{job_id}.json")
         path.write_text(
             json.dumps(spec, separators=(",", ":")),
             encoding="utf-8",
@@ -1666,7 +1712,7 @@ class JobManager:
         try:
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "vanth.runner", str(self.home), job_id],
+                    [sys.executable, "-m", "vanth.runner", str(self.home), job_id, claim_token and f"{job_id}-{claim_token}.json" or f"{job_id}.json"],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=runner_log,
@@ -1694,6 +1740,12 @@ class JobManager:
                             (stamp, stamp, job_id),
                         )
                     self.db.commit()
+                # Review rc33 P1-6: a RESTART claim whose spawn failed must keep
+                # its budgeted retry intent. Restore the pending deadline so
+                # restart policy relaunches after the backoff instead of treating
+                # this as a fresh (unbudgeted) failure.
+                if claim_token:
+                    self._restore_pending_restart_after(job_id, claim_token)
                 self._emit(
                     job_id,
                     "failed",
@@ -1731,15 +1783,48 @@ class JobManager:
                 ).rowcount
                 self.db.commit()
             if wrote != 1:
-                # The claim was lost between spawn and this write (recovery
-                # reclaimed it, or a newer launch owns the row). Never leave a
+                # The worker_pid write returned 0. That can mean two very
+                # different things:
+                #
+                # 1. OWNED SUCCESS: our runner already promoted this same claim
+                #    launching -> running (and possibly already finished it).
+                #    The runner is a VALID run of the job — never terminate it.
+                # 2. CLAIM LOSS: recovery reclaimed the claim, or a newer launch
+                #    owns the row (claim_token mismatched). The runner is for a
+                #    run that is no longer ours — terminate it.
+                #
+                # Distinguish by inspecting claim_token/status: same token with
+                # status 'running' (or any terminal) is owned success; only a
+                # mismatched token represents claim loss (review rc33 P1-1).
+                current = self._row(
+                    "SELECT status, claim_token, pid, worker_pid FROM jobs WHERE job_id=?", (job_id,)
+                )
+                ours = bool(
+                    current
+                    and current["claim_token"] == claim_token
+                    and current["status"] in {"running", "launching"} | TERMINAL_STATUSES
+                )
+                if ours:
+                    # The runner beat us to the promotion (or finished the job
+                    # before we recorded worker_pid). This is the success path.
+                    self._clear_pending_restart_after(job_id)
+                    return {
+                        "job_id": job_id,
+                        "status": current["status"],
+                        "worker_pid": current["worker_pid"] or proc.pid,
+                        "pid": current["pid"],
+                        "stdout_path": str(stdout_path),
+                        "stderr_path": str(stderr_path),
+                        "events_path": str(events_path),
+                        "message": "Job started",
+                    }
+                # The claim was lost between spawn and this write. Never leave a
                 # runner for a run that is no longer ours.
                 self.processes.pop(job_id, None)
                 try:
                     self._terminate_pid(proc.pid, force=True, deadline=time.monotonic() + self.recovery_kill_timeout)
                 except Exception:
                     self.logger.exception("could not terminate leaked runner job_id=%s pid=%s", job_id, proc.pid)
-                current = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))
                 return {
                     "job_id": job_id,
                     "status": (current["status"] if current else "lost"),
@@ -1749,6 +1834,7 @@ class JobManager:
                     "stderr_path": str(stderr_path),
                     "events_path": str(events_path),
                 }
+            self._clear_pending_restart_after(job_id)
             return {
                 "job_id": job_id,
                 "status": "running",
@@ -1759,15 +1845,39 @@ class JobManager:
                 "message": "Job started",
             }
         with self.db_lock:
-            self.db.execute(
-                "UPDATE jobs SET status='running', started_at=?, runner_heartbeat_at=?, worker_pid=?, updated_at=?, exit_code=NULL, ended_at=NULL WHERE job_id=?",
-                (now_iso(), now_iso(), proc.pid, now_iso(), job_id),
-            )
-            self.db.commit()
+            # No-token (start()/queued) path: the parent records 'running'
+            # because the row was inserted 'running' with started_at already
+            # set. The write is guarded by the ORIGINAL started_at so a
+            # completion/cancellation/orphan transition that happened while the
+            # parent was returning from Popen (a fast job) is never overwritten
+            # (review rc33 P1-2). Guarded on status: the row may have moved to a
+            # terminal state; started_at changes on every (re)launch so a newer
+            # run's identity is preserved.
+            row = self.db.execute(
+                "SELECT started_at, status, pid FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is not None:
+                claimed_status = row["status"]
+                if claimed_status == "running":
+                    self.db.execute(
+                        "UPDATE jobs SET worker_pid=?, runner_heartbeat_at=?, updated_at=? WHERE job_id=? AND status='running' AND started_at=?",
+                        (proc.pid, now_iso(), now_iso(), job_id, row["started_at"]),
+                    )
+                    self.db.commit()
+                elif claimed_status in TERMINAL_STATUSES:
+                    # A fast job completed/cancelled/orphaned while we were
+                    # returning from Popen. Do not resurrect it. The runner will
+                    # notice the row is terminal and self-terminate; the watcher
+                    # cleans up.
+                    pass
+        # Outside the lock (it is not reentrant): the launch is confirmed live;
+        # clear any abandoned-claim restart intent (review rc33 P1-6).
+        self._clear_pending_restart_after(job_id)
+        current = self._row("SELECT status, worker_pid FROM jobs WHERE job_id=?", (job_id,))
         return {
             "job_id": job_id,
-            "status": "running",
-            "worker_pid": proc.pid,
+            "status": (current["status"] if current else "running"),
+            "worker_pid": current["worker_pid"] if current else proc.pid,
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
             "events_path": str(events_path),
@@ -1797,6 +1907,15 @@ class JobManager:
         the restart-deadline clear atomic with the launch claim (review rc32
         P1-4): a crash between the two can no longer consume the restart budget
         without establishing launch ownership.
+
+        Review rc33 P1-6: if a restart claim is cleared (``restart_after`` ->
+        ``None``) but the launch never spawns (spec-construction failure, disk
+        error, or crash before spawn), the claimed-but-abandoned row would be
+        recovered ``orphaned`` and restart policy (which only watches
+        failed/completed rows) would lose the already-budgeted retry. To keep
+        the retry intent durable, the claim transaction ALSO records the cleared
+        deadline under ``pending_restart_after``; ``_restore_abandoned_claim``
+        re-persists it if the claimed launch is abandoned pre-spawn.
         """
         def claim() -> str | None:
             with self.db_lock:
@@ -1822,7 +1941,13 @@ class JobManager:
                         if state.get(key) != value:
                             return None
                 if policy_state_updates is not None:
+                    # Record the pre-clear value so an abandoned claim can
+                    # restore the restart intent (review rc33 P1-6).
+                    cleared = {k: state.get(k) for k in policy_state_updates}
                     state.update(policy_state_updates)
+                    for key, value in cleared.items():
+                        if value is not None and key == "restart_after":
+                            state["pending_restart_after"] = value
                 token = "claim_" + uuid.uuid4().hex[:16]
                 changed = self.db.execute(
                     "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=? "
@@ -1876,7 +2001,7 @@ class JobManager:
                 "interactive": False,
                 "claim_token": token,
             }
-        spec_path = self._write_spec(job_id, spec)
+        spec_path = self._write_spec(job_id, spec, spec_name=f"{job_id}-{token}.json")
         return {
             "job_id": job_id,
             "stdout_path": Path(spec["stdout_path"]),
@@ -1884,6 +2009,7 @@ class JobManager:
             "events_path": self.events_dir / f"{job_id}.jsonl",
             "spec_path": spec_path,
             "claim_token": token,
+            "spec_file": f"{job_id}-{token}.json",
         }
 
     def prepare_launch(self, job_id: str) -> dict[str, Any] | None:
@@ -1917,8 +2043,134 @@ class JobManager:
                         (now_iso(), job_id),
                     )
                     self.db.commit()
+                # Restore a restart deadline that was cleared with this claim
+                # (review rc33 P1-6): shutdown before spawn must not lose the
+                # budgeted retry.
+                self._restore_pending_restart_after(job_id, token, status="orphaned")
             return None
         return self._build_launch(job_id, token)
+
+    def _restore_pending_restart_after(self, job_id: str, claim_token: str | None, status: str | None = None) -> bool:
+        """Restore a restart deadline that was cleared atomically with a claim
+        whose launch never spawned (review rc33 P1-6).
+
+        ``_claim_due_restart`` records the pre-clear ``restart_after`` deadline
+        under ``pending_restart_after`` in policy_state. If the claimed launch is
+        abandoned pre-spawn (spec-construction failure, disk error, spawn
+        failure, or crash before spawn -> stale-claim recovery), the row ends
+        ``failed`` or ``orphaned`` and restart policy (which watches
+        failed/completed rows) would lose the already-budgeted retry. This
+        restores the deadline so the budgeted relaunch still happens. It is a
+        guarded no-op when the claim is no longer ours or no deadline was
+        pending. ``status`` optionally constrains the row status (e.g.
+        ``'orphaned'`` for stale-claim recovery).
+        """
+        self._ensure_open()
+
+        def restore() -> bool:
+            with self.db_lock:
+                row = self.db.execute(
+                    "SELECT claim_token, policy_state_json, status FROM jobs WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                if claim_token and row["claim_token"] != claim_token:
+                    return False
+                if status is not None and row["status"] != status:
+                    return False
+                try:
+                    state = json.loads(row["policy_state_json"] or "{}")
+                except (TypeError, ValueError):
+                    state = {}
+                if not isinstance(state, dict):
+                    state = {}
+                pending = state.get("pending_restart_after")
+                if not pending:
+                    return False
+                state["restart_after"] = pending
+                state.pop("pending_restart_after", None)
+                self.db.execute(
+                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
+                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
+                )
+                self.db.commit()
+                return True
+        return self._retry_locked(restore)
+
+    def _clear_pending_restart_after(self, job_id: str) -> None:
+        """Clear the abandoned-claim restart intent once a launch is confirmed
+        (runner promoted or the parent recorded worker_pid). Without this, a
+        stale ``pending_restart_after`` from an earlier claim could be restored
+        for a LATER abandoned claim whose own deadline differs (review rc33 P1-6).
+        """
+        self._ensure_open()
+
+        def clear() -> None:
+            with self.db_lock:
+                row = self.db.execute(
+                    "SELECT policy_state_json FROM jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    return
+                try:
+                    state = json.loads(row["policy_state_json"] or "{}")
+                except (TypeError, ValueError):
+                    state = {}
+                if not isinstance(state, dict) or "pending_restart_after" not in state:
+                    return
+                state.pop("pending_restart_after", None)
+                self.db.execute(
+                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
+                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
+                )
+                self.db.commit()
+        self._retry_locked(clear)
+
+    def _abandon_launch_claim(self, job_id: str, claim_token: str | None) -> tuple[bool, str]:
+        """Recover an abandoned ``launching`` claim (never spawned) to a terminal
+        state, preserving any budgeted restart intent (review rc33 P1-4/P1-6).
+
+        The terminal transition is an ATOMIC launching-only, token-guarded
+        UPDATE: it returns True ONLY if the runner has not already promoted the
+        claim to ``running`` (rc33 P1-4). If the claim carried a pending restart
+        deadline (``pending_restart_after`` set by ``_claim_due_restart``), the
+        row is recovered as ``failed`` with the deadline restored so restart
+        policy (which only watches failed/completed rows) relaunches the
+        already-budgeted retry (rc33 P1-6); otherwise it is recovered as
+        ``orphaned``. Returns ``(recovered, target_status)``.
+        """
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT policy_state_json FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        pending = None
+        if row:
+            try:
+                state = json.loads(row["policy_state_json"] or "{}")
+                pending = state.get("pending_restart_after") if isinstance(state, dict) else None
+            except (TypeError, ValueError):
+                pending = None
+        target = "failed" if pending else "orphaned"
+        if claim_token:
+            recovered = self._transition_terminal(job_id, target, claim_token=claim_token, require_launching=True)
+        else:
+            # Legacy row claimed before the claim_token column existed (never a
+            # restart claim, so target is always 'orphaned').
+            def recover_legacy() -> bool:
+                with self.db_lock:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status=?, ended_at=?, updated_at=? "
+                        "WHERE job_id=? AND status='launching' AND claim_token IS NULL",
+                        (target, now_iso(), now_iso(), job_id),
+                    ).rowcount
+                    self.db.commit()
+                return bool(changed)
+            recovered = self._retry_locked(recover_legacy)
+        if recovered and pending:
+            # Restore the budgeted deadline so restart policy relaunches.
+            self._restore_pending_restart_after(job_id, claim_token, status=target)
+        return recovered, target
 
     def _recover_stale_launch_claims(self) -> None:
         """Reclaim ``launching`` rows whose claim went stale (crash between
@@ -1934,6 +2186,14 @@ class JobManager:
         terminate before the row is freed, and the recovery emits an
         ``orphaned`` event through the normal terminal-transition path so waits,
         wake targets, and feeds are notified.
+
+        Review rc33 P1-4: recovery NEVER orphans a run the runner already
+        promoted. The terminal transition is an ATOMIC launching-only,
+        token-guarded UPDATE (``status='launching' AND claim_token=?``). Only
+        after recovery WINS that transition (rowcount 1) does it know the runner
+        cannot still promote — then (and only then) it reconciles/kills any
+        workload PID. If the runner promoted between the stale snapshot and the
+        transition, the guard returns 0 and the live workload is left alone.
         """
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.launch_claim_timeout)).isoformat().replace("+00:00", "Z")
         try:
@@ -1951,27 +2211,36 @@ class JobManager:
                     rows_to_recover.append(row)
             for row in rows_to_recover:
                 job_id = row["job_id"]
+                # ATOMIC ownership win first: the runner can promote the same
+                # token launching -> running between the snapshot above and this
+                # transition. The launching-only, token-guarded UPDATE is what
+                # decides: if the runner already owns 'running', it returns 0 and
+                # we leave the live run alone (review rc33 P1-4). A claim that
+                # carried a pending restart deadline recovers as 'failed' with
+                # the deadline restored so restart policy relaunches (P1-6).
+                recovered, target = self._abandon_launch_claim(job_id, row["claim_token"])
+                if not recovered:
+                    # The runner won the promotion (or a newer launch owns the
+                    # row). Either way the row is no longer ours to orphan; the
+                    # live workload must be left untouched.
+                    continue
+                # We own the abandoned launch now: reconcile processes. A
+                # workload child may have outlived its runner; terminate it
+                # before emitting the orphaned event (review rc32 P1-3).
                 if row["pid"]:
-                    # A workload child outlived its runner; terminate it before
-                    # freeing the row (review rc32 P1-3).
                     if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
                         self.logger.error("stale-claim recovery could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
                         continue
-                if row["claim_token"]:
-                    recovered = self._transition_terminal(job_id, "orphaned", claim_token=row["claim_token"])
+                if target == "failed":
+                    self._emit(
+                        job_id,
+                        "failed",
+                        message="Launch claim went stale before the runner published its workload; restart intent preserved",
+                        data={"claim_token": row["claim_token"]},
+                        level="error",
+                        source="server",
+                    )
                 else:
-                    # Legacy row claimed before the claim_token column existed.
-                    def recover_legacy() -> bool:
-                        with self.db_lock:
-                            changed = self.db.execute(
-                                "UPDATE jobs SET status='orphaned', ended_at=?, updated_at=? "
-                                "WHERE job_id=? AND status='launching' AND claim_token IS NULL",
-                                (now_iso(), now_iso(), job_id),
-                            ).rowcount
-                            self.db.commit()
-                        return bool(changed)
-                    recovered = self._retry_locked(recover_legacy)
-                if recovered:
                     self._emit(
                         job_id,
                         "orphaned",
@@ -2086,16 +2355,21 @@ class JobManager:
                 # either the child spawn failed inside the runner or the runner
                 # was killed. The claim is stale; recover it NOW (no grace
                 # period wait) so the job can be relaunched promptly. Guarded by
-                # claim_token so a concurrent recovery can't double-orphan.
+                # claim_token so a concurrent recovery can't double-orphan. A
+                # restart claim preserves its budgeted retry intent (P1-6).
                 if row["pid"]:
                     if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
                         self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
-                if self._transition_terminal(job_id, "orphaned", claim_token=claim_token):
+                recovered, target = self._abandon_launch_claim(job_id, claim_token)
+                if recovered:
                     self._emit(
                         job_id,
-                        "orphaned",
-                        message="Job runner exited before its workload was published",
+                        target,
+                        message="Job runner exited before its workload was published"
+                        if target == "orphaned"
+                        else "Job runner exited before its workload was published; restart intent preserved",
                         data={"claim_token": claim_token},
+                        level="error" if target == "failed" else "info",
                         source="server",
                     )
                 return
@@ -3383,6 +3657,12 @@ class JobManager:
                         str(self.home / "specs" / f"{job_id}.json"),
                         str(self.home / "stdin" / f"{job_id}.in"),
                     ]
+                    # Claim-specific specs (specs/{job_id}-{claim_token}.json)
+                    # also belong to this job and must be cleaned up (review
+                    # rc33 P1-3 introduced the claim-specific spec naming).
+                    if (self.home / "specs").exists():
+                        for spec_file in (self.home / "specs").glob(f"{job_id}-*.json"):
+                            artifacts.append(str(spec_file))
                     self.db.execute(
                         "INSERT OR IGNORE INTO cleanup_tombstones(tombstone_id, job_id, artifacts_json, created_at) VALUES (?, ?, ?, ?)",
                         ("clean_" + uuid.uuid4().hex[:16], job_id, json.dumps(artifacts, separators=(",", ":")), now_iso()),

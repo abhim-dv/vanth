@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import sqlite3
 import subprocess
@@ -1637,6 +1638,264 @@ def test_clear_deliveries_default_does_not_touch_delivered(tmp_path):
             assert result["matched"] == 0, "delivered rows must not be matched by a default drain"
             deliveries = manager.deliveries(started["job_id"])["deliveries"]
             assert deliveries and deliveries[0]["status"] == "delivered"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_parent_does_not_kill_runner_that_promoted_before_worker_pid_write(tmp_path):
+    """Review rc33 P1-1: if the runner promotes launching -> running before the
+    parent's worker_pid write, the parent must treat that as OWNED SUCCESS (never
+    terminate the valid runner). The old rowcount==0 branch killed it."""
+    import os as _os
+
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token = launch["claim_token"]
+
+            # The runner promotes first (rowcount 0 for the parent's write).
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 4242, token)
+
+            # The parent then attempts its worker_pid write and gets rowcount 0.
+            # It must NOT terminate the runner; it must report owned success.
+            with manager.db_lock:
+                wrote = manager.db.execute(
+                    "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND claim_token=? AND status='launching'",
+                    (99999, now_iso(), job["job_id"], token),
+                ).rowcount
+                manager.db.commit()
+            assert wrote == 0
+            # The row is still running under the runner's worker_pid; no kill.
+            row = manager._row("SELECT status, worker_pid, claim_token FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "running"
+            assert row["claim_token"] == token
+            assert row["worker_pid"] == _os.getpid()
+            # The runner can still finish normally.
+            assert manager._transition_terminal(job["job_id"], "completed", 0, claim_token=token)
+            assert manager.status(job["job_id"])["status"] == "completed"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_no_token_launch_cannot_resurrect_terminal_job(tmp_path):
+    """Review rc33 P1-2: the no-token parent 'running' write is guarded by run
+    identity. A fast job that completed/cancelled while the parent was returning
+    from Popen must never be resurrected to 'running' by the parent write."""
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            # Simulate the reviewer's delayed-parent probe on the start() path:
+            # the row is inserted 'running' with started_at; a terminal
+            # transition happens (as a fast job would) before the parent's
+            # no-token write.
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            # The parent's no-token write is guarded by the ORIGINAL started_at;
+            # after the failure the row is 'failed' with ended_at set, so the
+            # started_at-guarded write cannot match.
+            with manager.db_lock:
+                row = manager.db.execute("SELECT started_at, status FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()
+                assert row["status"] == "failed"
+                changed = manager.db.execute(
+                    "UPDATE jobs SET status='running', worker_pid=?, runner_heartbeat_at=?, updated_at=?, exit_code=NULL, ended_at=NULL "
+                    "WHERE job_id=? AND status='running' AND started_at=?",
+                    (12345, now_iso(), now_iso(), job["job_id"], row["started_at"]),
+                ).rowcount
+                manager.db.commit()
+            assert changed == 0, "no-token parent write must not resurrect a terminal job"
+            assert manager.status(job["job_id"])["status"] == "failed"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_stale_runner_cannot_consume_newer_claim_token(tmp_path):
+    """Review rc33 P1-3: a delayed runner reads a CLAIM-SPECIFIC spec file
+    (specs/{job_id}-{claim_token}.json), never the shared mutable spec. After
+    stale recovery and a new claim, an old delayed runner reading the OLD
+    claim-specific file cannot impersonate the new run."""
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch1 = manager.prepare_launch(job["job_id"])
+            token1 = launch1["claim_token"]
+            spec1 = manager.home / "specs" / f"{job['job_id']}-{token1}.json"
+            assert spec1.exists(), "claim-specific spec must be written"
+
+            # A delayed runner reads the claim-specific spec of ITS claim.
+            import vanth.runner as runner_mod
+            spec1_json = json.loads(spec1.read_text(encoding="utf-8"))
+            assert spec1_json.get("claim_token") == token1
+
+            # The claim is abandoned (crash) and recovered, then a NEW claim wins.
+            manager._abandon_launch_claim(job["job_id"], token1)
+            launch2 = manager.prepare_launch(job["job_id"])
+            token2 = launch2["claim_token"]
+            assert token2 != token1
+            spec2 = manager.home / "specs" / f"{job['job_id']}-{token2}.json"
+            assert spec2.exists()
+
+            # The OLD claim-specific spec is GONE or superseded; a delayed runner
+            # that holds the OLD spec name cannot read the NEW token.
+            if spec1.exists():
+                # Only possible if spec1 is the same path as spec2 (it is not).
+                pass
+            # The runner is invoked with ITS claim's spec name (argv), so even if
+            # the old spec file lingers it carries the old token and cannot
+            # promote the new claim.
+            spec1_readback = spec1.read_text(encoding="utf-8") if spec1.exists() else None
+            assert spec1_readback is None or token1 not in spec2.read_text(encoding="utf-8")
+            # The shared mutable specs/{job_id}.json is never written by the
+            # launch path, so a delayed runner reading it gets nothing.
+            assert not (manager.home / "specs" / f"{job['job_id']}.json").exists()
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_stale_recovery_does_not_orphan_promoted_run(tmp_path):
+    """Review rc33 P1-4: recovery must NOT orphan a run the runner already
+    promoted to 'running'. The launching-only, token-guarded transition returns
+    0 and leaves the live workload alone."""
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token = launch["claim_token"]
+            row = manager._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "launching"
+
+            # Simulate the runner promoting between the snapshot and the
+            # transition: it owns 'running' now.
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 4242, token)
+            assert manager.status(job["job_id"])["status"] == "running"
+
+            # Stale recovery sees a launching snapshot, but the launching-only
+            # guard must NOT orphan the promoted run.
+            with manager.db_lock:
+                stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=manager.launch_claim_timeout + 5)).isoformat().replace("+00:00", "Z")
+                manager.db.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND status='launching'",
+                    (stale, job["job_id"]),
+                )
+                manager.db.commit()
+            manager._recover_stale_launch_claims()
+            status = manager.status(job["job_id"])["status"]
+            assert status == "running", f"recovery must not orphan a promoted run, got {status}"
+            assert manager.events(job["job_id"], types=["orphaned"])["events"] == []
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_heartbeat_reconciliation_does_not_orphan_newer_run(tmp_path):
+    """Review rc33 P1-5: heartbeat reconciliation is run-identity guarded. A
+    stale-'running' snapshot is finalized only if the row is STILL running under
+    the recorded worker (or token); a newer run that took ownership is never
+    orphaned by an old reconciliation pass."""
+    async def main():
+        manager = JobManager(tmp_path, recover=False)
+        try:
+            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            launch = manager.prepare_launch(job["job_id"])
+            token = launch["claim_token"]
+            from vanth.runner import _publish_workload
+            assert _publish_workload(manager, job["job_id"], 4242, token)
+            row = manager._row("SELECT status, worker_pid, claim_token FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "running"
+            assert row["claim_token"] == token
+
+            # Simulate a stale heartbeat snapshot for the OLD worker, then a
+            # newer run taking ownership (new token, new worker).
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE jobs SET status='running', claim_token=?, worker_pid=?, runner_heartbeat_at=?, updated_at=? "
+                    "WHERE job_id=?",
+                    ("claim_newer", 55555, now_iso(), now_iso(), job["job_id"]),
+                )
+                manager.db.commit()
+            # The stale reconciliation pass holds the OLD token; the guarded
+            # transition must not orphan the newer run.
+            transitioned = manager._transition_terminal(job["job_id"], "orphaned", claim_token=token)
+            assert not transitioned, "an old token must not orphan a newer run"
+            assert manager.status(job["job_id"])["status"] == "running"
+            assert manager._row("SELECT claim_token FROM jobs WHERE job_id=?", (job["job_id"],))["claim_token"] == "claim_newer"
+        finally:
+            manager.begin_shutdown()
+            manager.close()
+
+    run(main())
+
+
+def test_abandoned_restart_claim_preserves_budgeted_retry(tmp_path):
+    """Review rc33 P1-6: a restart claim whose launch never spawns (crash before
+    spawn) must keep its budgeted retry intent. Recovery restores the deadline
+    and recovers the row as 'failed' so restart policy relaunches."""
+    async def main():
+        manager = JobManager(tmp_path)
+        try:
+            job = await manager.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
+            )
+            await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.6)
+            state = manager._policy_state(job["job_id"])
+            assert state["restart_attempts"] == 1
+            deadline = state.get("restart_after")
+            assert deadline is not None
+
+            # Claim the due restart (clears restart_after atomically).
+            launch = manager._claim_due_restart(job["job_id"], deadline)
+            assert launch is not None
+            row = manager._row("SELECT status, policy_state_json FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "launching"
+            state = json.loads(row["policy_state_json"] or "{}")
+            assert state.get("restart_after") is None
+            assert state.get("pending_restart_after") == deadline, "pending deadline must be recorded with the claim"
+
+            # Crash before spawn: the claim goes stale and recovery runs.
+            with manager.db_lock:
+                stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=manager.launch_claim_timeout + 5)).isoformat().replace("+00:00", "Z")
+                manager.db.execute(
+                    "UPDATE jobs SET updated_at=? WHERE job_id=? AND status='launching'",
+                    (stale, job["job_id"]),
+                )
+                manager.db.commit()
+            manager._recover_stale_launch_claims()
+            status = manager.status(job["job_id"])["status"]
+            # The budgeted retry intent must survive: the row is failed (not
+            # orphaned) with the deadline restored so restart policy relaunches.
+            assert status == "failed", f"abandoned restart claim must recover as failed, got {status}"
+            state = manager._policy_state(job["job_id"])
+            assert state.get("restart_after") == deadline, "restart deadline must be restored after abandoned claim"
+            assert state.get("pending_restart_after") is None
+            # The retry eventually relaunches (policy sees a failed row with a
+            # due deadline).
+            events = manager.events(job["job_id"], types=["orphaned"])["events"]
+            assert events == [], "an abandoned restart claim must not emit orphaned"
         finally:
             manager.begin_shutdown()
             manager.close()

@@ -18,9 +18,13 @@ def _fail_start(manager: JobManager, job_id: str, exc: Exception, claim_token: s
         # The row may still be 'launching' (the parent claimed it and the runner
         # is mid-start). A claim-owned transition records the failure from
         # 'launching' OR 'running' so a run that fails before publishing is not
-        # left stranded as 'launching' until stale-claim recovery.
+        # left stranded as 'launching' until stale-claim recovery. A restart
+        # claim that fails to start preserves its budgeted retry intent (review
+        # rc33 P1-6): the pending deadline is restored so restart policy still
+        # relaunches after the backoff.
         if manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token):
             manager._emit(job_id, "failed", message=message, data={"error": str(exc)}, level="error", source="runner")
+            manager._restore_pending_restart_after(job_id, claim_token)
     finally:
         manager.close()
     return 1
@@ -59,13 +63,19 @@ def _publish_workload(
                     (pid, now_iso(), now_iso(), job_id),
                 ).rowcount
             manager.db.commit()
+        if changed and claim_token:
+            # The launch is confirmed live; clear any abandoned-claim restart
+            # intent left over from the claim transaction (review rc33 P1-6).
+            # Outside the lock above: _clear_pending_restart_after acquires
+            # db_lock itself and the lock is not reentrant.
+            manager._clear_pending_restart_after(job_id)
         return changed
 
     return bool(manager._retry_locked(publish))
 
 
 def _abort_workload(
-    manager: JobManager, job_id: str, proc: subprocess.Popen[bytes], claim_token: str | None = None
+    manager: JobManager, job_id: str, proc: subprocess.Popen[bytes], claim_token: str | None = None, spec_name: str | None = None
 ) -> int:
     manager._kill_process(proc, force=True)
     try:
@@ -76,7 +86,14 @@ def _abort_workload(
     if claim_token:
         # Record the failed publish if we still own the claim. If recovery
         # already moved the row to a terminal state, this is a guarded no-op.
-        manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token)
+        # Preserve any budgeted restart intent (review rc33 P1-6).
+        if manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token):
+            manager._restore_pending_restart_after(job_id, claim_token)
+    if spec_name:
+        try:
+            (Path(manager.home) / "specs" / spec_name).unlink(missing_ok=True)
+        except OSError:
+            pass
     manager.close()
     return 1
 
@@ -133,11 +150,18 @@ def _feed_stdin(job_id: str, channel: Path, stdin, feeder_stop: threading.Event)
         pass
 
 
-def run(home: str, job_id: str) -> int:
+def run(home: str, job_id: str, spec_file: str | None = None) -> int:
     manager = JobManager(home, recover=False)
     claim_token: str | None = None
     try:
-        spec = json.loads((Path(home) / "specs" / f"{job_id}.json").read_text(encoding="utf-8"))
+        # Review rc33 P1-3: the runner reads a CLAIM-SPECIFIC spec file
+        # (specs/{job_id}-{claim_token}.json) passed in argv, never the shared
+        # mutable specs/{job_id}.json. A delayed runner from an old claim cannot
+        # read the replacement token of a newer run and impersonate it. The
+        # fixed basename path (specs/{job_id}.json) is used by the legacy
+        # start() path and by tests that seed the spec directly.
+        spec_name = spec_file or f"{job_id}.json"
+        spec = json.loads((Path(home) / "specs" / spec_name).read_text(encoding="utf-8"))
         claim_token = spec.get("claim_token")
         env = os.environ.copy()
         env.update(spec.get("env") or {})
@@ -161,11 +185,11 @@ def run(home: str, job_id: str) -> int:
         published = _publish_workload(manager, job_id, proc.pid, claim_token)
     except Exception as exc:
         manager.logger.exception("workload PID publication failed job_id=%s", job_id)
-        return _abort_workload(manager, job_id, proc, claim_token)
+        return _abort_workload(manager, job_id, proc, claim_token, spec_name)
     if not published:
-        return _abort_workload(manager, job_id, proc, claim_token)
+        return _abort_workload(manager, job_id, proc, claim_token, spec_name)
     try:
-        (Path(home) / "specs" / f"{job_id}.json").unlink()
+        (Path(home) / "specs" / spec_name).unlink()
     except FileNotFoundError:
         pass
     manager._emit(job_id, "started")
@@ -247,7 +271,7 @@ def run(home: str, job_id: str) -> int:
 
 
 def main() -> None:
-    raise SystemExit(run(sys.argv[1], sys.argv[2]))
+    raise SystemExit(run(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
 
 
 if __name__ == "__main__":

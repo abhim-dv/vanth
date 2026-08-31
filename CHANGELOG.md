@@ -4,6 +4,52 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Launch-claim concurrency and crash-consistency fixes (rc34)
+
+Six P1 concurrency/crash defects found in a review of the rc33 launch-token
+implementation. Full suite: 636 passed, 6 skipped across two clean runs.
+
+- **A delayed parent no longer kills a runner that already promoted (P1).**
+  If the runner changes `launching -> running` before the parent's
+  `worker_pid` write, the write returns rowcount 0. The parent previously
+  treated every 0 as claim loss and terminated a VALID long-running workload.
+  It now distinguishes owned success (same claim_token with status running or
+  terminal — leave the runner alone) from genuine claim loss (mismatched
+  token — terminate).
+- **Ordinary starts can no longer resurrect terminal jobs (P1).** The no-token
+  parent write that unconditionally set `status='running'` is now guarded by
+  the run's original `started_at`. A fast job that emitted `completed`/`failed`
+  (or was cancelled/orphaned) while the parent was returning from `Popen` is
+  never written back to `running`.
+- **A stale runner can no longer consume a newer claim token (P1).** Runners
+  previously read the shared mutable `specs/{job_id}.json`, so a delayed runner
+  from an old claim could read the replacement token after stale recovery. Each
+  claim now writes a CLAIM-SPECIFIC spec (`specs/{job_id}-{claim_token}.json`)
+  and the runner is given its own spec filename in argv; an old process can
+  never acquire a newer run's identity. Claim-specific specs are cleaned up by
+  the runner on success/abort and by job cleanup.
+- **Stale recovery can no longer orphan a live run (P1).** Recovery used to
+  snapshot a stale `launching` row, release the lock, and then transition with
+  a helper that also accepted `running` — a runner promoting between the two
+  got orphaned. Recovery now performs an ATOMIC launching-only, token-guarded
+  transition (`status='launching' AND claim_token=?`); it reconciles/kills
+  workload processes only AFTER winning that transition. If the runner promoted
+  first, the guard returns 0 and the live workload is untouched.
+- **Heartbeat reconciliation is run-identity guarded (P1).** Reconciliation
+  finalized a stale `running` snapshot with an unguarded terminal update, so a
+  newer restart could take ownership between PID reconciliation and the
+  transition and then be orphaned by the old pass. The final update now
+  requires the same claim_token (or the stale run's worker_pid for legacy rows).
+- **Restart intent survives a claimed-but-unspawned launch (P1).** The restart
+  deadline was cleared atomically with the claim, but a crash/disk error during
+  spec construction left the row `launching`, recovery changed it to
+  `orphaned`, and restart policy (which only watches failed/completed rows)
+  dropped the already-budgeted retry. The claim now records the pre-clear
+  deadline under `pending_restart_after`; an abandoned claim is recovered as
+  `failed` with the deadline restored so the budgeted relaunch still fires. The
+  pending intent is cleared once the launch is confirmed live (runner promoted
+  or parent recorded worker_pid).
+
 ### Launch claims, runner ownership, and wheel-executable fixes (rc33)
 
 - **POSIX wheels now bundle an executable monitor (P1).** Artifact download and
