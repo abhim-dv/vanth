@@ -45,9 +45,16 @@ def _publish_workload(
                 # (recovery orphaned it, or a newer launch owns the row), the
                 # rowcount is 0 and the runner aborts its workload instead of
                 # running an untracked process.
+                #
+                # Review rc36 P1: the pending restart intent is cleared IN THE
+                # SAME UPDATE that promotes the claim (json_remove on
+                # policy_state_json), so a crash cannot strand pending_restart_after
+                # with restart_after=null — promotion and clear are one atomic
+                # transaction.
                 changed = manager.db.execute(
                     "UPDATE jobs SET status='running', pid=?, worker_pid=?, started_at=?, runner_heartbeat_at=?, "
-                    "updated_at=?, exit_code=NULL, ended_at=NULL "
+                    "updated_at=?, exit_code=NULL, ended_at=NULL, "
+                    "policy_state_json=json_remove(policy_state_json, '$.pending_restart_after') "
                     "WHERE job_id=? AND claim_token=? AND status='launching' AND stop_requested_at IS NULL",
                     (pid, os.getpid(), now_iso(), now_iso(), now_iso(), job_id, claim_token),
                 ).rowcount
@@ -63,14 +70,6 @@ def _publish_workload(
                     (pid, now_iso(), now_iso(), job_id),
                 ).rowcount
             manager.db.commit()
-        if changed and claim_token:
-            # The launch is confirmed live; clear any abandoned-claim restart
-            # intent left over from the claim transaction (review rc33 P1-6).
-            # The clear is token-guarded (review rc34 P1-1): it only applies to
-            # OUR claim's intent, so a delayed runner can never erase a newer
-            # claim's pending deadline. Outside the lock above because the lock
-            # is not reentrant.
-            manager._clear_pending_restart_after(job_id, claim_token)
         return changed
 
     return bool(manager._retry_locked(publish))

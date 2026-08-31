@@ -159,3 +159,56 @@ def test_mcp_stdio_errors_and_event_cap(tmp_path):
             daemon.wait(timeout=5)
 
     asyncio.run(main())
+
+
+def test_job_wake_now_inherits_caller_codex_thread(tmp_path):
+    """Review P0-2: job_wake_now must resolve CODEX_THREAD_ID in the MCP process
+    (which owns the calling task) and include it so a codex_cli_thread target
+    without an explicit thread_id inherits the caller's task."""
+    async def main():
+        daemon, url = start_daemon(tmp_path)
+        env = {
+            **os.environ,
+            "VANTH_DAEMON_URL": url,
+            "VANTH_HOME": str(tmp_path),
+            "CODEX_THREAD_ID": "thread_from_caller",
+        }
+        server = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "vanth"],
+            cwd=str(Path(__file__).parents[1]),
+            env=env,
+        )
+        try:
+            async with stdio_client(server) as (read, write):
+                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
+                    await session.initialize()
+                    # Start a quick job so there is a real job row to wake.
+                    command = subprocess.list2cmdline([sys.executable, "-c", "print('wake me')"])
+                    start = content(await session.call_tool("job_start", {"command": command}))
+                    # No explicit thread_id: must inherit CODEX_THREAD_ID.
+                    woken = content(
+                        await session.call_tool(
+                            "job_wake_now",
+                            {"job_id": start["job_id"], "type": "codex_cli_thread", "events": ["completed"]},
+                        )
+                    )
+                    assert woken["result"] == "ok"
+                    assert woken["woken"] is True
+                    # The delivery enqueued by wake_now must carry the inherited
+                    # caller thread id (status may have moved off pending if the
+                    # dispatch worker already attempted the delivery).
+                    deliv = content(
+                        await session.call_tool(
+                            "job_deliveries", {"job_id": start["job_id"], "limit": 10}
+                        )
+                    )
+                    assert deliv["deliveries"], "wake_now must enqueue a delivery"
+                    target = deliv["deliveries"][0]["payload"]["target"]
+                    assert target.get("thread_id") == "thread_from_caller", f"must inherit caller thread, got {target}"
+                    assert target.get("type") == "codex_cli_thread"
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=5)
+
+    asyncio.run(main())

@@ -164,6 +164,15 @@ class _CodexAppServer:
             return message
         return f"{message}: {' | '.join(self.stderr_tail)}"
 
+    def _check_turn_status(self, turn: dict[str, Any]) -> None:
+        """Raise when a completed turn did NOT actually run to a delivered
+        outcome. ``interrupted`` (review P2) and ``failed`` are failures, not
+        successes — a wake must not report delivered when the model was cut off."""
+        status = turn.get("status")
+        if status in ("failed", "interrupted"):
+            error = (turn.get("error") or {}).get("message", f"turn {status}")
+            raise CodexBridgeError(self._error(f"codex turn {status}: {error}"))
+
     def wait_for_turn_completed(self, request_id: int, turn_id: str | None) -> dict[str, Any]:
         """Wait until the turn started by ``request_id`` finishes.
 
@@ -177,10 +186,7 @@ class _CodexAppServer:
         for turn in list(self.completed_turns):
             if turn_id is None or turn.get("id") in (None, turn_id):
                 self.completed_turns.remove(turn)
-                status = turn.get("status")
-                if status == "failed":
-                    error = (turn.get("error") or {}).get("message", "turn failed")
-                    raise CodexBridgeError(self._error(f"codex turn failed: {error}"))
+                self._check_turn_status(turn)
                 return turn
         while True:
             while not self.stderr.empty():
@@ -203,10 +209,7 @@ class _CodexAppServer:
             if method == "turn/completed":
                 turn = message.get("params", {}).get("turn") or {}
                 if turn_id is None or turn.get("id") in (None, turn_id):
-                    status = turn.get("status")
-                    if status == "failed":
-                        error = (turn.get("error") or {}).get("message", "turn failed")
-                        raise CodexBridgeError(self._error(f"codex turn failed: {error}"))
+                    self._check_turn_status(turn)
                     return turn
             # Responses to unrelated requests and other notifications are drained
             # silently; a response error for OUR turn is surfaced.
@@ -263,59 +266,6 @@ def _target_thread_id(target: dict[str, Any]) -> str | None:
     return target.get("thread_id") or target.get("threadId")
 
 
-def send_message_to_desktop_thread(
-    thread_id: str,
-    prompt: str,
-    *,
-    desktop_endpoint: str | None = None,
-    timeout_seconds: int = 30,
-) -> dict[str, Any]:
-    """Deliver a wake to a Codex DESKTOP task.
-
-    Experimental (review P0-2). Codex Desktop's existing app-server OWNS the
-    task; starting a second ``codex app-server`` and calling ``thread/resume``
-    fails with ``already has an active writer``. This transport instead posts to
-    Desktop's ``send_message_to_thread`` operation.
-
-    The Desktop-native ``send_message_to_thread`` route works through the
-    already-running app, but its named-pipe protocol is undocumented. This
-    adapter treats that private protocol as experimental and NEVER quietly
-    depends on it as a stable release feature. If no endpoint is configured, the
-    delivery fails with a clear error rather than silently using the CLI
-    app-server on a Desktop task.
-    """
-    if not desktop_endpoint:
-        raise CodexBridgeError(
-            "codex_desktop target requires 'desktop_endpoint' (the Codex Desktop "
-            "app-server address); Desktop wakes are experimental because Desktop "
-            "owns the active writer for live tasks"
-        )
-    import urllib.request
-
-    payload = json.dumps({"threadId": thread_id, "prompt": prompt}, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
-        desktop_endpoint.rstrip("/") + "/send_message_to_thread",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            status = response.getcode()
-    except urllib.error.HTTPError as exc:
-        # Desktop reports writer ownership as a distinct condition; surface it
-        # as permanent so the delivery is not retried into the same wall.
-        if exc.code == 409:
-            raise CodexActiveWriterError("codex desktop task already has an active writer") from exc
-        raise CodexBridgeError(f"codex desktop send_message_to_thread returned HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise CodexBridgeError(f"codex desktop send_message_to_thread failed: {exc.reason}") from exc
-    if status not in (200, 201, 202, 204):
-        raise CodexBridgeError(f"codex desktop send_message_to_thread returned HTTP {status}")
-    return {"thread_id": thread_id, "desktop": True, "response": body}
-
-
 def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
     target = payload.get("target") or {}
     target_type = target.get("type")
@@ -325,13 +275,6 @@ def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
         raise CodexBridgeError(f"{target_type} target requires thread_id")
     if not isinstance(prompt, str) or not prompt:
         raise CodexBridgeError("delivery payload requires prompt")
-    if target_type == "codex_desktop":
-        return send_message_to_desktop_thread(
-            thread_id,
-            prompt,
-            desktop_endpoint=target.get("desktop_endpoint"),
-            timeout_seconds=int(target.get("timeout_seconds", 300)),
-        )
     return send_message_to_thread(
         thread_id,
         prompt,

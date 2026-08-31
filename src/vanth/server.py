@@ -217,7 +217,7 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked"}
-WAKE_TARGET_TYPES = {"local_command", "codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread", "webhook"}
+WAKE_TARGET_TYPES = {"local_command", "codex_cli_thread", "codex_thread", "opencode_thread", "webhook"}
 
 
 def resolve_wake_target_identity(
@@ -275,8 +275,11 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
         if target_type not in WAKE_TARGET_TYPES:
             raise ValueError(f"unsupported wake target type: {target_type!r}")
         events = target.get("events", target.get("notify_on", []))
-        if not isinstance(events, list) or not all(isinstance(event, str) for event in events):
-            raise ValueError("wake target events must be a list of strings")
+        if not isinstance(events, list) or not events or not all(isinstance(event, str) for event in events):
+            # events=[] is rejected (review P2): an empty list would be
+            # interpreted as a wildcard and wake on every event, contradicting
+            # the documented non-empty requirement.
+            raise ValueError("wake target events must be a non-empty list of strings")
         command = target.get("command")
         if command is not None and not (
             (isinstance(command, str) and command) or (isinstance(command, list) and command)
@@ -301,13 +304,6 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
                 for key, value in headers.items():
                     if not isinstance(key, str) or not isinstance(value, str):
                         raise ValueError("webhook target headers must be string key/value pairs")
-        if target_type == "codex_desktop":
-            # Experimental Desktop transport: requires the Desktop app-server
-            # endpoint. Desktop owns the active writer for live tasks, so this
-            # is never silently routed through the CLI app-server (review P0-2).
-            desktop_endpoint = target.get("desktop_endpoint")
-            if not isinstance(desktop_endpoint, str) or not desktop_endpoint:
-                raise ValueError("codex_desktop target requires desktop_endpoint (experimental)")
         if target_type == "opencode_thread" and command is None:
             # OpenCode cannot auto-inherit a session id (review P1-1): the id is
             # never injected by the client, so a missing one must be rejected
@@ -316,6 +312,15 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             session_id = target.get("session_id") or target.get("sessionId") or target.get("thread_id") or target.get("threadId")
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError("opencode_thread target requires explicit session_id")
+            # Review P0-3: without --attach, `opencode run --session` uses an
+            # isolated backend and never wakes the visible TUI. Require the
+            # shared server URL so the wake reaches the running client's server.
+            attach = target.get("attach")
+            if not isinstance(attach, str) or not attach:
+                raise ValueError(
+                    "opencode_thread target requires attach (the opencode server URL, e.g. "
+                    "http://127.0.0.1:PORT) so the wake hits the visible client's server"
+                )
         elif target_type not in {"local_command", "webhook"} and command is None:
             thread_id = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
             if not isinstance(thread_id, str) or not thread_id:
@@ -511,6 +516,7 @@ class JobManager:
         claim_token: str | None = None,
         worker_pid: int | None = None,
         require_launching: bool = False,
+        expected_worker_pid: int | None = None,
     ) -> bool:
         if status not in TERMINAL_STATUSES:
             raise ValueError(f"invalid terminal status: {status}")
@@ -534,14 +540,25 @@ class JobManager:
                     # establishes ownership; after it wins, processes are
                     # reconciled. If the runner promoted first, the guard returns
                     # 0 and the live run is left alone.
+                    #
+                    # expected_worker_pid (review rc36 P1): stale-claim recovery
+                    # snapshots a dead/null worker_pid; requiring that observed
+                    # worker identity in the CAS means a runner that became live
+                    # AFTER the snapshot (worker_pid changed to a live value) is
+                    # never orphaned.
                     if require_launching:
                         status_guard = "status='launching'"
                     else:
                         status_guard = "status IN ('running','launching')"
+                    if expected_worker_pid is not None:
+                        status_guard += " AND worker_pid IS ?"
+                        args: tuple[Any, ...] = (status, exit_code, stamp, stamp, job_id, claim_token, expected_worker_pid)
+                    else:
+                        args = (status, exit_code, stamp, stamp, job_id, claim_token)
                     changed = self.db.execute(
                         "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL "
                         f"WHERE job_id=? AND claim_token=? AND {status_guard}",
-                        (status, exit_code, stamp, stamp, job_id, claim_token),
+                        args,
                     ).rowcount
                 elif worker_pid is not None:
                     # No-token RUN-IDENTITY guarded transition (review rc33
@@ -1395,7 +1412,7 @@ class JobManager:
             # still running. Per-target timeout_seconds overrides; thread
             # targets without one use the bridge default (300).
             target_type = row["target_type"]
-            default_timeout = 300 if target_type in {"codex_thread", "codex_cli_thread", "codex_desktop", "opencode_thread"} else 30
+            default_timeout = 300 if target_type in {"codex_thread", "codex_cli_thread", "opencode_thread"} else 30
             timeout = int(target.get("timeout_seconds", default_timeout))
             lease_seconds = timeout + max(1, self.delivery_lease_margin)
             due = (
@@ -1444,9 +1461,9 @@ class JobManager:
             target = delivery["payload"].get("target", {})
             command = target.get("command")
             target_type = target.get("type")
-            if not command and target_type in {"codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread"} and target.get("auto_dispatch") is False:
+            if not command and target_type in {"codex_cli_thread", "codex_thread", "opencode_thread"} and target.get("auto_dispatch") is False:
                 return
-            if not command and target_type not in {"codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread", "webhook"}:
+            if not command and target_type not in {"codex_cli_thread", "codex_thread", "opencode_thread", "webhook"}:
                 return
             delivery = self._claim_delivery(delivery["delivery_id"])
             if not delivery:
@@ -1459,7 +1476,7 @@ class JobManager:
                 except Exception as exc:
                     self._complete_delivery(delivery, "failed", str(exc))
                 return
-            if not command and target_type in {"codex_cli_thread", "codex_thread", "codex_desktop"}:
+            if not command and target_type in {"codex_cli_thread", "codex_thread"}:
                 try:
                     send_delivery_to_codex(payload)
                     self._complete_delivery(delivery, "delivered")
@@ -1650,11 +1667,13 @@ class JobManager:
         # injected — the caller's objects are never mutated.
         if wake_targets is not None:
             wake_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
-        validate_wake_targets(wake_targets)
+        # Apply notify_on defaults BEFORE validation so a target with no explicit
+        # events inherits the notify_on list and is not rejected as empty.
         if notify_on:
             for target in wake_targets or []:
                 if "events" not in target and "notify_on" not in target:
                     target["events"] = notify_on
+        validate_wake_targets(wake_targets)
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
@@ -1673,7 +1692,7 @@ class JobManager:
             (
                 target.get("thread_id") or target.get("threadId")
                 for target in (wake_targets or [])
-                if target.get("type") in {"codex_thread", "opencode_thread"}
+                if target.get("type") in {"codex_thread", "codex_cli_thread", "opencode_thread"}
             ),
             None,
         )
@@ -2151,33 +2170,32 @@ class JobManager:
 
         def restore() -> bool:
             with self.db_lock:
-                row = self.db.execute(
-                    "SELECT claim_token, policy_state_json, status FROM jobs WHERE job_id=?",
-                    (job_id,),
-                ).fetchone()
-                if row is None:
-                    return False
-                if claim_token and row["claim_token"] != claim_token:
-                    return False
-                if status is not None and row["status"] != status:
-                    return False
-                try:
-                    state = json.loads(row["policy_state_json"] or "{}")
-                except (TypeError, ValueError):
-                    state = {}
-                if not isinstance(state, dict):
-                    state = {}
-                pending = state.get("pending_restart_after")
-                if not pending:
-                    return False
-                state["restart_after"] = pending
-                state.pop("pending_restart_after", None)
-                self.db.execute(
-                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
-                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
-                )
+                # Review rc36 P1: a SINGLE guarded UPDATE moves the pending
+                # deadline back to restart_after. The WHERE clause re-checks the
+                # full run identity (claim_token + status + pending set) in the
+                # SAME statement that writes, so two managers cannot interleave a
+                # SELECT/UPDATE (cross-process TOCTOU): stale restore can never
+                # replace a newer claim's state because the guarded write affects
+                # zero rows when the token/status no longer match.
+                where = "job_id=?"
+                args: list[Any] = [job_id]
+                if claim_token:
+                    where += " AND claim_token=?"
+                    args.append(claim_token)
+                if status is not None:
+                    where += " AND status=?"
+                    args.append(status)
+                where += " AND json_extract(policy_state_json, '$.pending_restart_after') IS NOT NULL"
+                changed = self.db.execute(
+                    "UPDATE jobs SET "
+                    "policy_state_json=json_set(json_remove(policy_state_json, '$.pending_restart_after'), "
+                    "  '$.restart_after', json_extract(policy_state_json, '$.pending_restart_after')), "
+                    "updated_at=? "
+                    f"WHERE {where}",
+                    (now_iso(), *args),
+                ).rowcount
                 self.db.commit()
-                return True
+                return bool(changed)
         return self._retry_locked(restore)
 
     def _clear_pending_restart_after(self, job_id: str, claim_token: str | None = None) -> None:
@@ -2204,43 +2222,72 @@ class JobManager:
                     # no pending_restart_after and must never clear another
                     # claim's.
                     return
-                row = self.db.execute(
-                    "SELECT claim_token, policy_state_json FROM jobs WHERE job_id=?", (job_id,)
-                ).fetchone()
-                if row is None:
-                    return
-                if row["claim_token"] != claim_token:
-                    return
-                try:
-                    state = json.loads(row["policy_state_json"] or "{}")
-                except (TypeError, ValueError):
-                    state = {}
-                if not isinstance(state, dict) or "pending_restart_after" not in state:
-                    return
-                state.pop("pending_restart_after", None)
-                self.db.execute(
-                    "UPDATE jobs SET policy_state_json=?, updated_at=? WHERE job_id=?",
-                    (json.dumps(state, separators=(",", ":")), now_iso(), job_id),
-                )
+                # Review rc36 P1: a SINGLE guarded UPDATE removes the pending
+                # intent. The WHERE re-checks claim_token in the SAME statement
+                # that writes (cross-process CAS), so a stale clear from an old
+                # claim can never erase a newer claim's pending deadline — the
+                # guarded write affects zero rows when the token no longer
+                # matches.
+                changed = self.db.execute(
+                    "UPDATE jobs SET policy_state_json=json_remove(policy_state_json, '$.pending_restart_after'), updated_at=? "
+                    "WHERE job_id=? AND claim_token=? AND json_extract(policy_state_json, '$.pending_restart_after') IS NOT NULL",
+                    (now_iso(), job_id, claim_token),
+                ).rowcount
                 self.db.commit()
+                return
         self._retry_locked(clear)
 
-    def _abandon_launch_claim(self, job_id: str, claim_token: str | None) -> tuple[bool, str]:
+    def _revert_abandoned_claim(self, job_id: str, claim_token: str | None, target: str) -> bool:
+        """Revert an abandoned launch claim back to ``launching`` when the
+        workload kill failed (review rc36 P1).
+
+        Stale-claim recovery wins the launching-only terminal transition first
+        (blocking relaunch), then kills the owned workload PID. If the kill
+        fails, the workload may still be alive — leaving the row terminal would
+        orphan a live, untracked process. This reverts the row to ``launching``
+        (guarded by the same token/status) and, if the recovery restored a
+        pending restart deadline, moves ``restart_after`` back to
+        ``pending_restart_after`` so a later pass retries cleanly.
+        """
+        def revert() -> bool:
+            with self.db_lock:
+                if claim_token:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='launching', ended_at=NULL, "
+                        "policy_state_json=json_set(json_remove(policy_state_json, '$.restart_after'), "
+                        "  '$.pending_restart_after', json_extract(policy_state_json, '$.restart_after')), "
+                        "updated_at=? WHERE job_id=? AND claim_token=? AND status=?",
+                        (now_iso(), job_id, claim_token, target),
+                    ).rowcount
+                else:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='launching', ended_at=NULL, updated_at=? "
+                        "WHERE job_id=? AND claim_token IS NULL AND status=?",
+                        (now_iso(), job_id, target),
+                    ).rowcount
+                self.db.commit()
+                return bool(changed)
+        return self._retry_locked(revert)
+
+    def _abandon_launch_claim(self, job_id: str, claim_token: str | None, expected_worker_pid: int | None = None) -> tuple[bool, str]:
         """Recover an abandoned ``launching`` claim (never spawned) to a terminal
         state, preserving any budgeted restart intent (review rc33 P1-4/P1-6).
 
         The terminal transition is an ATOMIC launching-only, token-guarded
         UPDATE: it returns True ONLY if the runner has not already promoted the
-        claim to ``running`` (rc33 P1-4). If the claim carried a pending restart
-        deadline (``pending_restart_after`` set by ``_claim_due_restart``), the
-        row is recovered as ``failed`` with the deadline restored so restart
-        policy (which only watches failed/completed rows) relaunches the
+        claim to ``running`` (rc33 P1-4). ``expected_worker_pid`` (the observed
+        worker identity from the stale snapshot) is included in the CAS so a
+        runner that became live after the snapshot is never orphaned (review
+        rc36 P1). If the claim carried a pending restart deadline
+        (``pending_restart_after`` set by ``_claim_due_restart``), the row is
+        recovered as ``failed`` with the deadline restored so restart policy
+        (which only watches failed/completed rows) relaunches the
         already-budgeted retry (rc33 P1-6); otherwise it is recovered as
         ``orphaned``. Returns ``(recovered, target_status)``.
         """
         with self.db_lock:
             row = self.db.execute(
-                "SELECT policy_state_json FROM jobs WHERE job_id=?", (job_id,)
+                "SELECT policy_state_json, worker_pid FROM jobs WHERE job_id=?", (job_id,)
             ).fetchone()
         pending = None
         if row:
@@ -2251,7 +2298,10 @@ class JobManager:
                 pending = None
         target = "failed" if pending else "orphaned"
         if claim_token:
-            recovered = self._transition_terminal(job_id, target, claim_token=claim_token, require_launching=True)
+            recovered = self._transition_terminal(
+                job_id, target, claim_token=claim_token, require_launching=True,
+                expected_worker_pid=expected_worker_pid,
+            )
         else:
             # Legacy row claimed before the claim_token column existed (never a
             # restart claim, so target is always 'orphaned').
@@ -2316,18 +2366,28 @@ class JobManager:
                 # we leave the live run alone (review rc33 P1-4). A claim that
                 # carried a pending restart deadline recovers as 'failed' with
                 # the deadline restored so restart policy relaunches (P1-6).
-                recovered, target = self._abandon_launch_claim(job_id, row["claim_token"])
+                # The observed worker identity is included in the CAS so a
+                # runner that became live after the snapshot is never orphaned
+                # (review rc36 P1).
+                recovered, target = self._abandon_launch_claim(
+                    job_id, row["claim_token"], expected_worker_pid=row["worker_pid"]
+                )
                 if not recovered:
                     # The runner won the promotion (or a newer launch owns the
-                    # row). Either way the row is no longer ours to orphan; the
-                    # live workload must be left untouched.
+                    # row, or the worker identity changed). Either way the row is
+                    # no longer ours to orphan; the live workload must be left
+                    # untouched.
                     continue
-                # We own the abandoned launch now: reconcile processes. A
-                # workload child may have outlived its runner; terminate it
-                # before emitting the orphaned event (review rc32 P1-3).
+                # We own the abandoned launch now (the row is terminal, which
+                # blocks relaunch). Reconcile the exact owned workload PID. If
+                # the kill FAILS, the workload may still be alive; revert the
+                # row to 'launching' so a later recovery pass retries instead of
+                # leaving a terminal row with a live, untracked process (review
+                # rc36 P1).
                 if row["pid"]:
                     if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
                         self.logger.error("stale-claim recovery could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                        self._revert_abandoned_claim(job_id, row["claim_token"], target)
                         continue
                 if target == "failed":
                     self._emit(
@@ -2458,11 +2518,15 @@ class JobManager:
                 # Review rc34 P2: establish ownership FIRST (win the atomic
                 # launching-only transition) before terminating any workload
                 # PID, so a PID reused by a newer run is never killed.
-                recovered, target = self._abandon_launch_claim(job_id, claim_token)
+                recovered, target = self._abandon_launch_claim(job_id, claim_token, expected_worker_pid=row["worker_pid"])
                 if recovered:
                     if row["pid"]:
                         if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
                             self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
+                            # Revert to launching: the workload may still be
+                            # alive; a terminal row would orphan it (P1).
+                            self._revert_abandoned_claim(job_id, claim_token, target)
+                            return
                     self._emit(
                         job_id,
                         target,
@@ -3909,6 +3973,9 @@ class JobManager:
         self._ensure_open()
         if not isinstance(target, dict):
             raise ValueError("target must be an object")
+        # Apply the events default before validation (events must be non-empty).
+        if "events" not in target and "notify_on" not in target:
+            target = {**target, "events": ["completed", "failed"]}
         validate_wake_targets([target])
         target_type = target.get("type")
         events = target.get("events")
@@ -3942,6 +4009,8 @@ class JobManager:
             raise ValueError("target must be an object")
         targets = resolve_wake_target_identity([target], origin_thread_id)
         resolved = targets[0]
+        if "events" not in resolved and "notify_on" not in resolved:
+            resolved = {**resolved, "events": ["completed", "failed"]}
         validate_wake_targets([resolved])
         target_type = resolved.get("type")
         events = resolved.get("events")
@@ -3949,27 +4018,55 @@ class JobManager:
             events = resolved.get("notify_on") or ["completed", "failed"]
         if not events:
             raise ValueError("target events must not be empty")
+        if resolved.get("auto_dispatch") is False:
+            # Review P0-1/P1: wake_now must actually dispatch. An
+            # auto_dispatch:false target would leave a permanently-pending
+            # delivery while wake_now reported woken:true. Reject it.
+            raise ValueError("wake_now does not support auto_dispatch:false (the wake must be delivered immediately)")
         row = self._row("SELECT job_id, status FROM jobs WHERE job_id=?", (job_id,))
         if not row:
             raise ValueError(f"Unknown job_id: {job_id}")
         config = {key: value for key, value in resolved.items() if key not in {"type", "events", "notify_on"}}
         with self.db_lock:
             inserted = self._insert_wake_targets(job_id, [{"type": target_type, "events": events, **config}], now_iso())
-            # Enqueue an immediate synthetic delivery for the FIRST configured
-            # event so the wake fires now (review P0-1). The target is also kept
-            # registered so future events of these types keep waking it.
+            # Enqueue an immediate delivery so the wake fires NOW. Use a DISTINCT
+            # synthetic event type (never fabricate 'completed'/'failed' for a
+            # running or failed job — review P1). The payload carries the actual
+            # job status. The target stays registered so future REAL events of
+            # these types keep waking it.
+            target_row = self.db.execute(
+                "SELECT * FROM wake_targets WHERE target_id=?", (inserted[0],)
+            ).fetchone()
             synthetic = {
                 "event_id": "evt_synthetic_" + uuid.uuid4().hex[:12],
                 "job_id": job_id,
                 "seq": 0,
-                "type": events[0],
+                "type": "wake_now",
                 "level": "info",
                 "message": "wake_now requested by caller",
                 "data": {"synthetic": True, "requested_status": row["status"]},
                 "source": "server",
                 "created_at": now_iso(),
             }
-            self._enqueue_deliveries_uncommitted(synthetic)
+            delivery_id = "del_" + uuid.uuid4().hex[:16]
+            payload = self._delivery_payload(synthetic, target_row, delivery_id)
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO deliveries(
+                  delivery_id, event_id, target_id, job_id, target_type, status, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    delivery_id,
+                    synthetic["event_id"],
+                    target_row["target_id"],
+                    job_id,
+                    target_type,
+                    json.dumps(payload, separators=(",", ":")),
+                    now_iso(),
+                ),
+            )
             self.db.commit()
         return {
             "result": "ok",
@@ -3978,7 +4075,7 @@ class JobManager:
             "target_type": target_type,
             "events": events,
             "woken": True,
-            "synthetic_event_type": events[0],
+            "synthetic_event_type": "wake_now",
             "requested_status": row["status"],
         }
 
@@ -4546,7 +4643,7 @@ def _build_wake_target(
     When ``target`` is given it is returned unchanged (backward compatible).
     Otherwise a target is built from ``type`` / ``events`` / ``config``.
     ``type`` is required and must be a supported wake target type
-    (local_command, codex_cli_thread, codex_desktop, opencode_thread, webhook);
+    (local_command, codex_cli_thread, opencode_thread, webhook);
     events default to ["completed", "failed"].
     """
     if target is not None:
@@ -4569,21 +4666,22 @@ def job_add_wake_target(
     target: dict[str, Any] | None = None,
     events: list[str] | None = None,
     type: str | None = None,
-    **config: Any,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Register a wake target against a job for FUTURE events.
 
     Pass a full target dict ({"type", "events", ...config}) as ``target``, or
     use the shorthand: ``type`` (required, one of local_command /
-    codex_cli_thread / codex_desktop / opencode_thread / webhook) plus optional
-    ``events`` and extra config kwargs. Events default to ["completed", "failed"].
+    codex_cli_thread / opencode_thread / webhook) plus optional ``events`` and
+    ``config`` (extra target config). Events default to ["completed", "failed"].
 
     This only schedules a target for events that will occur AFTER registration.
     To surface a wake immediately (even if the event already fired), use
     ``job_wake_now``. ``opencode_thread`` targets require an explicit
-    ``session_id`` (OpenCode cannot auto-inherit one — review P1-1).
+    ``session_id`` (OpenCode cannot auto-inherit one — review P1-1) and an
+    ``attach`` server URL so the wake reaches the visible client's server.
     """
-    resolved = _build_wake_target(target, events, type, config)
+    resolved = _build_wake_target(target, events, type, config or {})
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
@@ -4593,18 +4691,27 @@ def job_wake_now(
     target: dict[str, Any] | None = None,
     events: list[str] | None = None,
     type: str | None = None,
-    **config: Any,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Surface a wake for a job IMMEDIATELY, even if the event already fired.
 
     This is the genuine "wake now" operation (review P0-1): it registers the
     target AND enqueues a synthetic delivery right away, so the wake reaches the
     target session without waiting for a matching event. Use ``target`` as a
-    full dict, or the ``type`` + ``events`` + config shorthand (same contract as
-    ``job_add_wake_target``). ``opencode_thread`` targets require an explicit
-    ``session_id``.
+    full dict, or the shorthand: ``type`` (required) + ``events`` + ``config``
+    (extra target config kwargs). ``opencode_thread`` targets require an
+    explicit ``session_id`` and ``attach`` (the opencode server URL so the wake
+    hits the visible client's server).
+
+    Caller-task inheritance is resolved HERE, in the MCP process that owns the
+    calling task (review P0-2): a ``codex_cli_thread``/``codex_thread`` target
+    without an explicit ``thread_id`` inherits ``CODEX_THREAD_ID`` so the wake
+    resumes the calling Codex task. Explicit ids always win.
     """
-    resolved = _build_wake_target(target, events, type, config)
+    origin_thread_id = os.environ.get("CODEX_THREAD_ID")
+    resolved = _build_wake_target(target, events, type, config or {})
+    if origin_thread_id:
+        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
     return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
 
 
@@ -4614,15 +4721,16 @@ def daemon_wake(
     target: dict[str, Any] | None = None,
     events: list[str] | None = None,
     type: str | None = None,
-    **config: Any,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """DEPRECATED: register a wake target. Kept for backward compatibility.
 
     Use ``job_add_wake_target`` to register a target for future events, or
     ``job_wake_now`` to surface a wake immediately. This alias registers the
-    target only (matching the original semantics).
+    target only (matching the original semantics). ``config`` holds extra
+    target config kwargs.
     """
-    resolved = _build_wake_target(target, events, type, config)
+    resolved = _build_wake_target(target, events, type, config or {})
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 

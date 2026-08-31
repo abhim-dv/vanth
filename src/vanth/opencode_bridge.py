@@ -48,15 +48,21 @@ def _session_exists(session_id: str, opencode_command: Any, timeout_seconds: flo
     (timeout, spawn failure, non-zero exit, invalid JSON, unexpected error) —
     None means "can't tell" and must never block a valid dispatch.
 
-    ``directory`` (the target session's cwd) is passed through so the probe
-    runs against the SAME project context as the target session. Without it a
-    cross-project session can be classified as missing (review P0-3).
+    ``directory`` (the target session's cwd) scopes the probe to the SAME
+    project context as the target session. OpenCode's ``session list`` supports
+    only ``--max-count``/``--format`` (not ``--dir``), so the working directory
+    is passed to the subprocess via ``cwd=`` rather than an unsupported flag
+    (review P0-3).
     """
     argv = _command_argv(opencode_command) + ["session", "list", "--format", "json"]
-    if directory:
-        argv += ["--dir", directory]
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_seconds)
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            **({"cwd": directory} if directory else {}),
+        )
     except (subprocess.TimeoutExpired, OSError):
         return None
     if result.returncode:
@@ -108,20 +114,24 @@ def send_message_to_session(
 
     env = None
     if auth:
-        # Non-persisted credential references: forward auth via environment to
-        # the opencode subprocess without writing secrets to disk (review
-        # P0-3). Supported keys: username/password, or a bearer token reference.
+        # Non-persisted credential references (review P0-3): only environment
+        # variable NAMES are accepted — never literal secret values. The values
+        # are read from the daemon's environment and forwarded to the opencode
+        # subprocess as the documented OPENCODE_SERVER_USERNAME /
+        # OPENCODE_SERVER_PASSWORD variables, without writing secrets to disk or
+        # into wake-target config/delivery payloads.
         env = os.environ.copy()
         if isinstance(auth, dict):
-            username = auth.get("username")
-            password = auth.get("password")
-            if username is not None:
-                env["OPENCODE_USERNAME"] = str(username)
-            if password is not None:
-                env["OPENCODE_PASSWORD"] = str(password)
-            bearer_ref = auth.get("bearer_env") or auth.get("token_env")
-            if bearer_ref:
-                env["OPENCODE_TOKEN"] = env.get(str(bearer_ref), "")
+            username_env = auth.get("username_env") or auth.get("username")
+            password_env = auth.get("password_env") or auth.get("password")
+            if username_env:
+                if not isinstance(username_env, str) or not username_env.isidentifier():
+                    raise OpenCodeBridgeError("auth.username must be an environment variable NAME (not a literal value)")
+                env["OPENCODE_SERVER_USERNAME"] = env.get(username_env, "")
+            if password_env:
+                if not isinstance(password_env, str) or not password_env.isidentifier():
+                    raise OpenCodeBridgeError("auth.password must be an environment variable NAME (not a literal value)")
+                env["OPENCODE_SERVER_PASSWORD"] = env.get(password_env, "")
 
     try:
         result = subprocess.run(

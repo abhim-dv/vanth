@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import subprocess
 import time
 from typing import Any
@@ -12,7 +11,6 @@ from vanth.codex_bridge import (
     CodexActiveWriterError,
     CodexBridgeError,
     send_delivery_to_codex,
-    send_message_to_desktop_thread,
     send_message_to_thread,
 )
 
@@ -194,52 +192,3 @@ def test_active_writer_is_permanent_error(monkeypatch: pytest.MonkeyPatch) -> No
 
     with pytest.raises(CodexActiveWriterError, match="active writer"):
         send_message_to_thread("thread-1", "wake", timeout_seconds=30)
-
-
-def test_codex_desktop_requires_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Review P0-2: codex_desktop is experimental and must never silently fall
-    back to the CLI app-server; without a desktop_endpoint it errors clearly."""
-    with pytest.raises(CodexBridgeError, match="desktop_endpoint"):
-        send_delivery_to_codex(
-            {"prompt": "wake", "target": {"type": "codex_desktop", "thread_id": "t1"}}
-        )
-
-
-def test_codex_desktop_posts_to_configured_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Review P0-2: codex_desktop submits through a relay connected to Desktop's
-    existing app (send_message_to_thread operation), not a second app-server."""
-    import urllib.request
-
-    seen = {}
-
-    def fake_urlopen(request, timeout):
-        seen["url"] = request.full_url
-        seen["data"] = json.loads(request.data.decode("utf-8"))
-        seen["timeout"] = timeout
-
-        class _Resp:
-            def getcode(self):
-                return 200
-
-            def read(self):
-                return b'{"ok": true}'
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        return _Resp()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    result = send_message_to_desktop_thread(
-        "desktop_thread_1",
-        "wake now",
-        desktop_endpoint="http://127.0.0.1:4096",
-        timeout_seconds=15,
-    )
-    assert seen["url"] == "http://127.0.0.1:4096/send_message_to_thread"
-    assert seen["data"] == {"threadId": "desktop_thread_1", "prompt": "wake now"}
-    assert seen["timeout"] == 15
-    assert result["desktop"] is True

@@ -36,10 +36,11 @@ def test_build_wake_target_shorthand():
         "type": "local_command",
         "events": ["checkpoint"],
     }
-    assert _build_wake_target(None, None, "opencode_thread", {"session_id": "s1"}) == {
+    assert _build_wake_target(None, None, "opencode_thread", {"session_id": "s1", "attach": "http://127.0.0.1:4096"}) == {
         "type": "opencode_thread",
         "events": ["completed", "failed"],
         "session_id": "s1",
+        "attach": "http://127.0.0.1:4096",
     }
     assert _build_wake_target(None, None, "local_command", {"command": ["echo", "hi"]}) == {
         "type": "local_command",

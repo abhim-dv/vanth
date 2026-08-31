@@ -750,11 +750,14 @@ a wake for an event that already happened. Use `job_wake_now` for that.
 
 Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
 the shorthand: `type` (required, one of `local_command` / `codex_cli_thread` /
-`codex_desktop` / `opencode_thread` / `webhook`) plus optional `events` and
-extra config kwargs. Events default to `["completed", "failed"]`.
+`opencode_thread` / `webhook`) plus optional `events` and `config` (extra
+target config). Events default to `["completed", "failed"]`.
 
-`opencode_thread` targets require an explicit `session_id` — OpenCode does not
-inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit it.
+`opencode_thread` targets require an explicit `session_id` (OpenCode does not
+inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit
+it) AND an `attach` URL — the opencode server the visible TUI/client is
+attached to. Without `attach`, `opencode run --session` runs against an
+isolated backend and does not wake the visible client.
 
 **Parameters**
 
@@ -763,7 +766,7 @@ inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit it.
 | `job_id` | `string` | required | Job to register the wake target on |
 | `target` | `object?` | `None` | Full wake-target dict (`{type, events, ...config}`); given, used as-is |
 | `events` | `string[]?` | `["completed","failed"]` | Shorthand; non-empty list of event types (e.g. `["checkpoint"]`) |
-| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `codex_desktop` / `opencode_thread` / `webhook` |
+| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `opencode_thread` / `webhook` |
 | `...` | `object?` | `{}` | Extra config kwargs merged into the shorthand target |
 
 **Response**

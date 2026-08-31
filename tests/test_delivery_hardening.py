@@ -361,6 +361,7 @@ def test_stale_opencode_session_skips_retries(tmp_path, request, monkeypatch):
                 {
                     "type": "opencode_thread",
                     "session_id": "ses_x",
+                    "attach": "http://127.0.0.1:4096",
                     "events": ["checkpoint"],
                     "max_attempts": 3,
                     "retry_delay_seconds": 1,

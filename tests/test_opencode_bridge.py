@@ -213,28 +213,36 @@ def test_probe_skipped_when_attach_set(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_probe_uses_target_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
     """Review P0-3: the session-existence probe must run against the target
-    cwd so a valid cross-project session is not classified as missing."""
+    cwd so a valid cross-project session is not classified as missing. OpenCode
+    `session list` does not support --dir, so cwd is passed via the subprocess
+    cwd= kwarg (not an unsupported flag)."""
     calls: list[list[str]] = []
+    kwargs_seen: list[dict] = []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
+        kwargs_seen.append(kwargs)
         if "list" in argv:
             return subprocess.CompletedProcess(argv, 0, '[{"id": "ses_proj"}]\n', "")
         return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     send_delivery_to_opencode(
-        {"prompt": "wake", "target": {"session_id": "ses_proj", "cwd": "F:/work/project"}}
+        {"prompt": "wake", "target": {"session_id": "ses_proj", "cwd": "F:/work/project", "skip_probe": False}}
     )
     assert len(calls) == 2
-    assert "list" in calls[0] and "--dir" in calls[0] and "F:/work/project" in calls[0]
+    assert "list" in calls[0] and "--dir" not in calls[0]
+    assert kwargs_seen[0].get("cwd") == "F:/work/project"
     assert "run" in calls[1] and "--dir" in calls[1]
 
 
 def test_auth_forwards_credential_references(monkeypatch: pytest.MonkeyPatch) -> None:
     """Review P0-3: authenticated opencode servers are supported through
-    non-persisted credential references (forwarded via env, never written)."""
-    monkeypatch.setenv("MY_TOKEN", "s3cret")
+    non-persisted credential references — only ENV VAR NAMES are accepted (never
+    literal values), forwarded as the documented OPENCODE_SERVER_USERNAME /
+    OPENCODE_SERVER_PASSWORD variables."""
+    monkeypatch.setenv("MY_USER", "bot")
+    monkeypatch.setenv("MY_PASS", "s3cret")
     seen = {}
 
     def fake_run(argv, **kwargs):
@@ -248,10 +256,31 @@ def test_auth_forwards_credential_references(monkeypatch: pytest.MonkeyPatch) ->
             "target": {
                 "session_id": "ses_1",
                 "skip_probe": True,
-                "auth": {"bearer_env": "MY_TOKEN", "username": "bot"},
+                "auth": {"username": "MY_USER", "password": "MY_PASS"},
             },
         }
     )
     assert "env" in seen
-    assert seen["env"].get("OPENCODE_TOKEN") == "s3cret"
-    assert seen["env"].get("OPENCODE_USERNAME") == "bot"
+    assert seen["env"].get("OPENCODE_SERVER_USERNAME") == "bot"
+    assert seen["env"].get("OPENCODE_SERVER_PASSWORD") == "s3cret"
+
+
+def test_auth_rejects_literal_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review P0-3: literal secret values must NOT be accepted in auth (they
+    would be serialized into wake-target config / delivery payloads)."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', ""),
+    )
+    with pytest.raises(OpenCodeBridgeError, match="environment variable NAME"):
+        send_delivery_to_opencode(
+            {
+                "prompt": "wake",
+                "target": {
+                    "session_id": "ses_1",
+                    "skip_probe": True,
+                    "auth": {"username": "literal-bot", "password": "literal-pass"},
+                },
+            }
+        )

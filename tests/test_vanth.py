@@ -238,6 +238,7 @@ def test_opencode_thread_delivery_dispatches_via_cli(tmp_path):
                     "events": ["checkpoint"],
                     "thread_id": "ses_test",
                     "cwd": str(tmp_path),
+                    "attach": "http://127.0.0.1:4096",
                     "opencode_command": [sys.executable, str(fake_opencode), str(calls)],
                 }
             ],
@@ -253,6 +254,8 @@ def test_opencode_thread_delivery_dispatches_via_cli(tmp_path):
             "ses_test",
             "--dir",
             str(tmp_path),
+            "--attach",
+            "http://127.0.0.1:4096",
             "--format",
             "json",
             delivery["payload"]["prompt"],
@@ -493,7 +496,7 @@ def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
                 notify_on=["completed"],
                 origin_thread_id="ses_origin",
                 wake_targets=[
-                    {"type": "opencode_thread", "session_id": "ses_explicit"},  # explicit wins
+                    {"type": "opencode_thread", "session_id": "ses_explicit", "attach": "http://127.0.0.1:4096"},  # explicit wins
                     {"type": "codex_thread", "auto_dispatch": False},  # inherits
                 ],
             )
@@ -1988,5 +1991,60 @@ def test_pending_restart_clear_is_token_guarded(tmp_path):
         finally:
             manager.begin_shutdown()
             manager.close()
+
+    run(main())
+
+
+def test_restore_clear_cross_process_cas(tmp_path):
+    """Review rc36 P1: _restore_pending_restart_after and
+    _clear_pending_restart_after must be single guarded UPDATEs (WHERE token +
+    full-state CAS), so two managers cannot interleave a SELECT/UPDATE and
+    corrupt state. A stale clear from an OLD claim must not erase a NEWER
+    claim's pending deadline, and a stale restore must not replace a newer
+    claim's state."""
+    async def main():
+        m1 = JobManager(tmp_path)
+        m2 = JobManager(tmp_path, recover=False)
+        try:
+            job = await m1.start(
+                cmd("import sys; sys.exit(1)"),
+                policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
+            )
+            await m1.wait(job["job_id"], ["failed"], timeout_seconds=30)
+            await asyncio.sleep(0.6)
+            deadline_a = m1._policy_state(job["job_id"]).get("restart_after")
+            assert deadline_a is not None
+            launch_a = m1._claim_due_restart(job["job_id"], deadline_a)
+            token_a = launch_a["claim_token"]
+            assert m1._policy_state(job["job_id"]).get("pending_restart_after") == deadline_a
+
+            # A stale clear from claim A (already abandoned) must NOT erase the
+            # pending intent of a NEWER claim B held by another manager.
+            launch_b = None
+            with m2.db_lock:
+                # Simulate recovery abandoning claim A and a newer claim B taking
+                # over (new token, still has pending intent).
+                m2.db.execute(
+                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=? WHERE job_id=?",
+                    ("claim_B", json.dumps({"pending_restart_after": deadline_a, "restart_attempts": 1}, separators=(",", ":")), job["job_id"]),
+                )
+                m2.db.commit()
+            # Stale clear from the OLD token A: must affect zero rows.
+            m1._clear_pending_restart_after(job["job_id"], token_a)
+            state = m2._policy_state(job["job_id"])
+            assert state.get("pending_restart_after") == deadline_a, "stale clear must not erase claim B's pending intent"
+
+            # A stale restore from claim A must NOT replace claim B's state.
+            m1._restore_pending_restart_after(job["job_id"], token_a, status="orphaned")
+            state = m2._policy_state(job["job_id"])
+            assert state.get("pending_restart_after") == deadline_a, "stale restore must not touch claim B"
+            assert state.get("restart_after") is None, "stale restore must not set claim B's restart_after"
+            row = m2._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job["job_id"],))
+            assert row["status"] == "launching" and row["claim_token"] == "claim_B"
+        finally:
+            m1.begin_shutdown()
+            m1.close()
+            m2.begin_shutdown()
+            m2.close()
 
     run(main())

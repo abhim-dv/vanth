@@ -4,6 +4,74 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc35-review release blockers: Desktop wake, OpenCode TUI wake, restart/ownership races (rc36)
+
+#### Codex transport (P0)
+
+- **`codex_desktop` removed from the release surface.** It depended on an HTTP
+  relay (`/send_message_to_thread`) Vanth neither ships nor discovers, and
+  official Codex app-server transports are JSON-RPC over stdio/WebSocket/
+  sockets — not that HTTP route. A normal Desktop install has nothing that can
+  receive it. `codex_cli_thread` (alias `codex_thread`) is the only codex wake
+  transport, for unloaded CLI tasks; Desktop-task wakes are not advertised
+  until a supported Desktop/native app-tools channel is integrated.
+- **`interrupted` turns are failures, not delivered.** The codex app-server
+  bridge now raises for both `failed` and `interrupted` turn outcomes so a
+  wake never reports delivered when the model was cut off.
+
+#### OpenCode transport (P0/P1)
+
+- **`opencode_thread` targets now REQUIRE `attach`** — the opencode server URL
+  that the visible TUI/client is attached to. Without it, `opencode run
+  --session` runs against an isolated backend and never wakes the visible
+  client. The wake is dispatched with `run --attach <url>` so it reaches the
+  running client's server.
+- **The session probe no longer uses the unsupported `session list --dir`.**
+  OpenCode 1.18.x rejects `--dir`; the target cwd is now passed to the probe
+  subprocess via `cwd=` so a cross-project session is not misclassified missing.
+- **Auth uses the documented `OPENCODE_SERVER_USERNAME` /
+  `OPENCODE_SERVER_PASSWORD` variables**, and accepts only environment-variable
+  NAMES (never literal secret values) so credentials are never serialized into
+  wake-target config or delivery payloads.
+
+#### Wake contract (P0/P1)
+
+- **`job_wake_now` now inherits the calling Codex task.** The MCP wrapper
+  resolves `CODEX_THREAD_ID` (in the process that owns the calling task) and
+  injects it into `codex_cli_thread`/`codex_thread` targets before posting to
+  `/wake-now`, so the wake resumes the caller's task. Verified at the wrapper
+  level via an MCP stdio test.
+- **`wake_now` rejects `auto_dispatch:false`.** It must actually dispatch, so a
+  target that would leave a permanently-pending delivery is rejected instead of
+  returning `woken:true`.
+- **`wake_now` uses a distinct `wake_now` synthetic event type** carrying the
+  real job status — it no longer fabricates a `completed` event for running or
+  failed jobs.
+- **`validate_wake_targets` rejects `events=[]`** (which was a silent wildcard),
+  and the events/`notify_on` default is applied before validation so
+  `job_start`/`wake_now` still default to `["completed", "failed"]`.
+- `wake_thread_id` extraction now includes `codex_cli_thread`.
+
+#### Launch/restart ownership (P1)
+
+- **Promotion and pending-restart clear are ONE transaction.** The runner's
+  `launching -> running` UPDATE now also `json_remove`s `pending_restart_after`
+  in the same statement, so a crash cannot strand `pending_restart_after` with
+  `restart_after=null`.
+- **Clear/restore are single guarded UPDATEs (cross-process CAS).**
+  `_clear_pending_restart_after` and `_restore_pending_restart_after` now do
+  the token/status/state check in the SAME write statement (`WHERE job_id=?
+  AND claim_token=? AND <json predicate>`, rowcount authoritative), closing the
+  SELECT-then-UPDATE TOCTOU where a stale daemon could overwrite a newer
+  claim's state.
+- **Stale-claim recovery CAS includes the observed worker identity.** A runner
+  that became live after the snapshot (worker_pid changed) is never orphaned.
+- **Failed-kill no longer leaves a terminal row with a live workload.**
+  Recovery/watcher revert the row to `launching` (and un-restore the deadline)
+  when the workload kill fails, so a later pass retries.
+
+Full suite: 646 passed, 6 skipped across two clean runs.
+
 ### Wake-contract, Codex Desktop/OpenCode transport, and rc34-review crash fixes (rc35)
 
 #### Wake contract (P0)
@@ -19,15 +87,15 @@ All notable changes to Vanth are documented here.
   `resolve_wake_target_identity` helper (caller thread id injected into
   codex targets; explicit ids always win).
 
-#### Codex Desktop vs CLI transport (P0)
+#### Codex transport (P0)
 
-- **Split transports.** `codex_cli_thread` (alias `codex_thread`) keeps the
-  existing app-server implementation for unloaded CLI tasks. New
-  **`codex_desktop`** type is EXPERIMENTAL and requires an explicit
-  `desktop_endpoint`; it posts to the Desktop app's `send_message_to_thread`
-  operation instead of starting a second app-server (which Desktop rejects with
-  `already has an active writer`). It never silently falls back to the CLI
-  app-server.
+- **`codex_desktop` removed from the release surface.** The HTTP relay it
+  expected (`/send_message_to_thread`) is not shipped or discovered by Vanth,
+  and official Codex app-server transports are JSON-RPC over stdio/WebSocket/
+  sockets — not that HTTP route. A normal Desktop installation has nothing that
+  can receive it. `codex_cli_thread` (alias `codex_thread`) remains the only
+  codex wake transport for unloaded CLI tasks; Desktop-task wakes are not
+  advertised until a supported Desktop/native app-tools channel is integrated.
 - **`active writer` is permanent/non-retryable.** A new `CodexActiveWriterError`
   is raised when the app-server reports an active writer; the delivery
   dispatcher dead-letters it (max_attempts=1) instead of retrying into the same

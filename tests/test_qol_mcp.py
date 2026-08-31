@@ -266,7 +266,7 @@ def test_wake_now_enqueues_immediate_delivery_after_completion(tmp_path):
         )
         assert result["result"] == "ok"
         assert result["woken"] is True
-        assert result["synthetic_event_type"] == "completed"
+        assert result["synthetic_event_type"] == "wake_now"
 
         deadline = time.monotonic() + 10
         deliveries = []
@@ -291,6 +291,9 @@ def test_wake_now_opencode_requires_explicit_session(tmp_path):
         job_id = start_job(manager, "print('x')")
         with pytest.raises(ValueError, match="explicit session_id"):
             manager.wake_now(job_id, {"type": "opencode_thread", "events": ["completed"]})
+        # attach is also required so the wake hits the visible client's server.
+        with pytest.raises(ValueError, match="attach"):
+            manager.wake_now(job_id, {"type": "opencode_thread", "events": ["completed"], "session_id": "ses_1"})
     finally:
         manager.close()
 
