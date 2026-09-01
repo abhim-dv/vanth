@@ -34,8 +34,9 @@ from vanth.codex_pipe import (
     CodexPipeError,
     CodexPipeUnavailable,
     MAX_FRAME_BYTES,
-    _claim_lease_seconds,
-    _helper_hard_deadline,
+    claim_lease_seconds,
+    helper_hard_deadline,
+    wake_sequence_budget,
     send_desktop_message,
 )
 from vanth.server import JobManager
@@ -328,32 +329,38 @@ class TestHelperSubprocess:
 
 
 class TestDeadlineLeaseInvariant:
-    """Review rc38 P1: the helper's hard wall-clock lifetime must be STRICTLY
-    SHORTER than the delivery claim lease, so a stalled helper can never outlive
-    the lease and cause concurrent duplicate delivery."""
+    """Review rc39 P1: the helper's hard wall-clock lifetime must be STRICTLY
+    SHORTER than the delivery claim lease for EVERY supported lease margin, so
+    a stalled helper can never outlive the lease and cause concurrent duplicate
+    delivery. The helper and the lease derive from ONE end-to-end deadline."""
 
-    def test_helper_deadline_shorter_than_lease_for_default(self):
-        timeout = 300  # default Desktop timeout
-        assert _helper_hard_deadline(timeout) < _claim_lease_seconds(timeout)
+    def test_helper_deadline_shorter_than_lease_for_all_margins(self):
+        # The reviewer reproduced the invariant failing at margin=1 with the
+        # old duplicated arithmetic. The lease is now helper_deadline + margin,
+        # so helper < lease holds for every margin >= 1.
+        for timeout in (1, 30, 60, 120, 300, 600, 900):
+            for margin in (1, 2, 5, 10, 30):
+                assert helper_hard_deadline(timeout) < claim_lease_seconds(timeout, margin), (
+                    f"helper {helper_hard_deadline(timeout)}s must be < lease "
+                    f"{claim_lease_seconds(timeout, margin)}s (timeout={timeout}, margin={margin})"
+                )
 
-    def test_helper_deadline_shorter_than_lease_for_minimum(self):
-        timeout = 1  # minimum configured timeout
-        assert _helper_hard_deadline(timeout) < _claim_lease_seconds(timeout)
+    def test_lease_is_derived_from_same_deadline_as_helper(self):
+        # No duplicated arithmetic: the lease is the helper deadline PLUS the
+        # operator margin, so it always strictly outlives the helper.
+        for timeout in (30, 300):
+            for margin in (1, 5):
+                assert claim_lease_seconds(timeout, margin) == helper_hard_deadline(timeout) + max(1, margin)
 
-    def test_helper_deadline_shorter_than_lease_for_configured(self):
-        for timeout in (30, 60, 120, 600, 900):
-            assert _helper_hard_deadline(timeout) < _claim_lease_seconds(timeout), (
-                f"helper deadline {_helper_hard_deadline(timeout)}s must be < lease "
-                f"{_claim_lease_seconds(timeout)}s for timeout={timeout}"
-            )
-
-    def test_helper_deadline_leaves_room_for_pipe_call(self):
-        # The helper must at least cover the pipe call's own timeout plus a
-        # small buffer so a legitimate slow host is not cut short by the helper
-        # BEFORE the pipe call's own deadline fires.
+    def test_sequence_budget_covers_two_calls(self):
+        # One end-to-end budget must cover the WHOLE sequence (tools/list +
+        # tools/call); a slow preflight cannot consume a second full timeout.
         timeout = 30
-        assert _helper_hard_deadline(timeout) >= timeout
-        assert _helper_hard_deadline(timeout) <= timeout + 2
+        budget = wake_sequence_budget(timeout)
+        assert budget == timeout
+        # The helper deadline = budget + tiny process buffer.
+        assert helper_hard_deadline(timeout) > budget
+        assert helper_hard_deadline(timeout) <= budget + 2
 
 
 class TestDesktopDelivery:
@@ -423,6 +430,71 @@ class TestDesktopDelivery:
             finally:
                 server.close()
         assert len(set(call_ids)) == 2
+
+    def test_sequence_budget_shared_between_preflight_and_call(self):
+        """Review rc39 P1: tools/list and tools/call share ONE end-to-end
+        budget. A slow preflight must NOT grant the tool call a second full
+        timeout; the whole sequence fails at the shared deadline."""
+        # A server that delays the tools/list response by ~40% of the budget and
+        # then NEVER answers tools/call. The client's total must not exceed the
+        # shared sequence budget (timeout_seconds).
+        import socket as _socket
+
+        server_sock, client_sock = _socket.socketpair()
+        timeout = 1.0
+
+        def serve():
+            conn = server_sock
+            try:
+                header = FakePipeServer._read_exact(conn, 4)
+                if not header:
+                    return
+                (length,) = struct.unpack("<I", header)
+                body = FakePipeServer._read_exact(conn, length)
+                message = json.loads(body.decode("utf-8"))
+                if message.get("method") == "tools/list":
+                    # Slow preflight: consume 40% of the budget.
+                    time.sleep(timeout * 0.4)
+                    FakePipeServer._write_frame(
+                        conn,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": message.get("id"),
+                            "result": {"tools": [{"namespace": "codex_app", "name": "send_message_to_thread"}]},
+                        },
+                    )
+                # Read tools/call but never answer it.
+                while True:
+                    header = FakePipeServer._read_exact(conn, 4)
+                    if not header:
+                        return
+                    (length,) = struct.unpack("<I", header)
+                    FakePipeServer._read_exact(conn, length)
+            except OSError:
+                return
+
+        threading.Thread(target=serve, daemon=True).start()
+        client = CodexPipeClient.__new__(CodexPipeClient)
+        client.handle = client_sock
+        client.timeout_seconds = timeout
+        client.sequence_deadline = time.monotonic() + wake_sequence_budget(timeout)
+        client._request_id = 0
+        start = time.monotonic()
+        try:
+            with pytest.raises(CodexPipeError, match="timed out"):
+                client.send_message_to_thread(
+                    destination_thread_id="t",
+                    prompt="wake",
+                    caller_thread_id="c",
+                    call_id="x",
+                )
+            elapsed = time.monotonic() - start
+            # The total must stay within ~the shared budget (not 2x timeout).
+            assert elapsed < timeout * 1.8, f"sequence must not get a second full timeout, took {elapsed:.2f}s"
+        finally:
+            client.close()
+            server_sock.close()
+            client_sock.close()
 
     def test_missing_pipe_is_fail_closed(self, monkeypatch):
         monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
@@ -602,6 +674,136 @@ class TestRelayProvisionedPipeDelivery:
             codex_bridge.send_delivery_to_codex_desktop = orig
 
 
+class TestRelayRestartRecovery:
+    """Review rc39 P1: a Desktop restart invalidates the private pipe. The relay
+    must reload/re-register the capability (or fail with an explicit
+    reprovision diagnostic) instead of permanently consuming the delivery."""
+
+    def test_relay_reloads_capability_after_pipe_change(self, monkeypatch, tmp_path):
+        import json as _json
+        import vanth.relay as relay_mod
+
+        from datetime import datetime, timezone
+
+        monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_PIPE", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_THREAD", raising=False)
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("VANTH_HOME", str(home))
+        cap = home / "codex_desktop.json"
+
+        def write(pipe, thread, ts):
+            cap.write_text(
+                _json.dumps(
+                    {
+                        "pipe_path": pipe,
+                        "thread_id": thread,
+                        "caller_thread_id": thread,
+                        "provisioned_at": ts.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        write(r"\\.\pipe\old_pipe", "thread_exec", datetime.now(timezone.utc))
+
+        class FakeClient:
+            def ensure(self):
+                return True
+
+            def post(self, path, payload):
+                if path == "/relay/ack":
+                    return {"result": "ok"}
+                return {"result": "ok"}
+
+            def get(self, path, params):
+                return {"deliveries": []}
+
+        relay = relay_mod.DesktopRelay(FakeClient(), "client_restart")
+        assert relay.pipe_path == r"\\.\pipe\old_pipe"
+
+        # Desktop restarts and the operator re-provisions with a NEW pipe (and a
+        # fresh provisioned_at). The relay must detect the change on reload.
+        write(r"\\.\pipe\new_pipe", "thread_exec", datetime.now(timezone.utc))
+        changed = relay._reload_capability()
+        assert changed is True, "a re-provisioned capability must be detected"
+        assert relay.pipe_path == r"\\.\pipe\new_pipe"
+        assert relay._registered is False, "the relay must re-register after reload"
+
+        # When NOTHING changed (genuine outage, no reprovision), reload returns
+        # False so the caller fails the delivery (explicit reprovision needed).
+        changed2 = relay._reload_capability()
+        assert changed2 is False
+
+    def test_relay_pipe_unavailable_fails_without_consuming(self, monkeypatch, tmp_path):
+        """When the pipe is unavailable and the capability did NOT change, the
+        delivery must fail (so it retries per max_attempts) — not be silently
+        acknowledged as delivered."""
+        import json as _json
+        import vanth.relay as relay_mod
+
+        from datetime import datetime, timezone
+
+        monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_PIPE", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_THREAD", raising=False)
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("VANTH_HOME", str(home))
+        cap = home / "codex_desktop.json"
+        cap.write_text(
+            _json.dumps(
+                {
+                    "pipe_path": r"\\.\pipe\dead_pipe",
+                    "thread_id": "thread_exec",
+                    "caller_thread_id": "thread_exec",
+                    "provisioned_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        from vanth.codex_pipe import CodexPipeUnavailable
+
+        class FakeClient:
+            def ensure(self):
+                return True
+
+            def post(self, path, payload):
+                if path == "/relay/ack":
+                    return {"result": "ok"}
+                return {"result": "ok"}
+
+            def get(self, path, params):
+                return {"deliveries": []}
+
+        from vanth import codex_bridge
+
+        orig = codex_bridge.send_delivery_to_codex_desktop
+
+        def unavailable(payload, *, caller_thread_id=None, pipe_path=None):
+            raise CodexPipeUnavailable("cannot open Codex Desktop app-tools pipe")
+
+        codex_bridge.send_delivery_to_codex_desktop = unavailable
+        try:
+            relay = relay_mod.DesktopRelay(FakeClient(), "client_outage")
+            with pytest.raises(CodexPipeUnavailable):
+                relay._deliver(
+                    {
+                        "delivery_id": "del_outage",
+                        "lease_token": "tok",
+                        "payload": {"target": {"type": "codex_desktop", "thread_id": "t"}, "prompt": "wake"},
+                    }
+                )
+            # The capability did not change -> reload returned False and the
+            # exception propagates (the _run boundary marks the delivery failed,
+            # which retries per max_attempts instead of acking delivered).
+            assert relay.pipe_path == r"\\.\pipe\dead_pipe"
+        finally:
+            codex_bridge.send_delivery_to_codex_desktop = orig
+
+
 class TestRelay:
     def _start_delivery(self, manager, thread_id="thread_dest"):
         async def main():
@@ -707,6 +909,51 @@ class TestRelay:
         finally:
             manager.close()
 
+    def test_ack_atomic_cas_includes_claim_client_id(self, tmp_path):
+        """Review rc39 P1: the relay ack validation+completion is ONE atomic CAS
+        that includes claim_client_id. Even if the row still matches the claim
+        TOKEN, a completion attempted by a different client_id affects zero rows
+        and raises — the client never receives a silent success."""
+        manager = JobManager(tmp_path / "state", recover=False)
+        try:
+            manager.relay_register(
+                "client_1", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_dest"}]
+            )
+            self._start_delivery(manager)
+            polled = manager.relay_poll("client_1", timeout_seconds=1)
+            assert polled
+            delivery = polled[0]
+            # The token still matches, but a DIFFERENT client_id must fail the
+            # atomic completion CAS (the guard is token AND client).
+            from vanth.server import now_iso
+            import datetime as _dt
+
+            row = manager._row(
+                "SELECT * FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)
+            )
+            with pytest.raises(ValueError, match="not claimed by this relay"):
+                manager._complete_delivery(
+                    {
+                        "delivery_id": delivery["delivery_id"],
+                        "claim_token": delivery["lease_token"],
+                        "attempts": row["attempts"],
+                        "payload": {"target": json.loads(row["payload_json"]).get("target", {})},
+                    },
+                    "delivered",
+                    require_claim_client_id="client_other",
+                )
+            # The row is untouched and still dispatching under client_1.
+            row = manager._row(
+                "SELECT status, claim_client_id FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)
+            )
+            assert row["status"] == "dispatching"
+            assert row["claim_client_id"] == "client_1"
+            # client_1 can still ack.
+            ack = manager.relay_ack("client_1", delivery["delivery_id"], "delivered", lease_token=delivery["lease_token"])
+            assert ack["result"] == "ok"
+        finally:
+            manager.close()
+
     def test_threadId_alias_target_is_pollable(self, tmp_path):
         """Review rc38 P1: the documented legacy `threadId` alias is accepted by
         validation and must be pollable by the relay. The target key is
@@ -769,6 +1016,39 @@ class TestRelay:
             polled = manager.relay_poll("client_1", timeout_seconds=1)
             assert polled, "matching delivery must NOT be starved by 20 foreign-task deliveries"
             assert polled[0]["payload"]["target"].get("thread_id") == "thread_target"
+        finally:
+            manager.close()
+
+    def test_relay_register_refreshes_liveness(self, tmp_path):
+        """Review rc39 P2: relay_register must refresh last_poll_at on the
+        upsert, so a stale client that reconnects is NOT deleted by
+        relay_expire_stale between its registration and first poll."""
+        manager = JobManager(tmp_path / "state", recover=False)
+        try:
+            manager.relay_register(
+                "client_1", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_dest"}]
+            )
+            # Simulate the subscription going stale (last_poll_at in the past).
+            import datetime as _dt
+
+            old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=3600)).isoformat().replace("+00:00", "Z")
+            with manager.db_lock:
+                manager.db.execute(
+                    "UPDATE relay_subscriptions SET last_poll_at=? WHERE client_id=?",
+                    (old, "client_1"),
+                )
+                manager.db.commit()
+            # Re-register (a reconnect) MUST refresh last_poll_at.
+            manager.relay_register(
+                "client_1", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_dest"}]
+            )
+            row = manager._row(
+                "SELECT last_poll_at FROM relay_subscriptions WHERE client_id=?", ("client_1",)
+            )
+            assert row is not None, "re-register must keep the subscription"
+            assert row["last_poll_at"] > old, "re-register must refresh last_poll_at"
+            # A stale sweep must NOT remove the just-refreshed subscription.
+            assert manager.relay_expire_stale(stale_after_seconds=300) == 0
         finally:
             manager.close()
 

@@ -161,6 +161,56 @@ def test_watch_loop_activity_keeps_relay_alive():
         relay.join(timeout=0.5)
 
 
+def test_watch_loop_blocking_relay_work_keeps_alive():
+    """Review rc39 P1: a relay long-poll that BLOCKS for longer than the
+    configured idle timeout must NOT be reaped. The relay holds the tracker as a
+    context manager around the blocking poll, so the watchdog sees it in-flight
+    for the whole duration."""
+    exited = []
+    import threading
+
+    def fake_exit():
+        exited.append(True)
+
+    tracker = _InFlight()
+    stop = threading.Event()
+
+    def relay_poll():
+        # A long-poll that blocks well past the idle threshold (0.05s).
+        while not stop.is_set():
+            with tracker:
+                time.sleep(0.2)
+            time.sleep(0.01)
+
+    relay = threading.Thread(target=relay_poll, daemon=True)
+    relay.start()
+    try:
+        thread = threading.Thread(
+            target=_watch_loop,
+            args=(os.getpid(), 0.005, 0.0, 0.05, fake_exit, tracker),
+            kwargs={"traffic": lambda: 0, "alive": lambda: True},
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.3)
+        assert not exited, "a blocking relay poll must keep the process alive past the idle timeout"
+        stop.set()
+        relay.join(timeout=0.5)
+        # Flip parent death so the watchdog thread terminates.
+        import vanth.process_watch as pw
+
+        orig_alive = pw.process_alive
+        pw.process_alive = lambda pid: False
+        try:
+            thread.join(timeout=0.5)
+        finally:
+            pw.process_alive = orig_alive
+        assert not thread.is_alive(), "watchdog must terminate once the parent dies"
+    finally:
+        stop.set()
+        relay.join(timeout=0.5)
+
+
 def test_watch_loop_idle_exits_after_activity_stops():
     """Review rc38 P1: once the relay goes quiet, the idle timer runs and the
     process exits. Activity is a per-sample reset, not a keep-alive grant."""

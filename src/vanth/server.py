@@ -1456,7 +1456,17 @@ class JobManager:
             target_type = row["target_type"]
             default_timeout = 300 if target_type in {"codex_thread", "codex_cli_thread", "codex_desktop", "opencode_thread"} else 30
             timeout = int(target.get("timeout_seconds", default_timeout))
-            lease_seconds = timeout + max(1, self.delivery_lease_margin)
+            if target_type == "codex_desktop":
+                # Desktop wake lease is derived from the SAME end-to-end deadline
+                # as the helper subprocess (review rc39 P1): the helper hard
+                # deadline + margin. Because the helper deadline already includes
+                # the process buffer, lease > helper holds for every margin>=1 —
+                # a stalled helper can never outlive its claim.
+                from .codex_pipe import claim_lease_seconds
+
+                lease_seconds = claim_lease_seconds(timeout, self.delivery_lease_margin)
+            else:
+                lease_seconds = timeout + max(1, self.delivery_lease_margin)
             due = (
                 row["status"] in {"pending", "retrying"}
                 and (row["next_attempt_at"] is None or row["next_attempt_at"] <= now)
@@ -1591,7 +1601,23 @@ class JobManager:
             with self._delivery_threads_lock:
                 self._delivery_threads.discard(threading.current_thread())
 
-    def _complete_delivery(self, delivery: dict[str, Any], status: str, error: str | None = None) -> dict[str, Any]:
+    def _complete_delivery(
+        self,
+        delivery: dict[str, Any],
+        status: str,
+        error: str | None = None,
+        *,
+        require_claim_client_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Complete a dispatching delivery with an atomic ownership CAS.
+
+        The ownership condition is part of the SAME single UPDATE (no
+        separate SELECT-then-UPDATE window), so a lease reclaimed between
+        validation and completion is impossible. When ``require_claim_client_id``
+        is given, the CAS also requires ``claim_client_id=?`` (the relay ack
+        path, review rc39 P1) and zero affected rows raises — the caller must
+        not report success for a delivery it no longer owns.
+        """
         if status not in {"delivered", "failed"}:
             raise ValueError("delivery completion status must be delivered or failed")
         target = delivery["payload"].get("target", {})
@@ -1609,14 +1635,27 @@ class JobManager:
         error = (error or "")[:DEFAULT_MAX_ERROR_BYTES] or None
         with self.db_lock:
             stamp = now_iso()
-            changed = self.db.execute(
-                """
-                UPDATE deliveries SET status=?, delivered_at=COALESCE(?, delivered_at), last_error=?, next_attempt_at=?,
-                  claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL
-                WHERE delivery_id=? AND status='dispatching' AND claim_token=?
-                """,
-                (final_status, delivered_at, error, next_attempt_at, delivery["delivery_id"], delivery["claim_token"]),
-            ).rowcount
+            if require_claim_client_id is not None:
+                changed = self.db.execute(
+                    """
+                    UPDATE deliveries SET status=?, delivered_at=COALESCE(?, delivered_at), last_error=?, next_attempt_at=?,
+                      claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL
+                    WHERE delivery_id=? AND status='dispatching' AND claim_token=? AND claim_client_id=?
+                    """,
+                    (
+                        final_status, delivered_at, error, next_attempt_at,
+                        delivery["delivery_id"], delivery["claim_token"], require_claim_client_id,
+                    ),
+                ).rowcount
+            else:
+                changed = self.db.execute(
+                    """
+                    UPDATE deliveries SET status=?, delivered_at=COALESCE(?, delivered_at), last_error=?, next_attempt_at=?,
+                      claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL
+                    WHERE delivery_id=? AND status='dispatching' AND claim_token=?
+                    """,
+                    (final_status, delivered_at, error, next_attempt_at, delivery["delivery_id"], delivery["claim_token"]),
+                ).rowcount
             if changed:
                 self.db.execute(
                     """
@@ -1626,6 +1665,10 @@ class JobManager:
                     (final_status, error, stamp, delivery["delivery_id"], delivery["claim_token"]),
                 )
             self.db.commit()
+            if require_claim_client_id is not None and not changed:
+                raise ValueError(
+                    "delivery is not claimed by this relay (lease reclaimed, delivered, or owned by another client)"
+                )
             row = self.db.execute("SELECT * FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)).fetchone()
         return self._delivery_dict(row)
 
@@ -1728,7 +1771,8 @@ class JobManager:
                 ON CONFLICT(client_id) DO UPDATE SET
                   client_type=excluded.client_type,
                   destinations_json=excluded.destinations_json,
-                  updated_at=excluded.updated_at
+                  updated_at=excluded.updated_at,
+                  last_poll_at=excluded.last_poll_at
                 """,
                 (client_id, client_type, json.dumps(destinations, separators=(",", ":")), now, now),
             )
@@ -1847,17 +1891,22 @@ class JobManager:
             raise ValueError("delivery completion status must be delivered or failed")
         if not isinstance(lease_token, str) or not lease_token:
             raise ValueError("relay_ack requires the opaque lease_token returned by relay_poll")
+        # ONE atomic CAS: the ownership check AND the completion are a single
+        # guarded UPDATE (including claim_client_id) inside one db_lock. There
+        # is no SELECT-then-UPDATE window in which another relay could reclaim
+        # the lease, and a zero-row guard raises instead of silently reporting
+        # success (review rc39 P1).
         with self.db_lock:
             row = self.db.execute(
                 "SELECT * FROM deliveries WHERE delivery_id=? AND status='dispatching' AND claim_token=? AND claim_client_id=?",
                 (delivery_id, lease_token, client_id),
             ).fetchone()
-        if not row:
-            raise ValueError(
-                "delivery is not claimed by this relay (lease reclaimed, delivered, or owned by another client)"
-            )
-        delivery = self._delivery_dict(row)
-        self._complete_delivery(delivery, status, error)
+            if not row:
+                raise ValueError(
+                    "delivery is not claimed by this relay (lease reclaimed, delivered, or owned by another client)"
+                )
+            delivery = self._delivery_dict(row)
+            self._complete_delivery(delivery, status, error, require_claim_client_id=client_id)
         return {"result": "ok", "delivery_id": delivery_id, "status": status}
 
     def relay_expire_stale(self, stale_after_seconds: int = 300) -> int:
@@ -4111,7 +4160,13 @@ class JobManager:
         if isinstance(kill_after_seconds, bool) or not isinstance(kill_after_seconds, int) or kill_after_seconds < 0 or kill_after_seconds > 86400:
             raise ValueError("kill_after_seconds must be between 0 and 86400")
         proc = self.processes.get(job_id)
-        row = self._row("SELECT status, worker_pid, pid, stop_requested_at, trigger_json FROM jobs WHERE job_id=?", (job_id,))
+        # First read captures the FULL ownership identity (claim token) — the
+        # stop-request update AND every terminal transition below CAS against
+        # THIS identity, so a replacement launch that took over the row between
+        # this read and the write is never touched (review rc39 P1).
+        row = self._row(
+            "SELECT status, worker_pid, pid, stop_requested_at, claim_token, trigger_json FROM jobs WHERE job_id=?", (job_id,)
+        )
         if not row:
             raise ValueError(f"Job is not running in this server: {job_id}")
         if row and row["status"] == "queued":
@@ -4135,19 +4190,40 @@ class JobManager:
             }
         deadline = time.monotonic() + kill_after_seconds
         stop_token = now_iso()
+        observed_claim_token = row["claim_token"]
+        observed_worker_pid = int(row["worker_pid"]) if row["worker_pid"] else None
         # A 'launching' row is stoppable too: the runner's launching->running
         # promotion is guarded by `stop_requested_at IS NULL`, so setting the
         # stop flag here prevents the launch from ever coming up (review rc36 P1
         # — every start is now a claim-token 'launching' row, so stop must not
         # reject the brief pre-promotion window).
+        #
+        # The stop-request update is OWNERSHIP-CAS'd on the observed claim token:
+        # a finish+restart/recovery that installed claim B between the first read
+        # and this write means the UPDATE affects zero rows and we return WITHOUT
+        # setting the stop flag on the replacement launch (review rc39 P1).
         with self.db_lock:
-            requested = self.db.execute(
-                "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching')",
-                (stop_token, job_id),
-            ).rowcount
+            if observed_claim_token:
+                requested = self.db.execute(
+                    "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND claim_token=?",
+                    (stop_token, job_id, observed_claim_token),
+                ).rowcount
+            else:
+                # No-token path (legacy/no-claim row): guard on the observed
+                # worker identity so a replacement worker is never stopped.
+                if observed_worker_pid is not None:
+                    requested = self.db.execute(
+                        "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND worker_pid=?",
+                        (stop_token, job_id, observed_worker_pid),
+                    ).rowcount
+                else:
+                    requested = self.db.execute(
+                        "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND stop_requested_at IS NULL",
+                        (stop_token, job_id),
+                    ).rowcount
             self.db.commit()
         if not requested:
-            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
+            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job is owned by a newer launch; stop is a no-op"}
         row = self._row("SELECT status, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,))
         if not row or row["status"] not in {"running", "launching"}:
             return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
@@ -4166,7 +4242,6 @@ class JobManager:
         # cancelled deterministically. The transition is claim-token guarded so a
         # newer launch that already owns the row is never cancelled by a stale
         # stop.
-        observed_claim_token = row["claim_token"]
         if row["status"] == "launching":
             changed = self._transition_terminal(job_id, "cancelled", claim_token=observed_claim_token)
             if not changed:
@@ -4177,7 +4252,7 @@ class JobManager:
                 # recovery/restart that installed a NEW claim (claim B) between
                 # the snapshot and this write is never cancelled by this stale
                 # stop — the CAS on claim A returns 0 and we return without
-                # mutating the new launch (review rc38 P1).
+                # mutating the new launch (review rc38 P1 / rc39 P1).
                 row = self._row(
                     "SELECT status, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,)
                 )

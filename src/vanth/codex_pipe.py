@@ -30,6 +30,44 @@ from typing import Any
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
+# Allowance for the helper subprocess's own startup/teardown on top of the wake
+# sequence budget. Kept tiny so the helper hard deadline is always strictly
+# shorter than the claim lease (review rc39 P1).
+_HELPER_PROCESS_BUFFER_SECONDS = 1.0
+
+
+def wake_sequence_budget(timeout_seconds: float) -> float:
+    """The end-to-end wall-clock budget for ONE Desktop wake.
+
+    This single budget covers the WHOLE sequence — ``tools/list`` preflight AND
+    ``tools/call`` — so a slow preflight cannot consume a second full timeout
+    (review rc39 P1). ``timeout_seconds`` is the operator-configured
+    ``timeout_seconds`` on the wake target.
+    """
+    return max(1.0, float(timeout_seconds))
+
+
+def helper_hard_deadline(timeout_seconds: float) -> float:
+    """The helper subprocess's hard wall-clock lifetime for one wake sequence.
+
+    The helper performs the whole sequence under the shared wake budget plus a
+    tiny process buffer. This is STRICTLY shorter than the claim lease
+    (``claim_lease_seconds``), which guarantees a stalled helper dies before the
+    daemon reclaims the delivery (review rc38/rc39 P1).
+    """
+    return wake_sequence_budget(timeout_seconds) + _HELPER_PROCESS_BUFFER_SECONDS
+
+
+def claim_lease_seconds(timeout_seconds: float, margin: int) -> float:
+    """The delivery claim lease length for a Desktop wake.
+
+    Derived from the SAME end-to-end deadline as the helper: the lease is the
+    helper hard deadline PLUS the operator-configured margin. Because the helper
+    deadline already includes the process buffer, ``lease > helper`` holds for
+    EVERY ``margin >= 1`` — there is no duplicated/test-only arithmetic with a
+    hardcoded default margin (review rc39 P1).
+    """
+    return helper_hard_deadline(timeout_seconds) + max(1, int(margin))
 
 
 def _produce(target_queue: "queue.Queue[Any]", fn, *args: Any) -> None:
@@ -120,6 +158,10 @@ class CodexPipeClient:
             raise CodexPipeUnavailable("Codex Desktop app-tools pipe is not configured")
         self.pipe_path = pipe_path
         self.timeout_seconds = timeout_seconds
+        # The end-to-end sequence deadline: BOTH calls (tools/list preflight and
+        # tools/call) share ONE budget so a slow preflight cannot consume a
+        # second full timeout (review rc39 P1).
+        self.sequence_deadline = time.monotonic() + wake_sequence_budget(timeout_seconds)
         # `open(path, "r+b", buffering=0)` opens a Windows named pipe handle
         # (also works for a POSIX socket/FIFO for tests). Buffering=0 is
         # required for a true byte stream over a named pipe. Tests may pass a
@@ -199,7 +241,19 @@ class CodexPipeClient:
         self._send_frame(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         )
-        deadline = time.monotonic() + self.timeout_seconds
+        # Each call shares the ONE sequence deadline: the call's own timeout is
+        # capped by the remaining end-to-end budget (review rc39 P1), so a slow
+        # preflight cannot consume a second full timeout. Tests that construct
+        # the client via __new__ may not set sequence_deadline; fall back to a
+        # fresh per-call deadline then.
+        sequence_deadline = getattr(self, "sequence_deadline", None)
+        if sequence_deadline is not None:
+            deadline = min(
+                time.monotonic() + self.timeout_seconds,
+                sequence_deadline,
+            )
+        else:
+            deadline = time.monotonic() + self.timeout_seconds
         result_queue: queue.Queue[Any] = queue.Queue()
         reader = threading.Thread(
             target=_produce,
@@ -303,30 +357,6 @@ class CodexPipeClient:
         return result
 
 
-def _helper_hard_deadline(timeout_seconds: float) -> float:
-    """Return the helper subprocess's hard wall-clock lifetime for a pipe call.
-
-    The helper must never outlive the delivery's claim lease, otherwise a
-    stalled helper could still be running while the daemon reclaims the
-    delivery and a second relay submits the same wake concurrently (review
-    rc38 P1). The pipe call itself enforces ``timeout_seconds`` internally, so
-    the helper only needs a small buffer beyond it — this is strictly SHORTER
-    than the claim lease (``timeout_seconds + delivery_lease_margin``), which
-    guarantees the helper dies before the lease expires.
-    """
-    return timeout_seconds + 2.0
-
-
-def _claim_lease_seconds(timeout_seconds: float, margin: int = 5) -> float:
-    """Return the delivery claim lease length for a Desktop wake.
-
-    Mirrors the daemon's lease computation (``timeout_seconds +
-    delivery_lease_margin``) and is used to assert the invariant that the
-    helper hard deadline is strictly shorter than the lease (review rc38 P1).
-    """
-    return timeout_seconds + max(1, margin)
-
-
 def send_desktop_message(
     *,
     destination_thread_id: str,
@@ -382,10 +412,10 @@ def send_desktop_message(
         "call_id": call_id,
     }
     argv = [sys.executable, "-m", "vanth.codex_pipe", "--helper"]
-    # Strictly shorter than the claim lease (timeout + margin) so a stalled
-    # helper can never outlive the lease and cause concurrent duplicate
-    # delivery (review rc38 P1).
-    hard_deadline = _helper_hard_deadline(timeout_seconds)
+    # Strictly shorter than the claim lease (derived from the SAME end-to-end
+    # deadline) so a stalled helper can never outlive the lease and cause
+    # concurrent duplicate delivery (review rc38/rc39 P1).
+    hard_deadline = helper_hard_deadline(timeout_seconds)
     try:
         result = subprocess.run(
             argv,

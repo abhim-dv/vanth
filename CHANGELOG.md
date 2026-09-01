@@ -4,6 +4,69 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc39-review races: one ownership CAS, one deadline, one in-flight scope (rc40)
+
+#### One ownership CAS (P1)
+
+- **Stop can no longer rebind itself to a replacement launch.** `_stop`'s FIRST
+  read now captures the full ownership identity (claim token + worker pid), and
+  BOTH the stop-request update and every terminal transition CAS against THAT
+  same identity. A finish+restart/recovery that installs claim B between the
+  observation and the stop-request write means the ownership-guarded UPDATE
+  affects zero rows and `_stop` returns WITHOUT setting the stop flag or
+  cancelling B. The regression test drives the real `_stop` interleaving (swap
+  A→B between the first read and the write) rather than calling
+  `_transition_terminal` in isolation.
+- **Relay acknowledgement is one atomic CAS.** `relay_ack` previously did a
+  SELECT-then-UPDATE with the lock released between them; a lease reclaimed in
+  that window made `_complete_delivery` update zero rows whose rowcount was
+  discarded, so `relay_ack` returned success for a delivery it no longer owned.
+  Validation + completion are now a SINGLE guarded UPDATE (including
+  `claim_client_id`) inside one lock; a zero-row guard raises instead of
+  silently reporting success. A test asserts the completion CAS is
+  client-identity bound even when the token still matches.
+
+#### One deadline (P1)
+
+- **Helper deadline and claim lease derive from ONE end-to-end deadline.** The
+  helper previously used `timeout + 2` while the server independently used
+  `timeout + margin` — with `VANTH_DELIVERY_LEASE_MARGIN=1` a 300s helper got a
+  302s deadline against a 301s lease, letting a stalled helper outlive its
+  claim. Now the Desktop lease is the helper hard deadline PLUS the margin
+  (both derived from `wake_sequence_budget`), so `helper < lease` holds for
+  every margin ≥ 1. No duplicated/test-only lease arithmetic.
+- **One budget covers the whole sequence.** `CodexPipeClient` now carries a
+  single `sequence_deadline` shared by BOTH calls (`tools/list` preflight and
+  `tools/call`); a slow preflight can no longer consume a second full timeout.
+  Test covers a slow preflight followed by a never-answering tool call.
+
+#### One in-flight scope (P1)
+
+- **Watchdog covers blocking relay work.** The relay previously recorded one
+  instantaneous activity timestamp before `/relay/poll` and did not stay active
+  around a long Desktop delivery — with a small `VANTH_WATCH_IDLE` the watchdog
+  reaped a healthy relay mid-operation. `_run` now holds the tracker as a
+  context manager around the blocking poll AND the delivery+ack, so the
+  watchdog sees them in-flight for their whole duration. A test uses a poll
+  that blocks longer than the idle timeout.
+
+#### Desktop restart recovery (P1)
+
+- On pipe-unavailable failure the relay re-resolves the capability
+  (`codex_desktop.json` / env). If a re-provisioned pipe/thread changed, it
+  re-registers and continues; if nothing changed, the failure propagates so the
+  delivery is marked failed (retried per `max_attempts`) rather than silently
+  acknowledged. The 24h age-only check is complemented by an immediate-restart
+  simulation test.
+
+#### Relay liveness (P2)
+
+- `relay_register` now refreshes `last_poll_at` on the upsert, so a stale
+  client that reconnects is not deleted by `relay_expire_stale` between its
+  registration and first poll. Regression test added.
+
+Full suite: 699 passed, 6 skipped across two clean full runs.
+
 ### rc38-review release blockers: Desktop wake production path, relay ownership, watchdog (rc39)
 
 #### Codex Desktop wake production path actually delivers (P0)

@@ -255,6 +255,38 @@ class DesktopRelay:
         result = self.client.get("/relay/poll", params)
         return result.get("deliveries") if isinstance(result, dict) else []
 
+    def _reload_capability(self) -> bool:
+        """Re-resolve the Desktop capability (pipe + thread) after a failure.
+
+        A Desktop restart invalidates the private pipe; re-running
+        ``vanth setup desktop`` rewrites ``codex_desktop.json`` with a fresh
+        ``provisioned_at``. On pipe-unavailable failure the relay re-reads the
+        capability and returns whether anything changed. If the pipe/thread
+        changed, the relay re-registers the new destination and continues; if
+        nothing changed, the failure is treated as a genuine outage with an
+        explicit reprovision diagnostic (review rc39 P1).
+        """
+        new_pipe = _desktop_pipe_path()
+        new_thread = _codex_thread_identity()
+        if new_pipe == self.pipe_path and new_thread == self.caller_thread_id:
+            return False
+        if new_pipe:
+            self.pipe_path = new_pipe
+        if new_thread:
+            self.caller_thread_id = new_thread
+        self.destinations = (
+            [{"client_type": "codex_desktop", "thread_id": self.caller_thread_id}]
+            if self.caller_thread_id and self.pipe_path
+            else []
+        )
+        self._registered = False
+        import logging
+
+        logging.getLogger("vanth").warning(
+            "Desktop wake capability changed (pipe/thread re-provisioned); re-registering relay"
+        )
+        return True
+
     def _ack(self, delivery: dict[str, Any], status: str, error: str | None = None) -> None:
         payload: dict[str, Any] = {
             "client_id": self.client_id,
@@ -281,6 +313,7 @@ class DesktopRelay:
 
     def _deliver(self, delivery: dict[str, Any]) -> None:
         from .codex_bridge import send_delivery_to_codex_desktop
+        from .codex_pipe import CodexPipeUnavailable
 
         # Deliver through the native pipe, injecting the relay's authenticated
         # caller/executor thread identity (required as outer params.threadId) and
@@ -296,6 +329,21 @@ class DesktopRelay:
                 pipe_path=self.pipe_path,
             )
             self._ack(delivery, "delivered")
+        except CodexPipeUnavailable:
+            # Desktop restart invalidates the private pipe. Try to reload the
+            # capability and re-register (a re-provisioned pipe/thread may be
+            # available); if nothing changed, this is a genuine outage and we
+            # fail the delivery WITHOUT permanently consuming it (the ack marks
+            # it failed -> retry/backoff per max_attempts, and the lease is not
+            # silently accepted). review rc39 P1.
+            if not self._reload_capability():
+                import logging
+
+                logging.getLogger("vanth").warning(
+                    "Codex Desktop pipe unavailable and capability did not change; "
+                    "delivery will be retried. If Desktop restarted, re-run `vanth setup desktop`."
+                )
+            raise
         except Exception:
             # Ack failures are handled at the _run boundary (bounded reconnect),
             # not here, so a transient daemon outage cannot kill the relay.
@@ -314,7 +362,16 @@ class DesktopRelay:
                     continue
                 self._backoff = 0.5
                 try:
-                    deliveries = self._poll()
+                    # The long-poll can block for up to 15s; hold the tracker as
+                    # a CONTEXT MANAGER so the watchdog sees the poll as
+                    # in-flight for its whole duration (review rc39 P1 — a
+                    # single instant notify_activity() before a long poll is
+                    # invisible if VANTH_WATCH_IDLE < poll duration).
+                    if self.activity_tracker is not None:
+                        with self.activity_tracker:
+                            deliveries = self._poll()
+                    else:
+                        deliveries = self._poll()
                 except Exception:
                     # Daemon unreachable: reconnect with backoff. Do NOT let the
                     # exception escape the loop (review rc37 P1).
@@ -325,7 +382,15 @@ class DesktopRelay:
                     if self._stop.is_set():
                         break
                     try:
-                        self._deliver(delivery)
+                        if self.activity_tracker is not None:
+                            # A Desktop delivery (helper subprocess) can run far
+                            # longer than any idle timeout; keep the tracker
+                            # active for the entire delivery + ack (review rc39
+                            # P1).
+                            with self.activity_tracker:
+                                self._deliver(delivery)
+                        else:
+                            self._deliver(delivery)
                     except Exception:
                         # A failed delivery (or failed ack) must not kill the
                         # relay: mark the delivery failed so it retries per the

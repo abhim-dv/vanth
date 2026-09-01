@@ -162,13 +162,15 @@ def test_runner_popen_failure_marks_job_failed(tmp_path, monkeypatch):
 
 
 def test_stale_stop_does_not_cancel_replacement_launch(tmp_path):
-    """Review rc38 P1: a stale stop must never cancel a replacement launch owner.
+    """Review rc39 P1: the real _stop interleaving must never cancel a
+    replacement launch owner.
 
-    A stop snapshots claim A on a 'launching' row. Between the snapshot and the
-    terminal transition, a recovery/restart installs claim B and promotes the
-    row to 'running' under B. The final transition must be CAS'd on the ORIGINAL
-    observed claim A, so a row now owned by B returns 0 and the stale stop does
-    NOT mutate the new launch."""
+    _stop's FIRST read observes claim A. Between that read and the stop-request
+    write, a finish+restart/recovery installs claim B (and promotes to
+    'running'). The stop-request UPDATE is ownership-CAS'd on claim A, so it
+    affects zero rows and _stop returns WITHOUT setting the stop flag or
+    transitioning B. This drives the real _stop path (not _transition_terminal
+    in isolation)."""
     from vanth.server import now_iso
 
     manager = JobManager(tmp_path, recover=False)
@@ -188,7 +190,26 @@ def test_stale_stop_does_not_cancel_replacement_launch(tmp_path):
             )
             manager.db.commit()
 
-        # A recovery/restart installs claim B and promotes to 'running'.
+        # _stop snapshots the row AFTER the first read; to reproduce the race we
+        # swap claim A -> claim B between the observation and the stop-request
+        # write. Patch _row to return the claim-A snapshot on the FIRST call
+        # (the observation) and the real (claim-B) row thereafter, so the
+        # stop-request UPDATE runs while the row is already owned by B.
+        original_row = manager._row
+        calls = {"n": 0}
+
+        def racy_row(sql, params=()):
+            calls["n"] += 1
+            if calls["n"] == 1 and "claim_token" in sql:
+                # The first ownership read returns the ORIGINAL claim-A row, even
+                # though the DB already moved on to B.
+                row = original_row("SELECT status, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,))
+                if row is None:
+                    return None
+                return dict((k, (claim_a if k == "claim_token" else row[k])) for k in row.keys())
+            return original_row(sql, params)
+
+        # Install claim B and promote to 'running' BEFORE the stop request.
         claim_b = "claim_B"
         with manager.db_lock:
             manager.db.execute(
@@ -197,22 +218,18 @@ def test_stale_stop_does_not_cancel_replacement_launch(tmp_path):
             )
             manager.db.commit()
 
-        # Now the stale stop observes the row (status running under B) and
-        # attempts the terminal transition. Its observed ownership is B (from
-        # the reload), so it legitimately owns the stop — this is the case where
-        # the stale stop DID see the new owner and must not cancel it if B is a
-        # NEWER launch it never started. We simulate the exact reviewer hazard:
-        # the snapshot was taken under A, then B installed. To force the hazard,
-        # bypass the mid-function reload and assert the transition is CAS'd on
-        # the snapshot token.
-        #
-        # Directly exercise the guard: a transition under claim A on a row now
-        # owned by B must return False (0 rows).
-        changed = manager._transition_terminal(job_id, "cancelled", claim_token=claim_a)
-        assert changed is False, "stale claim A must not cancel a row now owned by claim B"
-        row = manager._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job_id,))
+        manager._row = racy_row
+        try:
+            result = manager.stop_sync(job_id, kill_after_seconds=0)
+        finally:
+            manager._row = original_row
+        # The stale stop must NOT set the stop flag or cancel B.
+        assert result["status"] != "cancelled", f"stale stop must not cancel B: {result}"
+        assert "newer launch" in result.get("message", ""), f"unexpected message: {result}"
+        row = manager._row("SELECT status, claim_token, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
         assert row["status"] == "running", "the replacement launch must remain running"
         assert row["claim_token"] == claim_b, "the replacement owner must be untouched"
+        assert row["stop_requested_at"] is None, "the stop flag must not be set on the replacement launch"
     finally:
         manager.close()
 
