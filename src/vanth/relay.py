@@ -37,6 +37,14 @@ therefore accepts the capability through an explicit, supported handoff:
 The relay NEVER silently no-ops: if the capability is absent it records an
 explicit diagnostic (returned by ``start_desktop_relay``) so Desktop wake is
 known to be unavailable rather than silently pending.
+
+EXPERIMENTAL (review rc38 P2): the private host-pipe contract is not documented
+by official Codex material. This integration is explicitly experimental and
+scoped to ONE provisioned task per Desktop lifetime: one per-home capability
+file stores one pipe/thread tuple, provisioning a second Desktop task overwrites
+the first, and a Desktop restart invalidates the private pipe (stale capability
+is detected and surfaced, not silently used). Automatic or durable multi-task
+Desktop wake is NOT supported yet.
 """
 
 from __future__ import annotations
@@ -49,6 +57,11 @@ from typing import Any
 
 from .client import VanthClient
 
+# A Desktop wake capability older than this is treated as stale (a Desktop
+# restart invalidates the private app-tools pipe). 24h is generous for a
+# long-lived Desktop session while still catching stale tuples promptly.
+_DESKTOP_CAPABILITY_TTL_SECONDS = 24 * 3600
+
 
 class RelayError(RuntimeError):
     pass
@@ -58,16 +71,49 @@ def _desktop_capability_file() -> dict[str, Any] | None:
     """Read the per-home Desktop wake capability file, if present.
 
     ``vanth setup desktop`` writes this file with the pipe path and thread
-    identity it was granted when Desktop integration was active.
+    identity it was granted when Desktop integration was active. The private
+    app-tools pipe is invalidated by a Desktop restart, so a capability that is
+    stale is surfaced (not silently used) — the relay logs an explicit
+    diagnostic and does NOT register a destination it cannot deliver to (review
+    rc38 P2: stale-capability detection; this integration is explicitly
+    experimental and scoped to one provisioned task per Desktop lifetime).
     """
     try:
+        from datetime import datetime, timezone
+
         from .paths import canonical_home
 
         path = canonical_home() / "codex_desktop.json"
         if not path.is_file():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        # Stale-capability detection: a capability provisioned more than
+        # `_DESKTOP_CAPABILITY_TTL_SECONDS` ago is treated as stale. Desktop
+        # restart invalidates the private pipe path, so an old capability is
+        # almost certainly pointing at a dead pipe. The relay treats a stale
+        # file as ABSENT (fail closed) and logs a diagnostic so the operator
+        # re-runs `vanth setup desktop`.
+        provisioned_at = data.get("provisioned_at")
+        if provisioned_at:
+            try:
+                parsed = datetime.fromisoformat(provisioned_at.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - parsed).total_seconds()
+                if age > _DESKTOP_CAPABILITY_TTL_SECONDS:
+                    import logging
+
+                    logging.getLogger("vanth").warning(
+                        "Desktop wake capability file is STALE (provisioned %s, "
+                        "over %ss old); a Desktop restart invalidates the private pipe. "
+                        "Re-run `vanth setup desktop` inside an active Desktop session.",
+                        provisioned_at,
+                        _DESKTOP_CAPABILITY_TTL_SECONDS,
+                    )
+                    return None
+            except (ValueError, TypeError):
+                pass
+        return data
     except Exception:
         return None
 
@@ -136,6 +182,7 @@ class DesktopRelay:
         *,
         destinations: list[dict[str, Any]] | None = None,
         caller_thread_id: str | None = None,
+        pipe_path: str | None = None,
         poll_interval: float = 0.5,
         max_reconnect_delay: float = 15.0,
         activity_tracker: Any = None,
@@ -145,6 +192,11 @@ class DesktopRelay:
         self.destinations = destinations if destinations is not None else _destinations()
         # The executor/caller thread identity used as the outer params.threadId.
         self.caller_thread_id = caller_thread_id or _codex_thread_identity()
+        # The resolved app-tools pipe path (explicit handoff env or capability
+        # file). This MUST be carried into delivery: the delivery path reads only
+        # CODEX_APP_TOOLS_PIPE_PATH, which real MCP children do not inherit
+        # (review rc38 P0 — the provisioned pipe was discarded at delivery).
+        self.pipe_path = pipe_path or _desktop_pipe_path()
         self.poll_interval = poll_interval
         self.max_reconnect_delay = max_reconnect_delay
         # Optional watchdog activity tracker: while the relay owns an active
@@ -212,18 +264,37 @@ class DesktopRelay:
         }
         if error is not None:
             payload["error"] = error
-        self.client.post("/relay/ack", payload)
+        result = self.client.post("/relay/ack", payload)
+        # VanthClient.post() converts HTTP errors into JSON error objects rather
+        # than raising. A stale lease, ownership mismatch, or other rejected
+        # acknowledgement MUST NOT be treated as success — otherwise the relay
+        # believes the wake is complete while the row remains 'dispatching' and
+        # the lease expiry reclaims/delivers it again (review rc38 P1).
+        if not isinstance(result, dict) or result.get("result") != "ok":
+            detail = ""
+            if isinstance(result, dict):
+                detail = result.get("error") or result.get("message") or ""
+            raise RelayError(
+                f"acknowledgement rejected for delivery {delivery['delivery_id']} "
+                f"(lease may be stale or reclaimed): {detail}".rstrip()
+            )
 
     def _deliver(self, delivery: dict[str, Any]) -> None:
         from .codex_bridge import send_delivery_to_codex_desktop
 
         # Deliver through the native pipe, injecting the relay's authenticated
-        # caller/executor thread identity (required as outer params.threadId).
+        # caller/executor thread identity (required as outer params.threadId) and
+        # the relay's RESOLVED pipe path (the provisioned handoff pipe — delivery
+        # must not fall back to the un-inherited CODEX_APP_TOOLS_PIPE_PATH).
         # At-least-once semantics: the Vanth delivery id is the stable call/turn
         # correlation key. If host admission succeeds but the ack is lost, the
         # lease expires and the delivery is reclaimed for retry.
         try:
-            send_delivery_to_codex_desktop(delivery["payload"], caller_thread_id=self.caller_thread_id)
+            send_delivery_to_codex_desktop(
+                delivery["payload"],
+                caller_thread_id=self.caller_thread_id,
+                pipe_path=self.pipe_path,
+            )
             self._ack(delivery, "delivered")
         except Exception:
             # Ack failures are handled at the _run boundary (bounded reconnect),

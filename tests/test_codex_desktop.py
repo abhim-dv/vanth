@@ -34,6 +34,8 @@ from vanth.codex_pipe import (
     CodexPipeError,
     CodexPipeUnavailable,
     MAX_FRAME_BYTES,
+    _claim_lease_seconds,
+    _helper_hard_deadline,
     send_desktop_message,
 )
 from vanth.server import JobManager
@@ -267,6 +269,93 @@ class TestFraming:
         sock.close()
 
 
+class TestHelperSubprocess:
+    """Review rc38 P0: production launches `python -m vanth.codex_pipe --helper`
+    and must get a real JSON response. This exercises the REAL subprocess branch
+    (no `_handle` shortcut) exactly as production does."""
+
+    def test_helper_module_entry_point_responds(self):
+        # No pipe configured: the helper must still respond with a valid JSON
+        # error object (not exit 0 with empty stdout), proving main() runs.
+        env = dict(os.environ)
+        env.pop("CODEX_APP_TOOLS_PIPE_PATH", None)
+        env.pop("VANTH_CODEX_DESKTOP_PIPE", None)
+        request = {
+            "pipe_path": "",
+            "timeout_seconds": 5,
+            "destination_thread_id": "t",
+            "prompt": "p",
+            "caller_thread_id": "c",
+            "call_id": "x",
+        }
+        proc = subprocess.run(
+            [sys.executable, "-m", "vanth.codex_pipe", "--helper"],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"helper must exit 0, got {proc.returncode}: {proc.stderr}"
+        assert proc.stdout, "helper must write a JSON response (not exit with empty stdout)"
+        payload = json.loads(proc.stdout)
+        assert payload.get("ok") is False
+        assert "not configured" in payload.get("error", "")
+
+    def test_helper_subprocess_sanitizes_unreachable_pipe(self):
+        # A pipe that cannot be opened must surface a sanitized error through
+        # the REAL subprocess helper (never embed the pipe path in the JSON).
+        request = {
+            "pipe_path": r"\\.\pipe\nonexistent_vanth_test",
+            "timeout_seconds": 2,
+            "destination_thread_id": "t",
+            "prompt": "p",
+            "caller_thread_id": "c",
+            "call_id": "x",
+        }
+        proc = subprocess.run(
+            [sys.executable, "-m", "vanth.codex_pipe", "--helper"],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0
+        payload = json.loads(proc.stdout)
+        assert payload.get("ok") is False
+        # The error must be sanitized: never embed the pipe path.
+        assert r"\\.\pipe\nonexistent_vanth_test" not in payload.get("error", "")
+
+
+class TestDeadlineLeaseInvariant:
+    """Review rc38 P1: the helper's hard wall-clock lifetime must be STRICTLY
+    SHORTER than the delivery claim lease, so a stalled helper can never outlive
+    the lease and cause concurrent duplicate delivery."""
+
+    def test_helper_deadline_shorter_than_lease_for_default(self):
+        timeout = 300  # default Desktop timeout
+        assert _helper_hard_deadline(timeout) < _claim_lease_seconds(timeout)
+
+    def test_helper_deadline_shorter_than_lease_for_minimum(self):
+        timeout = 1  # minimum configured timeout
+        assert _helper_hard_deadline(timeout) < _claim_lease_seconds(timeout)
+
+    def test_helper_deadline_shorter_than_lease_for_configured(self):
+        for timeout in (30, 60, 120, 600, 900):
+            assert _helper_hard_deadline(timeout) < _claim_lease_seconds(timeout), (
+                f"helper deadline {_helper_hard_deadline(timeout)}s must be < lease "
+                f"{_claim_lease_seconds(timeout)}s for timeout={timeout}"
+            )
+
+    def test_helper_deadline_leaves_room_for_pipe_call(self):
+        # The helper must at least cover the pipe call's own timeout plus a
+        # small buffer so a legitimate slow host is not cut short by the helper
+        # BEFORE the pipe call's own deadline fires.
+        timeout = 30
+        assert _helper_hard_deadline(timeout) >= timeout
+        assert _helper_hard_deadline(timeout) <= timeout + 2
+
+
 class TestDesktopDelivery:
     def test_send_desktop_message_preflights_and_calls(self):
         server = FakePipeServer()
@@ -391,6 +480,128 @@ class TestDesktopDelivery:
         sock.close()
 
 
+class TestRelayProvisionedPipeDelivery:
+    """Review rc38 P0: the relay's RESOLVED pipe path (explicit handoff env OR
+    capability file) must be carried into delivery — the delivery path must NOT
+    fall back to the un-inherited CODEX_APP_TOOLS_PIPE_PATH."""
+
+    def test_relay_passes_resolved_pipe_to_delivery(self, monkeypatch, tmp_path):
+        import vanth.relay as relay_mod
+
+        monkeypatch.setenv("VANTH_CODEX_DESKTOP_PIPE", r"\\.\pipe\handoff_pipe")
+        monkeypatch.setenv("VANTH_CODEX_DESKTOP_THREAD", "thread_exec")
+        monkeypatch.setenv("VANTH_HOME", str(tmp_path))
+
+        delivered = {}
+
+        class FakeClient:
+            def ensure(self):
+                return True
+
+            def post(self, path, payload):
+                if path == "/relay/ack":
+                    return {"result": "ok"}
+                return {"result": "ok"}
+
+            def get(self, path, params):
+                return {"deliveries": []}
+
+        from vanth import codex_bridge
+
+        orig = codex_bridge.send_delivery_to_codex_desktop
+
+        def spy(payload, *, caller_thread_id=None, pipe_path=None):
+            delivered["caller_thread_id"] = caller_thread_id
+            delivered["pipe_path"] = pipe_path
+            return {"ok": True}
+
+        codex_bridge.send_delivery_to_codex_desktop = spy
+        try:
+            relay = relay_mod.DesktopRelay(FakeClient(), "client_x")
+            # Resolved from the explicit handoff env.
+            assert relay.pipe_path == r"\\.\pipe\handoff_pipe"
+            delivery = {
+                "delivery_id": "del_1",
+                "lease_token": "tok",
+                "payload": {"target": {"type": "codex_desktop", "thread_id": "t"}, "prompt": "wake"},
+            }
+            relay._deliver(delivery)
+            assert delivered["caller_thread_id"] == "thread_exec"
+            assert delivered["pipe_path"] == r"\\.\pipe\handoff_pipe", (
+                "the resolved handoff pipe must reach delivery, not the un-inherited env"
+            )
+        finally:
+            codex_bridge.send_delivery_to_codex_desktop = orig
+
+    def test_relay_uses_capability_file_pipe(self, monkeypatch, tmp_path):
+        """The capability-file handoff path: the relay must resolve the pipe from
+        the per-home file and pass THAT through delivery, with CODEX_APP_TOOLS_PIPE_PATH
+        absent (real MCP children do not inherit it)."""
+        import json as _json
+        import vanth.relay as relay_mod
+
+        monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_PIPE", raising=False)
+        monkeypatch.setenv("VANTH_CODEX_DESKTOP_THREAD", "thread_cap")
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("VANTH_HOME", str(home))
+        cap = home / "codex_desktop.json"
+        from datetime import datetime, timezone
+
+        cap.write_text(
+            _json.dumps(
+                {
+                    "pipe_path": r"\\.\pipe\capability_pipe",
+                    "thread_id": "thread_cap",
+                    "caller_thread_id": "thread_cap",
+                    "provisioned_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        delivered = {}
+
+        class FakeClient:
+            def ensure(self):
+                return True
+
+            def post(self, path, payload):
+                if path == "/relay/ack":
+                    return {"result": "ok"}
+                return {"result": "ok"}
+
+            def get(self, path, params):
+                return {"deliveries": []}
+
+        from vanth import codex_bridge
+
+        orig = codex_bridge.send_delivery_to_codex_desktop
+
+        def spy(payload, *, caller_thread_id=None, pipe_path=None):
+            delivered["caller_thread_id"] = caller_thread_id
+            delivered["pipe_path"] = pipe_path
+            return {"ok": True}
+
+        codex_bridge.send_delivery_to_codex_desktop = spy
+        try:
+            relay = relay_mod.DesktopRelay(FakeClient(), "client_cap")
+            assert relay.pipe_path == r"\\.\pipe\capability_pipe"
+            assert relay.caller_thread_id == "thread_cap"
+            relay._deliver(
+                {
+                    "delivery_id": "del_2",
+                    "lease_token": "tok2",
+                    "payload": {"target": {"type": "codex_desktop", "thread_id": "t"}, "prompt": "wake"},
+                }
+            )
+            assert delivered["pipe_path"] == r"\\.\pipe\capability_pipe"
+            assert delivered["caller_thread_id"] == "thread_cap"
+        finally:
+            codex_bridge.send_delivery_to_codex_desktop = orig
+
+
 class TestRelay:
     def _start_delivery(self, manager, thread_id="thread_dest"):
         async def main():
@@ -496,6 +707,37 @@ class TestRelay:
         finally:
             manager.close()
 
+    def test_threadId_alias_target_is_pollable(self, tmp_path):
+        """Review rc38 P1: the documented legacy `threadId` alias is accepted by
+        validation and must be pollable by the relay. The target key is
+        canonicalized to thread_id at persistence (and the SQL filter covers
+        both JSON paths), so a delivery registered with threadId is NOT left
+        pending forever."""
+        manager = JobManager(tmp_path / "state", recover=False)
+        try:
+            manager.relay_register(
+                "client_1", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_legacy"}]
+            )
+            # Wake a job with the camelCase alias.
+            from vanth.server import canonicalize_wake_target
+
+            async def main():
+                job = await manager.start(
+                    subprocess.list2cmdline([sys.executable, "-c", "import sys; sys.exit(0)"]),
+                    wake_targets=[{"type": "codex_desktop", "events": ["completed"], "threadId": "thread_legacy"}],
+                )
+                await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)
+                return job["job_id"]
+
+            job_id = asyncio.run(main())
+            polled = manager.relay_poll("client_1", timeout_seconds=1)
+            assert polled, "a delivery registered with threadId must be pollable"
+            target = polled[0]["payload"]["target"]
+            assert target.get("thread_id") == "thread_legacy"
+            assert canonicalize_wake_target({"threadId": "x"}) == {"thread_id": "x"}
+        finally:
+            manager.close()
+
     def test_sql_filter_before_limit_no_starvation(self, tmp_path):
         manager = JobManager(tmp_path / "state", recover=False)
         try:
@@ -538,6 +780,39 @@ class TestRelay:
         finally:
             manager.close()
 
+    def test_relay_ack_rejected_is_not_silent(self):
+        """Review rc38 P1: a rejected acknowledgement (stale lease, ownership
+        mismatch) must RAISE, never be silently treated as success. The relay
+        must not believe a wake is complete while the row stays 'dispatching'."""
+        from vanth.relay import DesktopRelay, RelayError
+
+        calls = []
+
+        class RejectingClient:
+            def post(self, path, payload):
+                if path == "/relay/ack":
+                    calls.append(payload)
+                    # VanthClient.post converts HTTP 409 into a JSON error object.
+                    return {"result": "error", "error": "delivery is not claimed by this relay"}
+                return {"result": "ok"}
+
+        relay = DesktopRelay(RejectingClient(), "client_x")
+        delivery = {"delivery_id": "del_reject", "lease_token": "stale_tok"}
+        with pytest.raises(RelayError, match="rejected|stale|reclaimed"):
+            relay._ack(delivery, "delivered")
+        assert calls, "the ack must be attempted"
+        assert calls[0]["lease_token"] == "stale_tok"
+
+    def test_relay_ack_success_does_not_raise(self):
+        from vanth.relay import DesktopRelay
+
+        class OkClient:
+            def post(self, path, payload):
+                return {"result": "ok"}
+
+        relay = DesktopRelay(OkClient(), "client_x")
+        relay._ack({"delivery_id": "del_ok", "lease_token": "tok"}, "delivered")  # must not raise
+
 
 class TestRelayProvisioning:
     def test_destinations_require_pipe_and_thread(self, monkeypatch):
@@ -577,6 +852,64 @@ class TestRelayProvisioning:
         monkeypatch.delenv("VANTH_CODEX_DESKTOP_THREAD", raising=False)
         monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
         assert relay_mod.start_desktop_relay() is None
+
+    def test_stale_capability_is_detected_and_fails_closed(self, monkeypatch, tmp_path):
+        """Review rc38 P2: a capability file older than the TTL (a Desktop
+        restart invalidates the private pipe) must be treated as ABSENT — fail
+        closed with a diagnostic, not silently used."""
+        import json as _json
+        import vanth.relay as relay_mod
+
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_PIPE", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_THREAD", raising=False)
+        monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("VANTH_HOME", str(home))
+        stale = datetime.now(timezone.utc) - timedelta(seconds=relay_mod._DESKTOP_CAPABILITY_TTL_SECONDS + 3600)
+        cap = home / "codex_desktop.json"
+        cap.write_text(
+            _json.dumps(
+                {
+                    "pipe_path": r"\\.\pipe\stale_pipe",
+                    "thread_id": "thread_stale",
+                    "caller_thread_id": "thread_stale",
+                    "provisioned_at": stale.isoformat().replace("+00:00", "Z"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Fresh capability: resolves.
+        fresh = datetime.now(timezone.utc)
+        cap.write_text(
+            _json.dumps(
+                {
+                    "pipe_path": r"\\.\pipe\fresh_pipe",
+                    "thread_id": "thread_fresh",
+                    "caller_thread_id": "thread_fresh",
+                    "provisioned_at": fresh.isoformat().replace("+00:00", "Z"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert relay_mod._desktop_pipe_path() == r"\\.\pipe\fresh_pipe"
+        # Now make it stale.
+        cap.write_text(
+            _json.dumps(
+                {
+                    "pipe_path": r"\\.\pipe\stale_pipe",
+                    "thread_id": "thread_stale",
+                    "caller_thread_id": "thread_stale",
+                    "provisioned_at": stale.isoformat().replace("+00:00", "Z"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert relay_mod._desktop_pipe_path() is None, "stale capability must fail closed"
+        assert relay_mod._codex_thread_identity() is None
 
     def test_start_desktop_relay_with_handoff_provisions(self, monkeypatch, tmp_path):
         """Review rc37 P0: with the host handoff env (the supported way to grant

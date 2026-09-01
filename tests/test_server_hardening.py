@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import os
 import subprocess
 import sys
 import time
@@ -158,6 +159,62 @@ def test_runner_popen_failure_marks_job_failed(tmp_path, monkeypatch):
 
     asyncio.run(main())
     manager.close()
+
+
+def test_stale_stop_does_not_cancel_replacement_launch(tmp_path):
+    """Review rc38 P1: a stale stop must never cancel a replacement launch owner.
+
+    A stop snapshots claim A on a 'launching' row. Between the snapshot and the
+    terminal transition, a recovery/restart installs claim B and promotes the
+    row to 'running' under B. The final transition must be CAS'd on the ORIGINAL
+    observed claim A, so a row now owned by B returns 0 and the stale stop does
+    NOT mutate the new launch."""
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        job_id = "job_stale_stop"
+        stdout_path = manager.logs / f"{job_id}.stdout.log"
+        stderr_path = manager.logs / f"{job_id}.stderr.log"
+        events_path = manager.events_dir / f"{job_id}.jsonl"
+        # Insert a 'launching' row owned by claim A.
+        claim_a = "claim_A"
+        stamp = now_iso()
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, "
+                "events_path, claim_token, worker_pid, pid) VALUES (?, ?, 'launching', ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                (job_id, "true", stamp, stamp, str(stdout_path), str(stderr_path), str(events_path), claim_a),
+            )
+            manager.db.commit()
+
+        # A recovery/restart installs claim B and promotes to 'running'.
+        claim_b = "claim_B"
+        with manager.db_lock:
+            manager.db.execute(
+                "UPDATE jobs SET status='running', claim_token=?, worker_pid=?, pid=? WHERE job_id=? AND claim_token=?",
+                (claim_b, os.getpid(), os.getpid(), job_id, claim_a),
+            )
+            manager.db.commit()
+
+        # Now the stale stop observes the row (status running under B) and
+        # attempts the terminal transition. Its observed ownership is B (from
+        # the reload), so it legitimately owns the stop — this is the case where
+        # the stale stop DID see the new owner and must not cancel it if B is a
+        # NEWER launch it never started. We simulate the exact reviewer hazard:
+        # the snapshot was taken under A, then B installed. To force the hazard,
+        # bypass the mid-function reload and assert the transition is CAS'd on
+        # the snapshot token.
+        #
+        # Directly exercise the guard: a transition under claim A on a row now
+        # owned by B must return False (0 rows).
+        changed = manager._transition_terminal(job_id, "cancelled", claim_token=claim_a)
+        assert changed is False, "stale claim A must not cancel a row now owned by claim B"
+        row = manager._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job_id,))
+        assert row["status"] == "running", "the replacement launch must remain running"
+        assert row["claim_token"] == claim_b, "the replacement owner must be untouched"
+    finally:
+        manager.close()
 
 
 def test_job_start_mcp_tool_is_not_a_coroutine_function():

@@ -99,14 +99,89 @@ def test_watch_loop_never_idle_exits_while_in_flight():
         thread = threading.Thread(
             target=_watch_loop,
             args=(os.getpid(), 0.005, 60, 0.01, fake_exit, tracker),
-            kwargs={"traffic": lambda: 0},
+            kwargs={"traffic": lambda: 0, "alive": lambda: True},
             daemon=True,
         )
         thread.start()
         time.sleep(0.05)
-        assert not exited
-    thread.join(timeout=0.5)
-    assert not exited
+        assert not exited, "an in-flight tool call must prevent idle exit"
+    # After the `with` block the tracker is inactive: the idle path must now
+    # run and terminate the thread (fake_exit fires). This also prevents a
+    # leaked daemon thread from polluting later monkeypatched tests.
+    thread.join(timeout=1.0)
+    assert exited, "inactivity after the in-flight call must idle-exit"
+    assert not thread.is_alive(), "idle path must terminate the watchdog thread"
+
+
+def test_watch_loop_activity_keeps_relay_alive():
+    """Review rc38 P1: a Desktop wake relay that keeps marking activity must
+    never be idle-reaped. The bump-decrement `notify_activity()` alone is
+    invisible to the watchdog (it samples `active` once per interval); the
+    last-activity timestamp must reset the idle timer."""
+    exited = []
+    import threading
+
+    def fake_exit():
+        exited.append(True)
+
+    tracker = _InFlight()
+    stop = threading.Event()
+    parent_alive = {"value": True}
+
+    def relay_poll():
+        while not stop.is_set():
+            tracker.notify_activity()
+            time.sleep(0.01)
+
+    relay = threading.Thread(target=relay_poll, daemon=True)
+    relay.start()
+    try:
+        # Parent self (alive), idle threshold 0.05s, interval 0.005s. Without
+        # activity the process would exit in ~0.05s; the relay's continuous
+        # activity must hold it far past that.
+        thread = threading.Thread(
+            target=_watch_loop,
+            args=(os.getpid(), 0.005, 0.0, 0.05, fake_exit, tracker),
+            kwargs={"traffic": lambda: 0, "alive": lambda: parent_alive["value"]},
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.3)
+        assert not exited, "relay activity must prevent idle exit"
+        # Stop the relay AND make the parent "die" so the daemon watchdog thread
+        # terminates (a never-exiting daemon thread would keep calling
+        # subprocess/tasklist in later tests and break monkeypatched tests).
+        stop.set()
+        relay.join(timeout=0.5)
+        parent_alive["value"] = False
+        thread.join(timeout=0.5)
+        assert not thread.is_alive(), "watchdog thread must exit once the parent dies"
+    finally:
+        stop.set()
+        relay.join(timeout=0.5)
+
+
+def test_watch_loop_idle_exits_after_activity_stops():
+    """Review rc38 P1: once the relay goes quiet, the idle timer runs and the
+    process exits. Activity is a per-sample reset, not a keep-alive grant."""
+    exited = []
+    import threading
+
+    def fake_exit():
+        exited.append(True)
+
+    tracker = _InFlight()
+    tracker.notify_activity()
+    time.sleep(0.02)
+    thread = threading.Thread(
+        target=_watch_loop,
+        args=(os.getpid(), 0.005, 60, 0.03, fake_exit, tracker),
+        kwargs={"traffic": lambda: 0, "alive": lambda: True},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=1.0)
+    assert exited, "inactivity after the last activity must idle-exit"
 
 
 def test_start_watchdog_none_when_no_parent(monkeypatch):
@@ -132,11 +207,27 @@ def test_start_watchdog_runs_when_parent_exists(monkeypatch):
 
     orig = pw.os.getppid
     pw.os.getppid = lambda: os.getpid()  # self as parent → alive
+    orig_alive = pw.process_alive
+    # Start with the parent alive, then flip process_alive to False so the
+    # grace-0 parent-death path terminates the thread. Without this the
+    # self-parent watchdog would run forever and its per-poll `tasklist` probe
+    # would pollute later monkeypatched subprocess.run tests.
+    state = {"alive": True}
+    pw.process_alive = lambda pid: state["alive"]
+    exited = []
     try:
-        thread, tracker = start_watchdog(interval=0.05, grace=60, idle=0.0)
+        # A no-op on_exit: the DEFAULT _exiting calls os._exit(0), which would
+        # kill the whole pytest process when we simulate parent death.
+        thread, tracker = start_watchdog(interval=0.05, grace=0.0, idle=0.0, on_exit=lambda: exited.append(True))
         assert thread is not None and thread.is_alive()
-        thread.join(timeout=0.2)
+        time.sleep(0.1)
+        assert thread.is_alive()
+        state["alive"] = False
+        thread.join(timeout=1.0)
+        assert not thread.is_alive(), "watchdog must terminate once the parent dies"
+        assert exited, "parent death must trigger the exit callback"
     finally:
+        pw.process_alive = orig_alive
         pw.os.getppid = orig
 
 

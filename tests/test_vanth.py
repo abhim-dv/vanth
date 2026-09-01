@@ -1485,7 +1485,9 @@ def test_restart_failures_advance_failure_streak(tmp_path):
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             await manager.wait(job["job_id"], ["gave_up"], timeout_seconds=60)
             # The streak watcher may lag the gave_up event by a tick; poll.
-            deadline = time.monotonic() + 5
+            # 15s window: the full suite runs under load and the watcher tick can
+            # lag well past the 5s it comfortably clears in isolation.
+            deadline = time.monotonic() + 15
             streak = 0
             while time.monotonic() < deadline:
                 streak = int(manager._policy_state(job["job_id"]).get("failure_streak", 0))

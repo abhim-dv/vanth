@@ -24,7 +24,9 @@ def cmd(code: str) -> str:
     return subprocess.list2cmdline([sys.executable, "-c", code])
 
 
-def wait_completed(manager: JobManager, job_id: str, timeout: float = 60) -> None:
+def wait_completed(manager: JobManager, job_id: str, timeout: float = 120) -> None:
+    # 120s default: the concurrent burst test launches 10 jobs in parallel and
+    # the full suite runs under load; 60s flaked when reader threads lagged.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if manager.status(job_id)["status"] in {"completed", "failed"}:

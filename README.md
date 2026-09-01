@@ -715,6 +715,15 @@ or launch Vanth with `VANTH_CODEX_DESKTOP_PIPE` /
 closed with an actionable "Desktop integration unavailable" error and is never
 routed to the CLI.
 
+> **Experimental.** The private host-pipe contract is not documented by official
+> Codex material. This integration is scoped to ONE provisioned task per Desktop
+> lifetime: one per-home `codex_desktop.json` stores one pipe/thread tuple,
+> provisioning a second Desktop task overwrites the first, and a Desktop restart
+> invalidates the private pipe. A stale capability (older than 24h) is detected
+> and fails closed with a diagnostic asking you to re-run `vanth setup desktop`
+> inside an active Desktop session. Automatic or durable multi-task Desktop wake
+> is NOT supported yet.
+
 ### opencode_thread
 
 Resumes an OpenCode session:

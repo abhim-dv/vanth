@@ -4,6 +4,73 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc38-review release blockers: Desktop wake production path, relay ownership, watchdog (rc39)
+
+#### Codex Desktop wake production path actually delivers (P0)
+
+- **Helper module entry point.** `python -m vanth.codex_pipe --helper` never
+  called `main()`, so production Desktop wake exited 0 with empty stdout and
+  every delivery failed as an invalid helper response. The module now has a
+  real `if __name__ == "__main__": main()` entry point, with a subprocess-level
+  regression test (no parent `_handle` shortcut).
+- **Provisioned pipe is carried into delivery.** The relay resolves the rc38
+  handoff pipe (`VANTH_CODEX_DESKTOP_PIPE` / `codex_desktop.json`) for
+  registration but DISCARDED it at delivery — `send_delivery_to_codex_desktop`
+  only consulted `CODEX_APP_TOOLS_PIPE_PATH`, which real MCP children do not
+  inherit. The relay now passes its resolved pipe path through `_deliver` →
+  `send_delivery_to_codex_desktop(pipe_path=...)` → `send_desktop_message`.
+  End-to-end tests cover both the explicit handoff env and the capability-file
+  path with `CODEX_APP_TOOLS_PIPE_PATH` absent.
+
+#### Relay ownership, watchdog, and contract (P1)
+
+- **MCP wake tool names restored.** rc38 registered the wake tools under
+  `mcp_`-prefixed names, breaking the rc37/documented contract
+  (`job_add_wake_target` / `job_wake_now` / `daemon_wake`). The explicit-config
+  adapters are now registered under the EXISTING external MCP names via
+  FastMCP's `name=` argument; agents never see `mcp_`-prefixed names. The stdio
+  contract test asserts the complete documented tool-name set and that no
+  `mcp_`-prefixed name is exposed.
+- **Relay activity actually resets the idle watchdog.** `notify_activity()`'s
+  bump-decrement was invisible to `_watch_loop` (which samples `active` once
+  per interval). `_InFlight` now records a last-activity monotonic timestamp on
+  every bump, and the watchdog resets its idle timer whenever
+  `now - last_activity < interval`. Deterministic watchdog tests prove repeated
+  relay activity prevents idle exit and that inactivity still exits.
+- **Helper deadline is strictly shorter than the claim lease.** The helper hard
+  deadline was `timeout * 2` (600s for the default 300s timeout) while the
+  delivery lease is ~305s — a stalled helper could outlive the lease and permit
+  concurrent duplicate delivery. The helper deadline is now `timeout + 2`,
+  strictly shorter than the lease. Invariant tests cover default/minimum/
+  configured timeouts.
+- **`threadId` alias deliveries are pollable.** Validation and
+  `_delivery_thread_target` accepted the documented legacy `threadId`, but the
+  SQL eligibility filter only read `$.target.thread_id`, leaving such deliveries
+  pending forever. Targets are canonicalized to `thread_id` at persistence and
+  the SQL covers both JSON paths. A relay-poll regression uses `threadId`.
+- **Rejected acknowledgements are not silent.** `VanthClient.post()` converts
+  HTTP errors into JSON error objects; `_ack` ignored the returned object, so a
+  stale lease / ownership mismatch was treated as success while the row stayed
+  `dispatching`. `_ack` now requires `result == "ok"` and raises otherwise.
+- **Stale stop cannot cancel a replacement owner.** The launching-branch stop
+  fallback called the unguarded `_transition_terminal(job_id, "cancelled")`
+  after a failed CAS, allowing a stale stop to cancel a recovery/restart's new
+  claim. The fallback now preserves the observed claim token and CAS's on it
+  throughout; a changed owner returns without mutating the new launch. A
+  deterministic stop/recovery interleaving test covers it.
+
+#### Experimental scoping & stale-capability detection (P2)
+
+- The private Desktop host-pipe contract is explicitly experimental and scoped
+  to ONE provisioned task per Desktop lifetime. The capability file now records
+  `provisioned_at`; a capability older than 24h is detected and fails closed
+  with a diagnostic (re-run `vanth setup desktop`) instead of silently using a
+  dead pipe. Docs (README / agent-tools) state the single-task, restart-fragile
+  limitation and that automatic/durable multi-task Desktop wake is not
+  supported yet.
+
+Full suite: 694 passed, 6 skipped across two clean full runs.
+
 ### rc37-review release blockers: real Desktop wake path, relay ownership (rc38)
 
 #### Codex Desktop wake actually works (P0)

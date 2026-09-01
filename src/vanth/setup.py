@@ -244,7 +244,14 @@ def register_codex_desktop(home: Path) -> tuple[bool, str]:
             missing.append("thread id (CODEX_THREAD_ID / VANTH_CODEX_DESKTOP_THREAD)")
         return False, f"Desktop capability unavailable (missing {', '.join(missing)}); run this inside a Codex Desktop session with app-tools active"
     path = home / "codex_desktop.json"
-    payload = {"pipe_path": pipe_path, "thread_id": thread_id, "caller_thread_id": thread_id}
+    from datetime import datetime, timezone
+
+    payload = {
+        "pipe_path": pipe_path,
+        "thread_id": thread_id,
+        "caller_thread_id": thread_id,
+        "provisioned_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     try:

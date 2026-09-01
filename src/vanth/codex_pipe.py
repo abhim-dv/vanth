@@ -30,7 +30,6 @@ from typing import Any
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
-_HELPER_HARD_DEADLINE_SECONDS = 60.0
 
 
 def _produce(target_queue: "queue.Queue[Any]", fn, *args: Any) -> None:
@@ -304,6 +303,30 @@ class CodexPipeClient:
         return result
 
 
+def _helper_hard_deadline(timeout_seconds: float) -> float:
+    """Return the helper subprocess's hard wall-clock lifetime for a pipe call.
+
+    The helper must never outlive the delivery's claim lease, otherwise a
+    stalled helper could still be running while the daemon reclaims the
+    delivery and a second relay submits the same wake concurrently (review
+    rc38 P1). The pipe call itself enforces ``timeout_seconds`` internally, so
+    the helper only needs a small buffer beyond it — this is strictly SHORTER
+    than the claim lease (``timeout_seconds + delivery_lease_margin``), which
+    guarantees the helper dies before the lease expires.
+    """
+    return timeout_seconds + 2.0
+
+
+def _claim_lease_seconds(timeout_seconds: float, margin: int = 5) -> float:
+    """Return the delivery claim lease length for a Desktop wake.
+
+    Mirrors the daemon's lease computation (``timeout_seconds +
+    delivery_lease_margin``) and is used to assert the invariant that the
+    helper hard deadline is strictly shorter than the lease (review rc38 P1).
+    """
+    return timeout_seconds + max(1, margin)
+
+
 def send_desktop_message(
     *,
     destination_thread_id: str,
@@ -323,7 +346,8 @@ def send_desktop_message(
     Production runs the blocking pipe I/O in a killable helper subprocess with a
     hard deadline (review rc37 P1) so a stalled named-pipe read can never hang
     the relay thread; the subprocess reads the pipe path from its inherited
-    environment only.
+    environment only. The hard deadline is strictly shorter than the delivery
+    claim lease (review rc38 P1).
     """
     if not isinstance(caller_thread_id, str) or not caller_thread_id:
         raise CodexPipeError(
@@ -358,7 +382,10 @@ def send_desktop_message(
         "call_id": call_id,
     }
     argv = [sys.executable, "-m", "vanth.codex_pipe", "--helper"]
-    hard_deadline = max(timeout_seconds * 2, _HELPER_HARD_DEADLINE_SECONDS)
+    # Strictly shorter than the claim lease (timeout + margin) so a stalled
+    # helper can never outlive the lease and cause concurrent duplicate
+    # delivery (review rc38 P1).
+    hard_deadline = _helper_hard_deadline(timeout_seconds)
     try:
         result = subprocess.run(
             argv,
@@ -449,3 +476,11 @@ def main() -> None:
         print(json.dumps({"ok": True, "result": result}, separators=(",", ":")))
     finally:
         client.close()
+
+
+if __name__ == "__main__":
+    # Module entry point: production launches the helper as
+    # `python -m vanth.codex_pipe --helper` (review rc38 P0). Without this the
+    # subprocess exits 0 with empty stdout and every Desktop wake fails as an
+    # invalid helper response.
+    main()

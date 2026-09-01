@@ -22,11 +22,12 @@ The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_cleanup`, `job_metrics_query`, `job_metric_compare`, `job_run_summary`,
 `job_artifact_add`, `job_artifacts`, `job_dashboard`, `job_metric_ingest`,
 `job_artifact_read`, `job_add_wake_target`, `job_wake_now`,
-`job_cleanup_preview`. The wake tools (`mcp_add_wake_target` /
-`mcp_job_wake_now` / `mcp_daemon_wake`) and their `daemon_wake` /
-`job_wake_now` / `job_add_wake_target` Python counterparts, plus `job_wait`
-`return_progress` and `job_tail` `follow` / `timeout_seconds`, are documented
-below.
+`job_cleanup_preview`. The wake tools (`job_add_wake_target` / `job_wake_now` /
+`daemon_wake`) and their `daemon_wake` / `job_wake_now` / `job_add_wake_target`
+Python counterparts, plus `job_wait` `return_progress` and `job_tail` `follow` /
+`timeout_seconds`, are documented below. The MCP tools are registered under
+these external names (the rc37 contract) — the `mcp_`-prefixed implementation
+names are NOT exposed to agents.
 
 ---
 
@@ -741,7 +742,7 @@ out of a job — the read side of `job_artifact_add`.
   "sha256": "...", "meta": {}, "content": "...", "truncated": false }
 ```
 
-### `mcp_job_add_wake_target` (MCP) / `job_add_wake_target` (Python)
+### `job_add_wake_target` (MCP + Python)
 
 Register a wake target against a job for **future** events. This only fires
 when the triggering event occurs **after** registration — it does NOT surface
@@ -788,7 +789,7 @@ isolated backend and does not wake the visible client.
 Errors: `ValueError` when `events` is empty or not a list of strings, or
 `type` is empty.
 
-### `mcp_job_wake_now` (MCP) / `job_wake_now` (Python)
+### `job_wake_now` (MCP + Python)
 
 Surface a wake **immediately**, even if the triggering event already fired.
 This is the genuine "wake now" operation: it registers the target AND enqueues
@@ -818,8 +819,10 @@ The Python functions keep the ORIGINAL signature
 `(job_id, target=None, events=None, type=None, **config)` — extra target config
 is passed as plain keyword arguments (e.g. `daemon_wake(job_id,
 type="local_command", command=...)`). The MCP surface is registered under the
-separately named explicit-config adapters `mcp_daemon_wake` /
-`mcp_job_wake_now` / `mcp_job_add_wake_target` (FastMCP cannot bind `**config`).
+external names `daemon_wake` / `job_wake_now` / `job_add_wake_target` (the rc37
+contract, restored in rc39) using explicit-signature config adapters — FastMCP
+cannot bind `**config`, so the MCP adapter takes an explicit `config` dict while
+keeping the documented tool name. Agents never see `mcp_`-prefixed names.
 
 ### `job_cleanup_preview`
 

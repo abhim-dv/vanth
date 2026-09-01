@@ -272,6 +272,23 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
+def canonicalize_wake_target(target: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a wake-target dict with ``threadId`` canonicalized to
+    ``thread_id``.
+
+    The documented legacy ``threadId`` alias is accepted by validation and
+    ``_delivery_thread_target``, but the relay SQL eligibility filter only reads
+    ``$.target.thread_id``. Canonicalizing ONCE at persistence guarantees a
+    delivery registered with either alias is pollable (review rc38 P1). A copy
+    is returned — the caller's dict is never mutated.
+    """
+    copied = dict(target)
+    if "threadId" in copied and "thread_id" not in copied:
+        copied["thread_id"] = copied["threadId"]
+    copied.pop("threadId", None)
+    return copied
+
+
 def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
     if targets is None:
         return
@@ -1667,11 +1684,11 @@ class JobManager:
                 f"data: {json.dumps(event.get('data') or {}, separators=(',', ':'))}\n\n"
                 "Continue from this event. Use vanth job_status/job_events/job_tail for details instead of polling."
             )
+        # Canonicalize the target key once so the persisted payload's thread id
+        # is always `thread_id` (the relay SQL filter reads only that path).
+        target_dict = canonicalize_wake_target({"type": target["type"], **config})
         return {
-            "target": {
-                "type": target["type"],
-                **config,
-            },
+            "target": target_dict,
             "event": event,
             "prompt": prompt,
             "delivery_id": delivery_id,
@@ -1783,13 +1800,14 @@ class JobManager:
                 f"""
                 SELECT * FROM deliveries
                 WHERE target_type='codex_desktop'
-                  AND json_extract(payload_json, '$.target.thread_id') IN ({placeholders})
+                  AND (json_extract(payload_json, '$.target.thread_id') IN ({placeholders})
+                       OR json_extract(payload_json, '$.target.threadId') IN ({placeholders}))
                   AND ((status IN ('pending', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                        OR (status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
                 ORDER BY created_at
                 LIMIT 20
                 """,
-                (*thread_ids, now, now),
+                (*thread_ids, *thread_ids, now, now),
             ).fetchall()
         claimed = []
         for row in rows:
@@ -2765,6 +2783,7 @@ class JobManager:
     def _insert_wake_targets(self, job_id: str, targets: list[dict[str, Any]], created_at: str) -> list[str]:
         inserted = []
         for target in targets:
+            target = canonicalize_wake_target(target)
             target_type = target.get("type")
             events = target.get("events") or target.get("notify_on") or []
             if not isinstance(target_type, str):
@@ -4147,12 +4166,21 @@ class JobManager:
         # cancelled deterministically. The transition is claim-token guarded so a
         # newer launch that already owns the row is never cancelled by a stale
         # stop.
+        observed_claim_token = row["claim_token"]
         if row["status"] == "launching":
-            changed = self._transition_terminal(job_id, "cancelled", claim_token=row["claim_token"])
+            changed = self._transition_terminal(job_id, "cancelled", claim_token=observed_claim_token)
             if not changed:
                 # The runner promoted between our snapshot and this write; fall
-                # through to the normal running-stop path.
-                row = self._row("SELECT status, worker_pid, pid, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+                # through to the normal running-stop path. PRESERVE the ORIGINAL
+                # observed ownership identity: the final transition below is
+                # claim-token guarded with the SNAPSHOT's token, so a
+                # recovery/restart that installed a NEW claim (claim B) between
+                # the snapshot and this write is never cancelled by this stale
+                # stop — the CAS on claim A returns 0 and we return without
+                # mutating the new launch (review rc38 P1).
+                row = self._row(
+                    "SELECT status, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,)
+                )
             else:
                 # Terminate the still-starting runner process so it does not keep
                 # running against a terminal row.
@@ -4165,9 +4193,9 @@ class JobManager:
                 self.processes.pop(job_id, None)
                 self._emit(job_id, "cancelled", message="Job cancelled while its runner was still launching")
                 return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
-        changed = self._transition_terminal(job_id, "cancelled")
+        changed = self._transition_terminal(job_id, "cancelled", claim_token=observed_claim_token)
         if not changed:
-            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
+            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal or owned by a newer launch"}
         self._emit(job_id, "cancelled")
         failures = []
         runner_pid = int(row["worker_pid"]) if row["worker_pid"] else None
@@ -4882,17 +4910,19 @@ def _build_wake_target(
     return {"type": target_type, "events": events or ["completed", "failed"], **config}
 
 
-# --- Python-compatibility API (review rc37 P1) ---
+# --- Python-compatibility API (review rc37 P1 / rc38 P1) ---
 # The OLD public Python names ``daemon_wake(job_id, target=None, events=None,
 # type=None, **config)`` / ``job_wake_now`` / ``job_add_wake_target`` are the
 # UNDECORATED functions below, with the original signature: extra target config
 # is passed as plain keyword arguments (``command=``, ``url=``, ``session_id=``,
 # ...). FastMCP cannot bind ``**config`` (pydantic makes it required), so the
-# MCP surface is registered under SEPARATELY NAMED explicit-signature adapters
-# (``mcp_daemon_wake`` / ``mcp_job_wake_now`` / ``mcp_job_add_wake_target``)
-# which accept an explicit ``config`` dict. Importing ``daemon_wake`` from
-# ``vanth.server`` and calling it with the original positional/keyword forms
-# keeps working.
+# MCP surface is the explicit-signature adapters below (``mcp_daemon_wake`` /
+# ``mcp_job_wake_now`` / ``mcp_job_add_wake_target``) which accept an explicit
+# ``config`` dict — but they are REGISTERED under the existing external MCP
+# names ``daemon_wake`` / ``job_wake_now`` / ``job_add_wake_target`` (via
+# FastMCP's ``name=`` argument) so agents keep calling the documented/original
+# names (review rc38 P1). Importing ``daemon_wake`` from ``vanth.server`` and
+# calling it with the original positional/keyword forms keeps working.
 
 
 def daemon_wake(
@@ -4957,7 +4987,7 @@ def _mcp_wake_payload(target, events, type, config) -> dict[str, Any]:
     return _build_wake_target(target, events, type, config or {})
 
 
-@mcp.tool()
+@mcp.tool(name="job_add_wake_target")
 def mcp_job_add_wake_target(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -4980,12 +5010,16 @@ def mcp_job_add_wake_target(
     ``attach`` server URL so the wake reaches the visible client's server.
     ``codex_desktop`` targets wake a RUNNING Codex Desktop task through its
     native app-tools host pipe (requires the Desktop integration).
+
+    Registered under the external MCP name ``job_add_wake_target`` (the rc37
+    contract); ``mcp_`` is only an implementation-prefix for the Python callable
+    (review rc38 P1 — clients must not learn prefix names).
     """
     resolved = _mcp_wake_payload(target, events, type, config)
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
-@mcp.tool()
+@mcp.tool(name="job_wake_now")
 def mcp_job_wake_now(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -5007,6 +5041,10 @@ def mcp_job_wake_now(
     calling task (review P0-2): a ``codex_cli_thread``/``codex_thread``/
     ``codex_desktop`` target without an explicit ``thread_id`` inherits the
     calling Codex task identity so the wake resumes the calling task.
+
+    Registered under the external MCP name ``job_wake_now`` (the rc37
+    contract); ``mcp_`` is only an implementation-prefix for the Python callable
+    (review rc38 P1 — clients must not learn prefix names).
     """
     origin_thread_id = os.environ.get("CODEX_THREAD_ID") or os.environ.get("VANTH_CODEX_DESKTOP_THREAD")
     resolved = _mcp_wake_payload(target, events, type, config)
@@ -5015,7 +5053,7 @@ def mcp_job_wake_now(
     return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
 
 
-@mcp.tool()
+@mcp.tool(name="daemon_wake")
 def mcp_daemon_wake(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -5030,6 +5068,10 @@ def mcp_daemon_wake(
     target only (matching the original semantics). ``config`` holds extra
     target config kwargs. Supported types include local_command /
     codex_cli_thread / codex_desktop / opencode_thread / webhook.
+
+    Registered under the external MCP name ``daemon_wake`` (the rc37 contract);
+    ``mcp_`` is only an implementation-prefix for the Python callable (review
+    rc38 P1 — clients must not learn prefix names).
     """
     resolved = _mcp_wake_payload(target, events, type, config)
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})

@@ -283,16 +283,26 @@ def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def send_delivery_to_codex_desktop(payload: dict[str, Any], *, caller_thread_id: str | None = None) -> dict[str, Any]:
+def send_delivery_to_codex_desktop(
+    payload: dict[str, Any],
+    *,
+    caller_thread_id: str | None = None,
+    pipe_path: str | None = None,
+) -> dict[str, Any]:
     """Deliver a wake into a running Codex Desktop task via the native
     app-tools host pipe (review rc36 P0).
 
     This is the Desktop route: it calls ``codex_app/send_message_to_thread`` on
-    the inherited ``CODEX_APP_TOOLS_PIPE_PATH`` so the follow-up lands in the
-    already-running Desktop task. It NEVER spawns a second app-server and never
-    falls back to the CLI thread bridge. The pipe is read from the current
-    (MCP/client) process's inherited environment — never from a job target or
-    daemon message.
+    the app-tools pipe so the follow-up lands in the already-running Desktop
+    task. It NEVER spawns a second app-server and never falls back to the CLI
+    thread bridge.
+
+    ``pipe_path`` is the relay's RESOLVED app-tools pipe path (the explicit
+    ``VANTH_CODEX_DESKTOP_PIPE`` / ``codex_desktop.json`` handoff). The
+    delivery path itself must NOT fall back to ``CODEX_APP_TOOLS_PIPE_PATH``:
+    real Vanth MCP children do not inherit it (review rc38 P0 — the provisioned
+    pipe was discarded at delivery). When ``pipe_path`` is absent the inherited
+    environment is read as a last resort (direct callers).
 
     ``caller_thread_id`` is the relay's authenticated executor/thread identity
     and is REQUIRED as the outer ``params.threadId`` by the native host. The
@@ -323,6 +333,7 @@ def send_delivery_to_codex_desktop(payload: dict[str, Any], *, caller_thread_id:
             prompt=prompt,
             caller_thread_id=caller,
             call_id=f"vanth-{delivery_id}",
+            pipe_path=pipe_path,
             timeout_seconds=int(target.get("timeout_seconds", 300)),
         )
     except CodexPipeUnavailable:

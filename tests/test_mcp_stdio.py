@@ -186,10 +186,23 @@ def test_job_wake_now_inherits_caller_codex_thread(tmp_path):
                     # Start a quick job so there is a real job row to wake.
                     command = subprocess.list2cmdline([sys.executable, "-c", "print('wake me')"])
                     start = content(await session.call_tool("job_start", {"command": command}))
+                    # Review rc38 P1: the documented rc37 wake tool names must
+                    # remain callable over stdio (agents must not learn
+                    # implementation-prefix `mcp_` names).
+                    tools = await session.list_tools()
+                    names = {tool.name for tool in tools.tools}
+                    assert "job_add_wake_target" in names, "rc37 MCP name job_add_wake_target must be registered"
+                    assert "job_wake_now" in names, "rc37 MCP name job_wake_now must be registered"
+                    assert "daemon_wake" in names, "rc37 MCP name daemon_wake must be registered"
+                    # The implementation-prefixed callables are NOT advertised
+                    # (clients must not learn prefix names).
+                    assert "mcp_job_wake_now" not in names
+                    assert "mcp_job_add_wake_target" not in names
+                    assert "mcp_daemon_wake" not in names
                     # No explicit thread_id: must inherit CODEX_THREAD_ID.
                     woken = content(
                         await session.call_tool(
-                            "mcp_job_wake_now",
+                            "job_wake_now",
                             {"job_id": start["job_id"], "type": "codex_cli_thread", "events": ["completed"]},
                         )
                     )

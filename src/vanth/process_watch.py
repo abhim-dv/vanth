@@ -147,40 +147,59 @@ class _InFlight:
 
     The watchdog must not idle-exit while a blocking tool call (``job_wait``,
     ``job_tail --follow``) is running. We wrap ``FastMCP.call_tool`` so the
-    counter is bumped around each call. The Desktop wake relay also bumps the
-    counter around each poll so an active subscription is never idle-reaped
+    counter is bumped around each call. The Desktop wake relay also marks
+    activity around each poll so an active subscription is never idle-reaped
     while it is still delivering wake notifications (review rc37 P1) — the
     relay traffic is real work even though it never touches MCP stdio.
+
+    Activity semantics (review rc38 P1): the relay's per-poll bump is a
+    TRANSIENT event — it must not just toggle the boolean (the watchdog samples
+    ``active`` once per interval and would almost always see ``False``). We
+    therefore record a last-activity monotonic timestamp on every bump, and the
+    watchdog resets its idle timer whenever ``now - last_activity < interval``.
+    A relay that keeps polling is never idle-reaped; a relay that goes quiet
+    (or exits) is reaped after the idle timeout, exactly as before.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._count = 0
+        self._last_activity = time.monotonic()
 
     def __enter__(self) -> "_InFlight":
         with self._lock:
             self._count += 1
+            self._last_activity = time.monotonic()
         return self
 
     def __exit__(self, *_: object) -> None:
         with self._lock:
             self._count -= 1
+            self._last_activity = time.monotonic()
 
     def notify_activity(self) -> None:
         """Mark transient activity so the idle timer resets.
 
         Used by the Desktop wake relay around each poll/delivery so the
         watchdog does not idle-exit a process that is still actively
-        delivering asynchronous wake notifications.
+        delivering asynchronous wake notifications. Records a last-activity
+        timestamp (not a count toggle) so the watchdog's next sample sees a
+        fresh ``last_activity`` even though ``active`` is momentarily False.
         """
         with self._lock:
             self._count += 1
             self._count -= 1
+            self._last_activity = time.monotonic()
 
     @property
     def active(self) -> bool:
         with self._lock:
             return self._count > 0
+
+    def last_activity(self) -> float:
+        """Return the monotonic timestamp of the most recent activity."""
+        with self._lock:
+            return self._last_activity
 
 
 def start_watchdog(
@@ -233,14 +252,16 @@ def _watch_loop(
     on_exit: callable,  # type: ignore[assignment]
     tracker: _InFlight,
     traffic: callable | None = None,  # type: ignore[assignment]
+    alive: callable | None = None,  # type: ignore[assignment]
 ) -> None:
     traffic = traffic or _stdin_traffic
+    alive = alive or (lambda: process_alive(parent))
     dead_since: float | None = None
     idle_since: float | None = None
     while True:
         time.sleep(interval)
         now = time.monotonic()
-        parent_alive = process_alive(parent)
+        parent_alive = alive()
         busy = tracker.active
 
         if not parent_alive:
@@ -253,7 +274,13 @@ def _watch_loop(
             dead_since = None
 
         if idle > 0 and parent_alive and not busy:
-            if traffic():
+            # Recent relay/tool activity resets the idle timer even though the
+            # process is momentarily not busy (review rc38 P1): the Desktop wake
+            # relay polls and delivers asynchronously without holding an MCP
+            # request context, and a healthy relay must not be idle-reaped.
+            if now - tracker.last_activity() < interval:
+                idle_since = None
+            elif traffic():
                 idle_since = None
             elif idle_since is None:
                 idle_since = now

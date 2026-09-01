@@ -105,10 +105,11 @@ def test_python_compat_wrappers_accept_legacy_kwargs(monkeypatch, tmp_path):
     """Review rc37 P1: the old public Python names daemon_wake / job_wake_now /
     job_add_wake_target keep the original signature
     ``(job_id, target=None, events=None, type=None, **config)`` — extra target
-    config is passed as plain keyword arguments. The MCP surface is registered
-    under separately named explicit-config adapters (mcp_daemon_wake etc.). Each
-    Python function delegates through the same _build_wake_target logic and
-    posts to the daemon."""
+    config is passed as plain keyword arguments. The MCP surface is the
+    explicit-config adapters (mcp_daemon_wake etc.) registered under the
+    EXISTING external MCP names daemon_wake / job_wake_now / job_add_wake_target
+    (review rc38 P1). Each Python function delegates through the same
+    _build_wake_target logic and posts to the daemon."""
     from vanth.server import (
         daemon_wake,
         job_add_wake_target,
