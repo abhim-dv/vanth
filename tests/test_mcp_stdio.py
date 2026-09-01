@@ -189,7 +189,7 @@ def test_job_wake_now_inherits_caller_codex_thread(tmp_path):
                     # No explicit thread_id: must inherit CODEX_THREAD_ID.
                     woken = content(
                         await session.call_tool(
-                            "job_wake_now",
+                            "mcp_job_wake_now",
                             {"job_id": start["job_id"], "type": "codex_cli_thread", "events": ["completed"]},
                         )
                     )

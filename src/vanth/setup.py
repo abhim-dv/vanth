@@ -217,6 +217,55 @@ def remove_mcp_servers(path: Path) -> tuple[bool, str]:
     return _merge_json(path, merge)
 
 
+def register_codex_desktop(home: Path) -> tuple[bool, str]:
+    """Provision Codex Desktop wake (review rc37 P0).
+
+    The real Codex Desktop MCP children do NOT inherit
+    ``CODEX_APP_TOOLS_PIPE_PATH``/``CODEX_THREAD_ID`` ambiently — the pipe is
+    granted only to the bundled ``codex_app`` MCP integration. This writes a
+    per-home ``codex_desktop.json`` capability file (pipe path + caller thread
+    identity) that the relay reads, so Desktop wake can be enabled through a
+    supported handoff: run `vanth setup desktop` while a Desktop session with
+    the app-tools capability is active in this environment.
+
+    The capability file is written with the same restrictive permissions as the
+    auth token (the pipe path is sensitive). It fails explicitly (no silent
+    no-op) when neither a pipe nor a caller thread identity is available.
+    """
+    import stat as _stat
+
+    pipe_path = os.environ.get("VANTH_CODEX_DESKTOP_PIPE") or os.environ.get("CODEX_APP_TOOLS_PIPE_PATH")
+    thread_id = os.environ.get("VANTH_CODEX_DESKTOP_THREAD") or os.environ.get("CODEX_THREAD_ID")
+    if not pipe_path or not thread_id:
+        missing = []
+        if not pipe_path:
+            missing.append("pipe (CODEX_APP_TOOLS_PIPE_PATH / VANTH_CODEX_DESKTOP_PIPE)")
+        if not thread_id:
+            missing.append("thread id (CODEX_THREAD_ID / VANTH_CODEX_DESKTOP_THREAD)")
+        return False, f"Desktop capability unavailable (missing {', '.join(missing)}); run this inside a Codex Desktop session with app-tools active"
+    path = home / "codex_desktop.json"
+    payload = {"pipe_path": pipe_path, "thread_id": thread_id, "caller_thread_id": thread_id}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, _stat.S_IRUSR | _stat.S_IWUSR)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    return True, f"Desktop wake provisioned (thread={thread_id})"
+
+
+def remove_codex_desktop(home: Path) -> tuple[bool, str]:
+    path = home / "codex_desktop.json"
+    if not path.exists():
+        return False, "not configured"
+    try:
+        path.unlink()
+    except OSError as exc:
+        return False, f"failed to remove: {exc}"
+    return True, "removed"
+
+
 def remove_codex(path: Path) -> tuple[bool, str]:
     section = f"[mcp_servers.{SETUP_KEY}]"
     lines = path.read_text(encoding="utf-8").splitlines()

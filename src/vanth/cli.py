@@ -337,14 +337,16 @@ def cmd_restart(home: Path, *, json_out: bool = False) -> int:
 
 
 def cmd_setup(argv: list[str], home: Path, *, json_out: bool = False) -> int:
-    from .setup import run_setup
+    from .setup import remove_codex_desktop, register_codex_desktop, run_setup
 
     if "-h" in argv or "--help" in argv:
         print(
-            "usage: vanth setup [opencode] [codex] [claude] [--remove] [--yes]\n"
+            "usage: vanth setup [opencode] [codex] [claude] [desktop] [--remove] [--yes]\n"
             "\n"
             "Register (or remove) the Vanth MCP server in the given clients' configs.\n"
             "With no client names, detects and configures every known client found.\n"
+            "`vanth setup desktop` provisions Codex Desktop wake by writing the\n"
+            "capability file from the current Desktop session's app-tools pipe.\n"
             "\n"
             "options:\n"
             "  --remove, -r   remove the Vanth MCP entry instead of adding it\n"
@@ -354,6 +356,14 @@ def cmd_setup(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         return 0
     remove = "--remove" in argv or "-r" in argv
     assume_yes = "--yes" in argv or "-y" in argv
+    if "desktop" in argv:
+        if json_out:
+            changed, summary = (remove_codex_desktop if remove else register_codex_desktop)(home)
+            print(json.dumps({"ok": changed or summary.startswith("Desktop wake provisioned"), "changed": changed, "summary": summary}))
+            return 0 if (changed or summary.startswith("Desktop wake provisioned")) else 1
+        changed, summary = (remove_codex_desktop if remove else register_codex_desktop)(home)
+        print(f"vanth setup desktop: {'removed' if remove else 'provisioned'}: {summary}")
+        return 0 if (changed or summary.startswith("Desktop wake provisioned")) else 1
     clients = [arg for arg in argv if arg in {"opencode", "codex", "claude"}]
     return run_setup(clients or None, home=home, remove=remove, assume_yes=assume_yes, json_out=json_out)
 

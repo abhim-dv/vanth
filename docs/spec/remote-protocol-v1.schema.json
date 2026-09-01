@@ -178,7 +178,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["local_command", "codex_thread", "opencode_thread", "webhook"]
+          "enum": ["local_command", "codex_thread", "codex_cli_thread", "codex_desktop", "opencode_thread", "webhook"]
         },
         "events": { "type": "array", "items": { "type": "string" } },
         "notify_on": { "type": "array", "items": { "type": "string" } },

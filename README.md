@@ -433,7 +433,7 @@ events.
 | `job_stop` | Stop a running job (terminate process tree) |
 | `job_doctor` | Daemon health, schema, tables, binary availability |
 | `job_cleanup` | Dry-run or real removal of old terminal jobs |
-| `daemon_wake` | Schedule a self-resume wake target — full target dict or `events`/`type`/`...config` shorthand |
+| `daemon_wake` | Schedule a self-resume wake target — full target dict or `events`/`type`/`...config` shorthand (Python API) |
 
 For the full parameter contract and response shapes of every tool, see
 [docs/agent-tools.md](docs/agent-tools.md).
@@ -669,9 +669,9 @@ Runs an arbitrary command, passing the delivery payload as JSON on stdin:
 
 Exit 0 marks the delivery `delivered`; any other exit marks it `failed`.
 
-### codex_thread
+### codex_thread / codex_cli_thread
 
-Resumes a Codex thread through the local app-server:
+Resumes a Codex thread through the local app-server (for an unloaded CLI task):
 
 ```json
 {
@@ -688,6 +688,32 @@ The target thread must already have had at least one turn (a persisted
 "rollout"). Resuming a brand-new, zero-turn thread fails with
 `no rollout found for thread id <id>` — the intended wake target is an
 existing/active conversation, not a never-started one.
+
+### codex_desktop
+
+Wakes a RUNNING Codex Desktop task through the native app-tools host pipe
+(`codex_app/send_message_to_thread` on `CODEX_APP_TOOLS_PIPE_PATH`). This never
+spawns a second app-server and never falls back to the CLI thread bridge:
+
+```json
+{
+  "type": "codex_desktop",
+  "thread_id": "019f...",
+  "events": ["checkpoint", "failed", "completed"]
+}
+```
+
+Desktop wake is delivered by a client-side relay: the Vanth MCP integration
+registers the task id it can wake, long-polls the daemon for due deliveries,
+submits the follow-up into the already-running Desktop task through the pipe,
+and acknowledges only after admission succeeds. The private pipe stays inside
+the Codex MCP process and is provisioned through a supported handoff — run
+`vanth setup desktop` inside a Codex Desktop session with the app-tools
+capability active (it writes a per-home `codex_desktop.json` capability file),
+or launch Vanth with `VANTH_CODEX_DESKTOP_PIPE` /
+`VANTH_CODEX_DESKTOP_THREAD` set. Without a pipe capability the delivery fails
+closed with an actionable "Desktop integration unavailable" error and is never
+routed to the CLI.
 
 ### opencode_thread
 

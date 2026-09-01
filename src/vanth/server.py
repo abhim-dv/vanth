@@ -628,6 +628,7 @@ class JobManager:
                 self._fire_triggered_jobs()
                 self._watch_policies()
                 self._maybe_auto_cleanup()
+                self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
             except Exception:
                 self.logger.exception("maintenance iteration failed")
 
@@ -1421,7 +1422,7 @@ class JobManager:
         if rows:
             self.logger.debug("persisted %d metric points job_id=%s event_id=%s", len(rows), event["job_id"], event["event_id"])
 
-    def _claim_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+    def _claim_delivery(self, delivery_id: str, *, claim_client_id: str | None = None) -> dict[str, Any] | None:
         with self.db_lock:
             self.db.execute("BEGIN IMMEDIATE")
             now = now_iso()
@@ -1450,12 +1451,16 @@ class JobManager:
             lease_expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat().replace("+00:00", "Z")
             attempt = int(row["attempts"]) + 1
             reclaimed = int(row["status"] == "dispatching")
+            # claim_client_id binds the claim to a specific relay so only that
+            # client can ack it (review rc37 P1). The daemon dispatcher passes
+            # None (no relay binding).
             changed = self.db.execute(
                 """
-                UPDATE deliveries SET status='dispatching', attempts=?, claim_token=?, claimed_at=?, lease_expires_at=?
+                UPDATE deliveries SET status='dispatching', attempts=?, claim_token=?, claimed_at=?, lease_expires_at=?,
+                  claim_client_id=?
                 WHERE delivery_id=? AND (status IN ('pending','retrying') OR (status='dispatching' AND lease_expires_at<=?))
                 """,
-                (attempt, token, now, lease_expires, delivery_id, now),
+                (attempt, token, now, lease_expires, claim_client_id, delivery_id, now),
             ).rowcount
             if not changed:
                 self.db.rollback()
@@ -1590,7 +1595,7 @@ class JobManager:
             changed = self.db.execute(
                 """
                 UPDATE deliveries SET status=?, delivered_at=COALESCE(?, delivered_at), last_error=?, next_attempt_at=?,
-                  claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL
+                  claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL
                 WHERE delivery_id=? AND status='dispatching' AND claim_token=?
                 """,
                 (final_status, delivered_at, error, next_attempt_at, delivery["delivery_id"], delivery["claim_token"]),
@@ -1723,12 +1728,15 @@ class JobManager:
     def relay_poll(self, client_id: str, timeout_seconds: float = 30.0) -> list[dict[str, Any]]:
         """Long-poll for due codex_desktop deliveries addressed to this client.
 
-        Returns a list of delivery dicts (each carries the full payload). The
-        relay claims each one (marks it ``dispatching`` with a lease, exactly
-        like the daemon's own dispatcher) so a delivery is only handed to ONE
-        relay at a time. The relay then delivers via the pipe and calls
-        ``relay_ack``. Polls block up to ``timeout_seconds`` (bounded) so a
-        client can reconnect with backoff.
+        Returns a list of delivery dicts (each carries the full payload AND an
+        opaque ``lease_token``). The relay claims each one (marks it
+        ``dispatching`` with a lease bound to this client) so a delivery is only
+        handed to ONE relay at a time. The relay delivers via the pipe and calls
+        ``relay_ack`` with BOTH its client_id and the opaque lease token — only
+        the claiming client can complete a delivery (review rc37 P1). Polls
+        block up to ``timeout_seconds`` (bounded) so a client can reconnect with
+        backoff. Stale subscriptions (no poll within the grace window) are
+        expired server-side.
         """
         self._ensure_open()
         client_row = self._row(
@@ -1755,39 +1763,42 @@ class JobManager:
         deadline = time.monotonic() + max(1.0, min(timeout_seconds, 60.0))
         poll_interval = float(os.environ.get("VANTH_RELAY_POLL_INTERVAL", "0.5"))
         while True:
-            due = self._relay_due_deliveries(thread_ids)
+            due = self._relay_due_deliveries(thread_ids, claim_client_id=client_id)
             if due:
                 return due
             if time.monotonic() >= deadline:
                 return []
             time.sleep(poll_interval)
 
-    def _relay_due_deliveries(self, thread_ids: set[str]) -> list[dict[str, Any]]:
+    def _relay_due_deliveries(self, thread_ids: set[str], *, claim_client_id: str | None = None) -> list[dict[str, Any]]:
         now = now_iso()
+        if not thread_ids:
+            return []
+        # Build the SQL so destinations are filtered BEFORE ORDER BY/LIMIT,
+        # otherwise 20 older deliveries for OTHER tasks could starve a matching
+        # delivery forever (review rc37 P1).
+        placeholders = ",".join("?" for _ in thread_ids)
         with self.db_lock:
             rows = self.db.execute(
-                """
+                f"""
                 SELECT * FROM deliveries
                 WHERE target_type='codex_desktop'
+                  AND json_extract(payload_json, '$.target.thread_id') IN ({placeholders})
                   AND ((status IN ('pending', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                        OR (status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
                 ORDER BY created_at
                 LIMIT 20
                 """,
-                (now, now),
+                (*thread_ids, now, now),
             ).fetchall()
-            if thread_ids:
-                rows = [
-                    row
-                    for row in rows
-                    if self._delivery_thread_target(row).get("thread_id") in thread_ids
-                ]
-            else:
-                rows = []
         claimed = []
         for row in rows:
-            delivery = self._claim_delivery(row["delivery_id"])
+            delivery = self._claim_delivery(row["delivery_id"], claim_client_id=claim_client_id)
             if delivery:
+                # Add an opaque lease token: the claim_token stored in the row is
+                # opaque to the client; only relay_ack (which CAS's on it server
+                # side) may use it.
+                delivery["lease_token"] = delivery["claim_token"]
                 claimed.append(delivery)
         return claimed
 
@@ -1800,21 +1811,51 @@ class JobManager:
         thread_id = target.get("thread_id") or target.get("threadId")
         return {"thread_id": thread_id}
 
-    def relay_ack(self, client_id: str, delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
+    def relay_ack(self, client_id: str, delivery_id: str, status: str, error: str | None = None, lease_token: str | None = None) -> dict[str, Any]:
         """Acknowledge a relayed delivery after client-native admission.
 
         ``status`` is ``delivered`` (the prompt was accepted/processed) or
-        ``failed``. On ``failed`` the normal retry/backoff semantics apply. Only
-        the relay that claimed the delivery (lease held) can ack it.
+        ``failed``. On ``failed`` the normal retry/backoff semantics apply.
+
+        The acknowledgement is OWNED by the claiming client (review rc37 P1):
+        it CAS's on ``status='dispatching'``, the stored ``claim_token`` (the
+        opaque ``lease_token`` returned by ``relay_poll``), AND ``claim_client_id``
+        matching the caller. A different relay — or the same relay after its
+        lease was reclaimed — affects zero rows. The current claim token is never
+        reloaded on behalf of the acknowledger.
         """
         self._ensure_open()
+        if status not in {"delivered", "failed"}:
+            raise ValueError("delivery completion status must be delivered or failed")
+        if not isinstance(lease_token, str) or not lease_token:
+            raise ValueError("relay_ack requires the opaque lease_token returned by relay_poll")
         with self.db_lock:
-            row = self.db.execute("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+            row = self.db.execute(
+                "SELECT * FROM deliveries WHERE delivery_id=? AND status='dispatching' AND claim_token=? AND claim_client_id=?",
+                (delivery_id, lease_token, client_id),
+            ).fetchone()
         if not row:
-            raise ValueError(f"Unknown delivery_id: {delivery_id}")
+            raise ValueError(
+                "delivery is not claimed by this relay (lease reclaimed, delivered, or owned by another client)"
+            )
         delivery = self._delivery_dict(row)
         self._complete_delivery(delivery, status, error)
         return {"result": "ok", "delivery_id": delivery_id, "status": status}
+
+    def relay_expire_stale(self, stale_after_seconds: int = 300) -> int:
+        """Expire relay subscriptions that have not polled within the window.
+
+        Called from the dispatch loop so a crashed relay's registration does not
+        linger forever (review rc37 P1). Returns the number of rows removed.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat().replace("+00:00", "Z")
+        with self.db_lock:
+            changed = self.db.execute(
+                "DELETE FROM relay_subscriptions WHERE last_poll_at IS NULL OR last_poll_at < ?",
+                (cutoff,),
+            ).rowcount
+            self.db.commit()
+        return changed
 
     async def start(
         self,
@@ -1858,8 +1899,6 @@ class JobManager:
         trigger = self._validate_trigger(trigger)
         policy = validate_policy(policy)
         queued = trigger is not None
-        if self.max_running_jobs and not queued and self._running_count() >= self.max_running_jobs:
-            raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
         stderr_path = self.logs / f"{job_id}.stderr.log"
@@ -1884,6 +1923,20 @@ class JobManager:
         # guarded).
         direct_claim_token = None if queued else "claim_" + uuid.uuid4().hex[:16]
         with self.db_lock:
+            # Concurrent-job quota is enforced ATOMICALLY with the row insert
+            # (review rc37 P1): BEGIN IMMEDIATE acquires the write lock before
+            # the count, so the count and the INSERT are ONE transaction. Two
+            # manager processes (or threads) synchronized at a SELECT-then-insert
+            # can no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two
+            # 'launching' rows. Both 'launching' and 'running' reservations count.
+            if self.max_running_jobs and not queued:
+                self.db.execute("BEGIN IMMEDIATE")
+                reserved = self.db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
+                ).fetchone()[0]
+                if reserved >= self.max_running_jobs:
+                    self.db.rollback()
+                    raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
             self.db.execute(
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
@@ -4812,7 +4865,7 @@ def _build_wake_target(
     When ``target`` is given it is returned unchanged (backward compatible).
     Otherwise a target is built from ``type`` / ``events`` / ``config``.
     ``type`` is required and must be a supported wake target type
-    (local_command, codex_cli_thread, opencode_thread, webhook);
+    (local_command, codex_cli_thread, codex_desktop, opencode_thread, webhook);
     events default to ["completed", "failed"].
     """
     if target is not None:
@@ -4829,8 +4882,83 @@ def _build_wake_target(
     return {"type": target_type, "events": events or ["completed", "failed"], **config}
 
 
-@mcp.tool()
+# --- Python-compatibility API (review rc37 P1) ---
+# The OLD public Python names ``daemon_wake(job_id, target=None, events=None,
+# type=None, **config)`` / ``job_wake_now`` / ``job_add_wake_target`` are the
+# UNDECORATED functions below, with the original signature: extra target config
+# is passed as plain keyword arguments (``command=``, ``url=``, ``session_id=``,
+# ...). FastMCP cannot bind ``**config`` (pydantic makes it required), so the
+# MCP surface is registered under SEPARATELY NAMED explicit-signature adapters
+# (``mcp_daemon_wake`` / ``mcp_job_wake_now`` / ``mcp_job_add_wake_target``)
+# which accept an explicit ``config`` dict. Importing ``daemon_wake`` from
+# ``vanth.server`` and calling it with the original positional/keyword forms
+# keeps working.
+
+
+def daemon_wake(
+    job_id: str,
+    target: dict[str, Any] | None = None,
+    events: list[str] | None = None,
+    type: str | None = None,
+    **config: Any,
+) -> dict[str, Any]:
+    """DEPRECATED: register a wake target. Kept for backward compatibility.
+
+    Original signature: extra target config passed as plain keyword arguments
+    (``command=``, ``url=``, ``session_id=``, ``thread_id=``, ...). ``type`` is
+    required when ``target`` is not given. This registers a target for FUTURE
+    events only (matching the original semantics). Use ``job_wake_now`` to
+    surface a wake immediately, or ``job_add_wake_target`` to register a target.
+    """
+    resolved = _build_wake_target(target, events, type, config)
+    return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
+
+
+def job_wake_now(
+    job_id: str,
+    target: dict[str, Any] | None = None,
+    events: list[str] | None = None,
+    type: str | None = None,
+    **config: Any,
+) -> dict[str, Any]:
+    """Surface a wake for a job IMMEDIATELY, even if the event already fired.
+
+    Original signature: extra target config passed as plain keyword arguments.
+    ``opencode_thread`` targets require an explicit ``session_id`` and
+    ``attach``. Caller-task inheritance resolves ``CODEX_THREAD_ID`` for
+    ``codex_cli_thread``/``codex_thread``/``codex_desktop`` targets without an
+    explicit thread id.
+    """
+    origin_thread_id = os.environ.get("CODEX_THREAD_ID")
+    resolved = _build_wake_target(target, events, type, config)
+    if origin_thread_id:
+        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
+    return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
+
+
 def job_add_wake_target(
+    job_id: str,
+    target: dict[str, Any] | None = None,
+    events: list[str] | None = None,
+    type: str | None = None,
+    **config: Any,
+) -> dict[str, Any]:
+    """Register a wake target against a job for FUTURE events.
+
+    Original signature: extra target config passed as plain keyword arguments.
+    ``opencode_thread`` targets require an explicit ``session_id`` and
+    ``attach``.
+    """
+    resolved = _build_wake_target(target, events, type, config)
+    return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
+
+
+def _mcp_wake_payload(target, events, type, config) -> dict[str, Any]:
+    return _build_wake_target(target, events, type, config or {})
+
+
+@mcp.tool()
+def mcp_job_add_wake_target(
     job_id: str,
     target: dict[str, Any] | None = None,
     events: list[str] | None = None,
@@ -4841,25 +4969,24 @@ def job_add_wake_target(
 
     Pass a full target dict ({"type", "events", ...config}) as ``target``, or
     use the shorthand: ``type`` (required, one of local_command /
-    codex_cli_thread / opencode_thread / webhook) plus optional ``events`` and
-    ``config`` (extra target config). Events default to ["completed", "failed"].
+    codex_cli_thread / codex_desktop / opencode_thread / webhook) plus optional
+    ``events`` and ``config`` (extra target config). Events default to
+    ["completed", "failed"].
 
     This only schedules a target for events that will occur AFTER registration.
     To surface a wake immediately (even if the event already fired), use
     ``job_wake_now``. ``opencode_thread`` targets require an explicit
     ``session_id`` (OpenCode cannot auto-inherit one — review P1-1) and an
     ``attach`` server URL so the wake reaches the visible client's server.
-
-    Python callers that used the legacy ``**config`` kwargs style can call the
-    module-level ``daemon_wake``/``job_wake_now``/``job_add_wake_target``
-    wrappers, which accept extra target config as keyword arguments.
+    ``codex_desktop`` targets wake a RUNNING Codex Desktop task through its
+    native app-tools host pipe (requires the Desktop integration).
     """
-    resolved = _build_wake_target(target, events, type, config or {})
+    resolved = _mcp_wake_payload(target, events, type, config)
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
 @mcp.tool()
-def job_wake_now(
+def mcp_job_wake_now(
     job_id: str,
     target: dict[str, Any] | None = None,
     events: list[str] | None = None,
@@ -4877,19 +5004,19 @@ def job_wake_now(
     hits the visible client's server).
 
     Caller-task inheritance is resolved HERE, in the MCP process that owns the
-    calling task (review P0-2): a ``codex_cli_thread``/``codex_thread`` target
-    without an explicit ``thread_id`` inherits ``CODEX_THREAD_ID`` so the wake
-    resumes the calling Codex task. Explicit ids always win.
+    calling task (review P0-2): a ``codex_cli_thread``/``codex_thread``/
+    ``codex_desktop`` target without an explicit ``thread_id`` inherits the
+    calling Codex task identity so the wake resumes the calling task.
     """
-    origin_thread_id = os.environ.get("CODEX_THREAD_ID")
-    resolved = _build_wake_target(target, events, type, config or {})
+    origin_thread_id = os.environ.get("CODEX_THREAD_ID") or os.environ.get("VANTH_CODEX_DESKTOP_THREAD")
+    resolved = _mcp_wake_payload(target, events, type, config)
     if origin_thread_id:
         resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
     return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
 
 
 @mcp.tool()
-def daemon_wake(
+def mcp_daemon_wake(
     job_id: str,
     target: dict[str, Any] | None = None,
     events: list[str] | None = None,
@@ -4901,52 +5028,10 @@ def daemon_wake(
     Use ``job_add_wake_target`` to register a target for future events, or
     ``job_wake_now`` to surface a wake immediately. This alias registers the
     target only (matching the original semantics). ``config`` holds extra
-    target config kwargs.
+    target config kwargs. Supported types include local_command /
+    codex_cli_thread / codex_desktop / opencode_thread / webhook.
     """
-    resolved = _build_wake_target(target, events, type, config or {})
-    return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
-
-
-# --- Python-compatibility wrappers (review rc36 P1) ---
-# The MCP tools above expose an explicit ``config`` dict because FastMCP cannot
-# bind ``**config`` (pydantic would make it a required field). Older direct
-# Python callers used ``daemon_wake(job_id, type="local_command", command="...")``
-# with the extra target config passed as plain keyword arguments. Those calls
-# broke when the signature changed to ``**config``. These non-MCP wrappers
-# restore the old kwargs style for Python callers while the MCP surface stays
-# explicit-config. The wrappers collect every unrecognized keyword into the
-# target config dict, so ``command=``/``url=``/``session_id=`` etc. all work.
-
-
-def daemon_wake_python(job_id: str, **config: Any) -> dict[str, Any]:
-    """Backward-compatible Python form of :func:`daemon_wake`.
-
-    ``config`` may contain ``type``/``events`` plus any extra target config as
-    plain keywords (e.g. ``command=``, ``url=``, ``session_id=``). Delegates to
-    the MCP tool's logic so the behavior is identical.
-    """
-    target_type = config.pop("type", None)
-    events = config.pop("events", None)
-    resolved = _build_wake_target(None, events, target_type, config)
-    return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
-
-
-def job_wake_now_python(job_id: str, **config: Any) -> dict[str, Any]:
-    """Backward-compatible Python form of :func:`job_wake_now`."""
-    target_type = config.pop("type", None)
-    events = config.pop("events", None)
-    resolved = _build_wake_target(None, events, target_type, config)
-    origin_thread_id = os.environ.get("CODEX_THREAD_ID")
-    if origin_thread_id:
-        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
-    return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
-
-
-def job_add_wake_target_python(job_id: str, **config: Any) -> dict[str, Any]:
-    """Backward-compatible Python form of :func:`job_add_wake_target`."""
-    target_type = config.pop("type", None)
-    events = config.pop("events", None)
-    resolved = _build_wake_target(None, events, target_type, config)
+    resolved = _mcp_wake_payload(target, events, type, config)
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
@@ -5123,7 +5208,7 @@ def _run_mcp_server() -> None:
     try:
         from .relay import start_desktop_relay
 
-        desktop_relay = start_desktop_relay()
+        desktop_relay = start_desktop_relay(activity_tracker=tracker)
     except Exception:
         logging.getLogger("vanth").exception("failed to start Desktop wake relay")
 

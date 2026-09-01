@@ -203,3 +203,42 @@ def test_doctor_reports_quota_and_retention(tmp_path, monkeypatch):
             manager.stop_sync(started["job_id"], kill_after_seconds=2)
     finally:
         manager.close()
+
+
+def test_max_running_jobs_atomic_across_managers(tmp_path, monkeypatch):
+    """Review rc37 P1: the concurrent-job quota is enforced atomically with the
+    row insert. Two manager processes synchronized at a SELECT-then-insert can
+    no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two 'launching'
+    rows."""
+    monkeypatch.setenv("VANTH_MAX_RUNNING_JOBS", "1")
+    import threading as _t
+
+    m1 = JobManager(tmp_path / "state", recover=False)
+    m2 = JobManager(tmp_path / "state", recover=False)
+    try:
+        barrier = _t.Barrier(2)
+        results = {}
+
+        def start_in(manager, key):
+            barrier.wait()
+            try:
+                results[key] = asyncio.run(manager.start(cmd("import time; time.sleep(3)")))
+            except Exception as exc:
+                results[key] = exc
+
+        t1 = _t.Thread(target=start_in, args=(m1, "a"))
+        t2 = _t.Thread(target=start_in, args=(m2, "b"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        started = [r for r in results.values() if not isinstance(r, Exception)]
+        rejected = [r for r in results.values() if isinstance(r, ValueError)]
+        assert len(started) == 1, f"exactly one job must start, got {len(started)}"
+        assert len(rejected) == 1, "the other start must be rejected by the quota"
+        for r in started:
+            m1.stop_sync(r["job_id"], kill_after_seconds=2)
+    finally:
+        m1.close()
+        m2.close()

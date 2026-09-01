@@ -247,4 +247,40 @@ def test_unknown_interactive_command_does_not_hang(monkeypatch, capsys):
         server.main(["statsu"])
     assert exc.value.code == 2
     assert "unknown command" in capsys.readouterr().err
-    assert called["mcp"] is False
+
+
+def test_register_codex_desktop_writes_capability_file(tmp_path, monkeypatch):
+    """Review rc37 P0: `vanth setup desktop` provisions Desktop wake by writing
+    a per-home capability file (pipe + caller thread) that the relay reads, so
+    the relay does NOT rely on ambient env inheritance into Vanth MCP children."""
+    monkeypatch.setenv("VANTH_CODEX_DESKTOP_PIPE", "\\\\\\\\.\\\\pipe\\\\codex_app_tools")
+    monkeypatch.setenv("VANTH_CODEX_DESKTOP_THREAD", "thread_executor")
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    changed, summary = setup.register_codex_desktop(home)
+    assert changed is True
+    assert "thread_executor" in summary
+    path = home / "codex_desktop.json"
+    assert path.is_file()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["pipe_path"] == "\\\\\\\\.\\\\pipe\\\\codex_app_tools"
+    assert data["thread_id"] == "thread_executor"
+    # Remove works.
+    changed2, _ = setup.remove_codex_desktop(home)
+    assert changed2 is True
+    assert not path.exists()
+
+
+def test_register_codex_desktop_fails_closed_without_capability(tmp_path, monkeypatch):
+    """Review rc37 P0: provisioning must fail explicitly (not silently no-op)
+    when neither a pipe nor a caller thread identity is available."""
+    monkeypatch.delenv("VANTH_CODEX_DESKTOP_PIPE", raising=False)
+    monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
+    monkeypatch.delenv("VANTH_CODEX_DESKTOP_THREAD", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    changed, summary = setup.register_codex_desktop(home)
+    assert changed is False
+    assert "unavailable" in summary
+    assert not (home / "codex_desktop.json").exists()

@@ -283,7 +283,7 @@ def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def send_delivery_to_codex_desktop(payload: dict[str, Any]) -> dict[str, Any]:
+def send_delivery_to_codex_desktop(payload: dict[str, Any], *, caller_thread_id: str | None = None) -> dict[str, Any]:
     """Deliver a wake into a running Codex Desktop task via the native
     app-tools host pipe (review rc36 P0).
 
@@ -293,6 +293,12 @@ def send_delivery_to_codex_desktop(payload: dict[str, Any]) -> dict[str, Any]:
     falls back to the CLI thread bridge. The pipe is read from the current
     (MCP/client) process's inherited environment — never from a job target or
     daemon message.
+
+    ``caller_thread_id`` is the relay's authenticated executor/thread identity
+    and is REQUIRED as the outer ``params.threadId`` by the native host. The
+    relay injects its own identity here; the target's optional
+    ``caller_thread_id`` is a legacy alias for direct callers. A delivery
+    without either is rejected BEFORE any pipe I/O (review rc37 P0).
     """
     from .codex_pipe import CodexPipeUnavailable, send_desktop_message
 
@@ -304,12 +310,18 @@ def send_delivery_to_codex_desktop(payload: dict[str, Any]) -> dict[str, Any]:
         raise CodexBridgeError(f"{target_type} target requires thread_id")
     if not isinstance(prompt, str) or not prompt:
         raise CodexBridgeError("delivery payload requires prompt")
+    caller = caller_thread_id or target.get("caller_thread_id")
+    if not isinstance(caller, str) or not caller:
+        raise CodexBridgeError(
+            "codex_desktop delivery requires a caller thread id (the relay's executor identity); "
+            "refusing to call the Desktop host without it"
+        )
     delivery_id = payload.get("delivery_id") or "vanth-delivery"
     try:
         result = send_desktop_message(
             destination_thread_id=thread_id,
             prompt=prompt,
-            caller_thread_id=target.get("caller_thread_id"),
+            caller_thread_id=caller,
             call_id=f"vanth-{delivery_id}",
             timeout_seconds=int(target.get("timeout_seconds", 300)),
         )

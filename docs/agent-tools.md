@@ -20,14 +20,13 @@ The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_deliveries`, `job_mark_delivery`, `job_retry_delivery`,
 `job_delivery_attempts`, `job_tail`, `job_wait`, `job_stop`, `job_doctor`,
 `job_cleanup`, `job_metrics_query`, `job_metric_compare`, `job_run_summary`,
-`job_artifact_add`, `job_artifacts`, `job_dashboard`.
-
-The following are part of the planned v1.4 surface (in progress, not yet
-released): `job_metric_ingest`, `job_artifact_read`, `job_add_wake_target`,
-`job_wake_now`, `job_cleanup_preview`. The parallel additions `job_rerun`
-override params, `job_status_batch`, `job_wait` `return_progress`, and
-`job_tail` `follow` / `timeout_seconds` are documented below as part of the
-planned surface.
+`job_artifact_add`, `job_artifacts`, `job_dashboard`, `job_metric_ingest`,
+`job_artifact_read`, `job_add_wake_target`, `job_wake_now`,
+`job_cleanup_preview`. The wake tools (`mcp_add_wake_target` /
+`mcp_job_wake_now` / `mcp_daemon_wake`) and their `daemon_wake` /
+`job_wake_now` / `job_add_wake_target` Python counterparts, plus `job_wait`
+`return_progress` and `job_tail` `follow` / `timeout_seconds`, are documented
+below.
 
 ---
 
@@ -742,7 +741,7 @@ out of a job — the read side of `job_artifact_add`.
   "sha256": "...", "meta": {}, "content": "...", "truncated": false }
 ```
 
-### `job_add_wake_target`
+### `mcp_job_add_wake_target` (MCP) / `job_add_wake_target` (Python)
 
 Register a wake target against a job for **future** events. This only fires
 when the triggering event occurs **after** registration — it does NOT surface
@@ -755,11 +754,13 @@ the shorthand: `type` (required, one of `local_command` / `codex_cli_thread` /
 `["completed", "failed"]`.
 
 `codex_cli_thread` / `codex_desktop` targets inherit the calling Codex task's
-thread id (resolved by the MCP wrapper from `CODEX_THREAD_ID`); an explicit
-`thread_id` always wins. `codex_desktop` wakes a RUNNING Desktop task through
-its native app-tools host pipe — it requires the Desktop integration to be
-active (`CODEX_APP_TOOLS_PIPE_PATH` inherited by the client) and fails closed
-(never falls back to the CLI thread bridge) when it is not.
+thread id (resolved by the MCP wrapper from `CODEX_THREAD_ID` /
+`VANTH_CODEX_DESKTOP_THREAD`); an explicit `thread_id` always wins.
+`codex_desktop` wakes a RUNNING Desktop task through its native app-tools host
+pipe — it requires the Desktop integration to be provisioned (run `vanth setup
+desktop` inside a Desktop session, or set `VANTH_CODEX_DESKTOP_PIPE` /
+`VANTH_CODEX_DESKTOP_THREAD`) and fails closed (never falls back to the CLI
+thread bridge) when it is not.
 
 `opencode_thread` targets require an explicit `session_id` (OpenCode does not
 inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit
@@ -787,7 +788,7 @@ isolated backend and does not wake the visible client.
 Errors: `ValueError` when `events` is empty or not a list of strings, or
 `type` is empty.
 
-### `job_wake_now`
+### `mcp_job_wake_now` (MCP) / `job_wake_now` (Python)
 
 Surface a wake **immediately**, even if the triggering event already fired.
 This is the genuine "wake now" operation: it registers the target AND enqueues
@@ -813,11 +814,12 @@ Kept for backward compatibility. Alias of `job_add_wake_target` — it registers
 a wake target for future events only. Use `job_wake_now` to surface a wake
 immediately, or `job_add_wake_target` to register a target.
 
-Python callers that previously passed the extra target config as plain keyword
-arguments (e.g. `daemon_wake(job_id, type="local_command", command=...)`) can
-use the module-level `daemon_wake_python` / `job_wake_now_python` /
-`job_add_wake_target_python` wrappers, which accept that `**config` style. The
-MCP tools take an explicit `config` dict.
+The Python functions keep the ORIGINAL signature
+`(job_id, target=None, events=None, type=None, **config)` — extra target config
+is passed as plain keyword arguments (e.g. `daemon_wake(job_id,
+type="local_command", command=...)`). The MCP surface is registered under the
+separately named explicit-config adapters `mcp_daemon_wake` /
+`mcp_job_wake_now` / `mcp_job_add_wake_target` (FastMCP cannot bind `**config`).
 
 ### `job_cleanup_preview`
 

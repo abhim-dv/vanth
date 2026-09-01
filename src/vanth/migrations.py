@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -79,6 +79,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
           created_at TEXT NOT NULL, next_attempt_at TEXT, delivered_at TEXT,
           last_error TEXT, claim_token TEXT, claimed_at TEXT, lease_expires_at TEXT,
+          claim_client_id TEXT,
           UNIQUE(event_id, target_id)
         );
         CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status, next_attempt_at, created_at);
@@ -108,7 +109,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at);
-        PRAGMA user_version=12;
+        PRAGMA user_version=13;
         """
     )
 
@@ -244,6 +245,10 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 )
                 db.execute("PRAGMA user_version=12")
                 version = 12
+            if version < 13:
+                _add_missing(db, "deliveries", {"claim_client_id": "TEXT"})
+                db.execute("PRAGMA user_version=13")
+                version = 13
             db.commit()
         except Exception:
             db.rollback()

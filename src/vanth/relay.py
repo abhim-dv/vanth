@@ -7,9 +7,10 @@ pipe names. Instead, the Vanth MCP/client integration owns an outbound relay:
    client/session/task identities it can wake) and long-polls for due
    ``codex_desktop`` deliveries.
 2. The daemon publishes a generic delivery envelope (delivery_id, destination
-   identity, prompt/event payload).
+   identity, prompt/event payload) plus an opaque lease token.
 3. The relay acknowledges ONLY after the client-native prompt admission
-   succeeds.
+   succeeds, presenting BOTH its client identity AND the opaque lease token, so
+   only the claiming client can ack (review rc37 P1).
 4. A disconnect leaves the delivery pending; a reconnect re-registers and
    resumes from the last acknowledged delivery id.
 
@@ -19,10 +20,23 @@ attached-server/session prompt API; Codex Desktop uses the host-provided
 ``CODEX_APP_TOOLS_PIPE_PATH``. That private pipe stays inside the Codex MCP
 process — it is never sent to the daemon or written to the job database.
 
-The relay runs as an internal thread using a separate localhost connection to
-the daemon (never MCP stdio), stops with the MCP process, and uses bounded
-reconnect backoff. Registration is authenticated by the daemon's loopback
-bearer token (the same token the MCP client already uses).
+Provisioning (review rc37 P0): the real Codex Desktop MCP children do NOT
+inherit ``CODEX_APP_TOOLS_PIPE_PATH`` or ``CODEX_THREAD_ID`` ambiently — the
+pipe is granted only to the bundled ``codex_app`` MCP integration. The relay
+therefore accepts the capability through an explicit, supported handoff:
+
+- ``VANTH_CODEX_DESKTOP_PIPE``: the named-pipe path (set by ``vanth setup``
+  when it provisions a Desktop wake integration, or by a host wrapper that
+  launches Vanth with the granted capability).
+- ``VANTH_CODEX_DESKTOP_THREAD``: the caller/executor thread identity (the
+  outer ``params.threadId`` the host requires). If unset, ``CODEX_THREAD_ID``
+  is used (CLI MCP processes).
+- The pipe path is ALSO read from a per-home ``codex_desktop.json`` capability
+  file written by ``vanth setup desktop``.
+
+The relay NEVER silently no-ops: if the capability is absent it records an
+explicit diagnostic (returned by ``start_desktop_relay``) so Desktop wake is
+known to be unavailable rather than silently pending.
 """
 
 from __future__ import annotations
@@ -40,20 +54,74 @@ class RelayError(RuntimeError):
     pass
 
 
+def _desktop_capability_file() -> dict[str, Any] | None:
+    """Read the per-home Desktop wake capability file, if present.
+
+    ``vanth setup desktop`` writes this file with the pipe path and thread
+    identity it was granted when Desktop integration was active.
+    """
+    try:
+        from .paths import canonical_home
+
+        path = canonical_home() / "codex_desktop.json"
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _codex_thread_identity() -> str | None:
+    """Resolve the caller/executor thread identity for Desktop wake.
+
+    Order: explicit ``VANTH_CODEX_DESKTOP_THREAD`` (host handoff), then
+    ``CODEX_THREAD_ID`` (CLI MCP processes), then the capability file. The
+    caller thread id is REQUIRED by the native host as the outer
+    ``params.threadId`` (review rc37 P0).
+    """
+    for name in ("VANTH_CODEX_DESKTOP_THREAD", "CODEX_THREAD_ID"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    capability = _desktop_capability_file()
+    if capability:
+        thread = capability.get("thread_id") or capability.get("caller_thread_id")
+        if thread:
+            return thread
+    return None
+
+
+def _desktop_pipe_path() -> str | None:
+    """Resolve the Desktop app-tools pipe path.
+
+    Order: explicit ``VANTH_CODEX_DESKTOP_PIPE`` (host handoff), then the
+    inherited ``CODEX_APP_TOOLS_PIPE_PATH``, then the capability file.
+    """
+    for name in ("VANTH_CODEX_DESKTOP_PIPE", "CODEX_APP_TOOLS_PIPE_PATH"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    capability = _desktop_capability_file()
+    if capability:
+        path = capability.get("pipe_path") or capability.get("pipe")
+        if path:
+            return path
+    return None
+
+
 def _destinations() -> list[dict[str, Any]]:
     """The client identities this MCP process can wake.
 
-    Codex Desktop: the calling thread is derived from ``CODEX_THREAD_ID`` in
-    this process (the MCP process is spawned fresh per task/session), and the
-    pipe path must be inherited. Only register if the pipe is actually present —
-    fail closed when the Desktop capability is absent.
+    The caller/executor thread (used as the outer ``params.threadId``) is the
+    relay's registered destination. Registration only happens when the pipe
+    capability is actually present — fail closed when the Desktop capability is
+    absent (review rc37 P0).
     """
-    codex_thread = os.environ.get("CODEX_THREAD_ID")
+    codex_thread = _codex_thread_identity()
     if not codex_thread:
         return []
-    from .codex_pipe import app_tools_pipe_path
-
-    if not app_tools_pipe_path():
+    if not _desktop_pipe_path():
         return []
     return [{"client_type": "codex_desktop", "thread_id": codex_thread}]
 
@@ -67,17 +135,27 @@ class DesktopRelay:
         client_id: str,
         *,
         destinations: list[dict[str, Any]] | None = None,
+        caller_thread_id: str | None = None,
         poll_interval: float = 0.5,
         max_reconnect_delay: float = 15.0,
+        activity_tracker: Any = None,
     ) -> None:
         self.client = client
         self.client_id = client_id
         self.destinations = destinations if destinations is not None else _destinations()
+        # The executor/caller thread identity used as the outer params.threadId.
+        self.caller_thread_id = caller_thread_id or _codex_thread_identity()
         self.poll_interval = poll_interval
         self.max_reconnect_delay = max_reconnect_delay
+        # Optional watchdog activity tracker: while the relay owns an active
+        # subscription it marks activity so the MCP idle watchdog does not reap
+        # a healthy process that is still delivering wake notifications (review
+        # rc37 P1). Parent-death cleanup is untouched.
+        self.activity_tracker = activity_tracker
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._backoff = 0.5
+        self._registered = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -87,6 +165,9 @@ class DesktopRelay:
 
     def stop(self) -> None:
         self._stop.set()
+        self._unregister()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
 
     def _register(self) -> bool:
         try:
@@ -98,82 +179,140 @@ class DesktopRelay:
                     "destinations": self.destinations,
                 },
             )
-            return bool(result and result.get("result") == "ok")
+            ok = bool(result and result.get("result") == "ok")
+            self._registered = ok
+            return ok
         except Exception:
+            self._registered = False
             return False
 
     def _unregister(self) -> None:
+        if not self._registered:
+            return
         try:
             self.client.post("/relay/unregister", {"client_id": self.client_id})
         except Exception:
             pass
+        self._registered = False
 
     def _poll(self) -> list[dict[str, Any]]:
-        # Long-poll up to 15s per request so a reconnect doesn't spin.
+        # Long-poll up to 15s per request so a reconnect doesn't spin. The poll
+        # response includes an opaque lease token per delivery; ack requires it
+        # so only the claiming client can complete a delivery (review rc37 P1).
         params = {"client_id": self.client_id, "timeout_seconds": "15"}
         result = self.client.get("/relay/poll", params)
         return result.get("deliveries") if isinstance(result, dict) else []
 
+    def _ack(self, delivery: dict[str, Any], status: str, error: str | None = None) -> None:
+        payload: dict[str, Any] = {
+            "client_id": self.client_id,
+            "delivery_id": delivery["delivery_id"],
+            "lease_token": delivery.get("lease_token"),
+            "status": status,
+        }
+        if error is not None:
+            payload["error"] = error
+        self.client.post("/relay/ack", payload)
+
     def _deliver(self, delivery: dict[str, Any]) -> None:
         from .codex_bridge import send_delivery_to_codex_desktop
 
+        # Deliver through the native pipe, injecting the relay's authenticated
+        # caller/executor thread identity (required as outer params.threadId).
+        # At-least-once semantics: the Vanth delivery id is the stable call/turn
+        # correlation key. If host admission succeeds but the ack is lost, the
+        # lease expires and the delivery is reclaimed for retry.
         try:
-            send_delivery_to_codex_desktop(delivery["payload"])
-            self.client.post(
-                "/relay/ack",
-                {"client_id": self.client_id, "delivery_id": delivery["delivery_id"], "status": "delivered"},
-            )
-        except Exception as exc:
-            self.client.post(
-                "/relay/ack",
-                {
-                    "client_id": self.client_id,
-                    "delivery_id": delivery["delivery_id"],
-                    "status": "failed",
-                    "error": str(exc),
-                },
-            )
+            send_delivery_to_codex_desktop(delivery["payload"], caller_thread_id=self.caller_thread_id)
+            self._ack(delivery, "delivered")
+        except Exception:
+            # Ack failures are handled at the _run boundary (bounded reconnect),
+            # not here, so a transient daemon outage cannot kill the relay.
+            raise
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            if not self._register():
-                # Registration failed (daemon not up, or no destinations). Wait
-                # with bounded backoff and retry.
-                time.sleep(self._backoff)
-                self._backoff = min(self._backoff * 2, self.max_reconnect_delay)
-                continue
-            self._backoff = 0.5
-            try:
-                deliveries = self._poll()
-            except Exception:
-                # Daemon unreachable: reconnect with backoff.
-                time.sleep(self._backoff)
-                self._backoff = min(self._backoff * 2, self.max_reconnect_delay)
-                continue
-            for delivery in deliveries:
-                if self._stop.is_set():
-                    break
-                self._deliver(delivery)
+        try:
+            while not self._stop.is_set():
+                if self.activity_tracker is not None:
+                    self.activity_tracker.notify_activity()
+                if not self._register():
+                    # Registration failed (daemon not up, or no destinations).
+                    # Wait with bounded backoff and retry.
+                    time.sleep(self._backoff)
+                    self._backoff = min(self._backoff * 2, self.max_reconnect_delay)
+                    continue
+                self._backoff = 0.5
+                try:
+                    deliveries = self._poll()
+                except Exception:
+                    # Daemon unreachable: reconnect with backoff. Do NOT let the
+                    # exception escape the loop (review rc37 P1).
+                    time.sleep(self._backoff)
+                    self._backoff = min(self._backoff * 2, self.max_reconnect_delay)
+                    continue
+                for delivery in deliveries:
+                    if self._stop.is_set():
+                        break
+                    try:
+                        self._deliver(delivery)
+                    except Exception:
+                        # A failed delivery (or failed ack) must not kill the
+                        # relay: mark the delivery failed so it retries per the
+                        # normal backoff, then continue polling. If even the ack
+                        # cannot be sent (daemon down), the lease expires and the
+                        # daemon reclaims the delivery later.
+                        try:
+                            self._ack(delivery, "failed", "delivery failed; will retry")
+                        except Exception:
+                            # Ack unavailable (daemon down); the lease will
+                            # expire and the daemon reclaims the delivery.
+                            pass
+                        time.sleep(0.2)
+        finally:
+            self._unregister()
 
 
-def start_desktop_relay() -> DesktopRelay | None:
+def start_desktop_relay(activity_tracker: Any = None) -> DesktopRelay | None:
     """Start the Desktop wake relay if this process can wake a Desktop task.
 
-    Returns None when there is nothing to wake (no CODEX_THREAD_ID and no
-    inherited CODEX_APP_TOOLS_PIPE_PATH), so no relay thread is spawned.
+    Returns the relay when the capability is present and a thread identity is
+    available, otherwise ``None``. Prerequisite absence is not silent: the
+    diagnostic is written to the ``vanth`` logger (and surfaced in ``doctor``
+    via ``relay_status``) so Desktop wake being unavailable is observable
+    (review rc37 P0). A relay with no registered destinations exits its loop
+    without registering, so it never blocks shutdown.
+
+    ``activity_tracker`` is the MCP watchdog's ``_InFlight`` tracker; the relay
+    marks activity around each poll so an active subscription is never
+    idle-reaped (review rc37 P1).
     """
-    codex_thread = os.environ.get("CODEX_THREAD_ID")
-    from .codex_pipe import app_tools_pipe_path
+    codex_thread = _codex_thread_identity()
+    pipe_path = _desktop_pipe_path()
+    if not codex_thread or not pipe_path:
+        reason = []
+        if not pipe_path:
+            reason.append("no Codex Desktop pipe capability (CODEX_APP_TOOLS_PIPE_PATH / VANTH_CODEX_DESKTOP_PIPE / codex_desktop.json)")
+        if not codex_thread:
+            reason.append("no caller thread identity (CODEX_THREAD_ID / VANTH_CODEX_DESKTOP_THREAD)")
+        import logging
 
-    if not codex_thread or not app_tools_pipe_path():
+        logging.getLogger("vanth").warning(
+            "Desktop wake relay not started: %s. Provision with `vanth setup desktop` or a host handoff.",
+            "; ".join(reason),
+        )
         return None
-    from .client import VanthClient
-
     try:
         client = VanthClient()
         client.ensure()
     except Exception:
+        import logging
+
+        logging.getLogger("vanth").warning("Desktop wake relay not started: daemon unreachable")
         return None
-    relay = DesktopRelay(client, f"mcp-{os.getpid()}-{codex_thread}")
+    relay = DesktopRelay(
+        client,
+        f"mcp-{os.getpid()}-{codex_thread}",
+        activity_tracker=activity_tracker,
+    )
     relay.start()
     return relay

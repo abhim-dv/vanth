@@ -711,6 +711,7 @@ class Handler(BaseHTTPRequestHandler):
                     delivery_id=payload.get("delivery_id", ""),
                     status=payload.get("status", ""),
                     error=payload.get("error"),
+                    lease_token=payload.get("lease_token"),
                 ))
             elif parsed.path == "/remotes/pair":
                 from .remote.pairing import pair_remote

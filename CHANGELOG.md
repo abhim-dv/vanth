@@ -4,6 +4,72 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc37-review release blockers: real Desktop wake path, relay ownership (rc38)
+
+#### Codex Desktop wake actually works (P0)
+
+- **Capability preflight matches the LIVE Desktop catalog.** Desktop reports the
+  tool as separate fields (`namespace="codex_app"`, `name="send_message_to_thread"`);
+  the preflight now matches `(namespace, name)` and also accepts a combined
+  qualified name for compatibility. The fake pipe server reproduces the captured
+  live schema.
+- **Required caller thread id always supplied.** The native host rejects
+  `tools/call` without the outer `params.threadId` (`-32602 Invalid app tool
+  request`). The relay retains its authenticated executor/thread identity and
+  injects it; a delivery without one is rejected BEFORE any pipe I/O.
+- **Provisioned through a supported handoff, not ambient inheritance.** Real
+  Vanth MCP children do NOT receive `CODEX_APP_TOOLS_PIPE_PATH` /
+  `CODEX_THREAD_ID`. `vanth setup desktop` writes a per-home `codex_desktop.json`
+  capability file (pipe + caller thread identity), and the relay also accepts
+  `VANTH_CODEX_DESKTOP_PIPE` / `VANTH_CODEX_DESKTOP_THREAD`. Without a
+  capability the relay records an explicit diagnostic instead of silently
+  no-oping.
+- **Hard timeout on blocking pipe I/O.** `codex_pipe` runs the call on a worker
+  thread with a wall-clock deadline (closing the handle unblocks the reader), and
+  production delivery additionally runs the whole sequence in a killable helper
+  subprocess with a hard deadline, so a stalled named-pipe host can never hang
+  the relay thread.
+- **Pipe path never reaches delivery errors.** `CodexPipeUnavailable` messages
+  are sanitized (Windows OSErrors embed the full named-pipe path); the raw
+  exception is logged only in protected debug logging.
+
+#### Relay ownership & lifecycle (P1)
+
+- **Claimant-bound acknowledgements.** `relay_poll` returns an opaque
+  `lease_token` per delivery (the claim token); `relay_ack` CAS's on
+  `delivery_id`, `status='dispatching'`, `claim_token`, AND `claim_client_id`
+  matching the caller. A different relay — or the same relay after its lease was
+  reclaimed — affects zero rows. The current claim token is never reloaded on
+  behalf of the acknowledger (schema v13, `claim_client_id` column).
+- **No SQL starvation.** Destinations are filtered in SQL (`json_extract` on
+  `payload_json`) BEFORE `ORDER BY ... LIMIT`, so 20+ older deliveries for other
+  tasks can never starve a matching delivery.
+- **Relay lifecycle is exception-safe.** Delivery/ack failures are caught at the
+  `_run` boundary and always re-enter bounded reconnect; `stop()` unregisters in
+  `finally`; stale subscriptions are expired server-side from the dispatch loop;
+  at-least-once semantics use the stable delivery id as the call/turn key.
+
+#### Launch-identity (P1)
+
+- **Concurrent-job quota is now atomic.** `start()` counts and inserts in ONE
+  `BEGIN IMMEDIATE` transaction, so two manager processes can no longer both pass
+  `VANTH_MAX_RUNNING_JOBS=1` and create two `launching` rows (reproduced
+  deterministically; regression test added).
+
+#### Compatibility (P1)
+
+- **Original Python wake names restored.** `daemon_wake` / `job_wake_now` /
+  `job_add_wake_target` keep the original signature
+  `(job_id, target=None, events=None, type=None, **config)` — old calls such as
+  `daemon_wake(job_id, type="local_command", command=...)` work again. The MCP
+  surface is registered under separately named explicit-config adapters
+  (`mcp_daemon_wake` / `mcp_job_wake_now` / `mcp_job_add_wake_target`).
+- **Docs/schema aligned:** README, agent-tools, and the remote protocol schema
+  now list `codex_cli_thread`/`codex_desktop`; the stale "planned v1.4" and
+  "shared relay protocol" claims are corrected.
+
+Full suite: 679 passed, 6 skipped across two clean full runs.
+
 ### rc36-review release blockers: Desktop wake relay, launch-identity hardening (rc37)
 
 #### Codex Desktop wake via client relay (P0)
@@ -20,10 +86,17 @@ All notable changes to Vanth are documented here.
   `codex_desktop` deliveries, (3) delivers through the pipe, and (4)
   acknowledges only after admission succeeds. A disconnect leaves the delivery
   pending; a reconnect re-registers and resumes from the last acknowledged
-  delivery id. Both Codex (pipe adapter) and OpenCode (session/attach adapter)
-  share one subscription/ack protocol.
+  delivery id. (OpenCode wake currently uses daemon-side attached CLI dispatch;
+  the relay subscription/ack protocol is Codex-Desktop-specific for now.)
+- **Provisioned through a supported handoff, not ambient inheritance.** The real
+  Codex Desktop MCP children do NOT receive `CODEX_APP_TOOLS_PIPE_PATH` or
+  `CODEX_THREAD_ID`. `vanth setup desktop` writes a per-home
+  `codex_desktop.json` capability file (pipe + caller thread identity), or a
+  host wrapper can set `VANTH_CODEX_DESKTOP_PIPE` /
+  `VANTH_CODEX_DESKTOP_THREAD`. Without a capability the relay records an
+  explicit diagnostic instead of silently no-oping.
 - **Private pipe is contained inside the Codex MCP process** and is taken only
-  from its inherited environment — never from a job target or daemon message.
+  from the provisioned capability — never from a job target or daemon message.
 - **Fail-closed and opt-in:** with no inherited `CODEX_APP_TOOLS_PIPE_PATH` or
   capability, `codex_desktop` delivery fails with an actionable "Desktop
   integration unavailable" error and NEVER routes to the CLI thread bridge.

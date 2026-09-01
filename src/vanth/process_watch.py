@@ -147,7 +147,10 @@ class _InFlight:
 
     The watchdog must not idle-exit while a blocking tool call (``job_wait``,
     ``job_tail --follow``) is running. We wrap ``FastMCP.call_tool`` so the
-    counter is bumped around each call.
+    counter is bumped around each call. The Desktop wake relay also bumps the
+    counter around each poll so an active subscription is never idle-reaped
+    while it is still delivering wake notifications (review rc37 P1) — the
+    relay traffic is real work even though it never touches MCP stdio.
     """
 
     def __init__(self) -> None:
@@ -161,6 +164,17 @@ class _InFlight:
 
     def __exit__(self, *_: object) -> None:
         with self._lock:
+            self._count -= 1
+
+    def notify_activity(self) -> None:
+        """Mark transient activity so the idle timer resets.
+
+        Used by the Desktop wake relay around each poll/delivery so the
+        watchdog does not idle-exit a process that is still actively
+        delivering asynchronous wake notifications.
+        """
+        with self._lock:
+            self._count += 1
             self._count -= 1
 
     @property
