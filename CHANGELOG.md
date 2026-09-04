@@ -4,6 +4,31 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc40 self-review fixes (rc41)
+
+- **Stop never touches a replacement's processes.** The ownership-guarded
+  stop-request could still win on A and then terminate B's workload/runner PIDs
+  read after a takeover. `_stop` now re-verifies ownership after the re-read
+  and returns early on mismatch — no termination, no transition — and clears
+  only its own flag value so B's runner is not poisoned. Regression test uses a
+  live sleeper as B's process and asserts survival.
+- **Helper preserves the Unavailable class.** Production pipe failures arrived
+  as plain `CodexPipeError` (the helper JSON had no class marker), so relay
+  outage handling never fired. The helper now sets `"unavailable": true` and
+  the parent re-raises `CodexPipeUnavailable` (message still sanitized).
+- **Outage releases instead of consuming.** The old path acked failed on pipe
+  outage — terminal at the default `max_attempts=1`. Now a re-provisioned
+  capability is reloaded and retried once with the fresh pipe; otherwise the
+  delivery is released back to pending via the new `/relay/release` endpoint
+  (ownership-CAS'd, attempts untouched, immediately due) and the relay backs
+  off and keeps polling. A dedicated `RelayCapabilityLost` skips the
+  ack-failed path in `_run`.
+- **No doomed frames.** `CodexPipeClient.call()` checks the shared sequence
+  budget BEFORE sending; an exhausted budget raises without transmitting a
+  prompt the host might still act on.
+
+Full suite: 704 passed, 6 skipped across two clean full runs.
+
 ### rc39-review races: one ownership CAS, one deadline, one in-flight scope (rc40)
 
 #### One ownership CAS (P1)

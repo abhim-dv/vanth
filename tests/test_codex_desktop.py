@@ -303,6 +303,44 @@ class TestHelperSubprocess:
         assert payload.get("ok") is False
         assert "not configured" in payload.get("error", "")
 
+    def test_helper_unavailable_flag_survives_subprocess(self):
+        """Self-review rc40: a dead pipe through the REAL helper subprocess must
+        surface as CodexPipeUnavailable (not plain CodexPipeError) so the relay
+        can match on the class and reload the capability. The message stays
+        sanitized."""
+        request = {
+            "pipe_path": r"\\.\pipe\nonexistent_vanth_unavail",
+            "timeout_seconds": 2,
+            "destination_thread_id": "t",
+            "prompt": "p",
+            "caller_thread_id": "c",
+            "call_id": "x",
+        }
+        proc = subprocess.run(
+            [sys.executable, "-m", "vanth.codex_pipe", "--helper"],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(proc.stdout)
+        assert payload.get("ok") is False
+        assert payload.get("unavailable") is True
+        assert r"\\.\pipe\nonexistent_vanth_unavail" not in payload.get("error", "")
+
+    def test_send_desktop_message_raises_unavailable_class(self):
+        """End-to-end through send_desktop_message (real subprocess branch): a
+        dead pipe raises CodexPipeUnavailable so relay outage handling fires."""
+        with pytest.raises(CodexPipeUnavailable):
+            send_desktop_message(
+                destination_thread_id="t",
+                prompt="p",
+                caller_thread_id="c",
+                call_id="x",
+                pipe_path=r"\\.\pipe\nonexistent_vanth_class",
+                timeout_seconds=2,
+            )
+
     def test_helper_subprocess_sanitizes_unreachable_pipe(self):
         # A pipe that cannot be opened must surface a sanitized error through
         # the REAL subprocess helper (never embed the pipe path in the JSON).
@@ -736,10 +774,10 @@ class TestRelayRestartRecovery:
         changed2 = relay._reload_capability()
         assert changed2 is False
 
-    def test_relay_pipe_unavailable_fails_without_consuming(self, monkeypatch, tmp_path):
+    def test_relay_pipe_unavailable_releases_without_consuming(self, monkeypatch, tmp_path):
         """When the pipe is unavailable and the capability did NOT change, the
-        delivery must fail (so it retries per max_attempts) — not be silently
-        acknowledged as delivered."""
+        delivery must be RELEASED back to pending (no attempt consumed) — not
+        acked failed (terminal at max_attempts=1) and not silently delivered."""
         import json as _json
         import vanth.relay as relay_mod
 
@@ -766,13 +804,14 @@ class TestRelayRestartRecovery:
 
         from vanth.codex_pipe import CodexPipeUnavailable
 
+        posted = []
+
         class FakeClient:
             def ensure(self):
                 return True
 
             def post(self, path, payload):
-                if path == "/relay/ack":
-                    return {"result": "ok"}
+                posted.append((path, payload))
                 return {"result": "ok"}
 
             def get(self, path, params):
@@ -788,7 +827,7 @@ class TestRelayRestartRecovery:
         codex_bridge.send_delivery_to_codex_desktop = unavailable
         try:
             relay = relay_mod.DesktopRelay(FakeClient(), "client_outage")
-            with pytest.raises(CodexPipeUnavailable):
+            with pytest.raises(relay_mod.RelayCapabilityLost):
                 relay._deliver(
                     {
                         "delivery_id": "del_outage",
@@ -796,10 +835,99 @@ class TestRelayRestartRecovery:
                         "payload": {"target": {"type": "codex_desktop", "thread_id": "t"}, "prompt": "wake"},
                     }
                 )
-            # The capability did not change -> reload returned False and the
-            # exception propagates (the _run boundary marks the delivery failed,
-            # which retries per max_attempts instead of acking delivered).
+            # The capability did not change -> the delivery was RELEASED (not
+            # acked failed, which would terminally consume it at max_attempts=1).
+            paths = [path for path, _ in posted]
+            assert "/relay/release" in paths, f"must release, posted: {paths}"
+            assert not any(
+                path == "/relay/ack" and payload.get("status") == "failed"
+                for path, payload in posted
+            ), "must NOT ack-failed a released delivery"
+            release = next(payload for path, payload in posted if path == "/relay/release")
+            assert release["delivery_id"] == "del_outage"
+            assert release["lease_token"] == "tok"
             assert relay.pipe_path == r"\\.\pipe\dead_pipe"
+        finally:
+            codex_bridge.send_delivery_to_codex_desktop = orig
+
+    def test_relay_retries_with_reprovisioned_pipe(self, monkeypatch, tmp_path):
+        """Desktop restart + reprovision while the relay runs: the first send
+        fails on the dead pipe, the relay reloads the NEW capability, and the
+        same pending wake is delivered through the fresh pipe (never lost)."""
+        import json as _json
+        import vanth.relay as relay_mod
+
+        from datetime import datetime, timezone
+
+        monkeypatch.delenv("CODEX_APP_TOOLS_PIPE_PATH", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_PIPE", raising=False)
+        monkeypatch.delenv("VANTH_CODEX_DESKTOP_THREAD", raising=False)
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("VANTH_HOME", str(home))
+        cap = home / "codex_desktop.json"
+
+        def write(pipe):
+            cap.write_text(
+                _json.dumps(
+                    {
+                        "pipe_path": pipe,
+                        "thread_id": "thread_exec",
+                        "caller_thread_id": "thread_exec",
+                        "provisioned_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        write(r"\\.\pipe\old_dead_pipe")
+
+        from vanth.codex_pipe import CodexPipeUnavailable
+
+        posted = []
+        delivered = {}
+
+        class FakeClient:
+            def ensure(self):
+                return True
+
+            def post(self, path, payload):
+                posted.append((path, payload))
+                return {"result": "ok"}
+
+            def get(self, path, params):
+                return {"deliveries": []}
+
+        from vanth import codex_bridge
+
+        orig = codex_bridge.send_delivery_to_codex_desktop
+
+        def flaky_send(payload, *, caller_thread_id=None, pipe_path=None):
+            # The old (dead) pipe fails; the re-provisioned pipe admits.
+            if pipe_path == r"\\.\pipe\old_dead_pipe":
+                # Simulate the operator re-provisioning DURING the outage.
+                write(r"\\.\pipe\new_live_pipe")
+                raise CodexPipeUnavailable("cannot open Codex Desktop app-tools pipe")
+            delivered["pipe_path"] = pipe_path
+            return {"ok": True}
+
+        codex_bridge.send_delivery_to_codex_desktop = flaky_send
+        try:
+            relay = relay_mod.DesktopRelay(FakeClient(), "client_reprov")
+            assert relay.pipe_path == r"\\.\pipe\old_dead_pipe"
+            # Must NOT raise: the retry through the fresh pipe succeeds.
+            relay._deliver(
+                {
+                    "delivery_id": "del_reprov",
+                    "lease_token": "tok",
+                    "payload": {"target": {"type": "codex_desktop", "thread_id": "t"}, "prompt": "wake"},
+                }
+            )
+            assert delivered["pipe_path"] == r"\\.\pipe\new_live_pipe"
+            assert relay.pipe_path == r"\\.\pipe\new_live_pipe"
+            acks = [payload for path, payload in posted if path == "/relay/ack"]
+            assert acks and acks[0]["status"] == "delivered"
+            assert not any(path == "/relay/release" for path, _ in posted)
         finally:
             codex_bridge.send_delivery_to_codex_desktop = orig
 
@@ -1049,6 +1177,44 @@ class TestRelay:
             assert row["last_poll_at"] > old, "re-register must refresh last_poll_at"
             # A stale sweep must NOT remove the just-refreshed subscription.
             assert manager.relay_expire_stale(stale_after_seconds=300) == 0
+        finally:
+            manager.close()
+
+    def test_relay_release_returns_to_pending_without_consuming(self, tmp_path):
+        """relay_release returns a claimed delivery to pending WITHOUT
+        consuming an attempt (attempts untouched, immediately due). Wrong
+        token/client raises; the delivery stays dispatching under its owner."""
+        manager = JobManager(tmp_path / "state", recover=False)
+        try:
+            manager.relay_register(
+                "client_1", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_dest"}]
+            )
+            self._start_delivery(manager)
+            polled = manager.relay_poll("client_1", timeout_seconds=1)
+            assert polled
+            delivery = polled[0]
+            before = manager._row(
+                "SELECT attempts FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)
+            )
+            # Wrong token must fail and leave the row dispatching.
+            with pytest.raises(ValueError, match="not claimed by this relay"):
+                manager.relay_release("client_1", delivery["delivery_id"], lease_token="bogus")
+            # Correct release: pending, attempts untouched, due immediately.
+            released = manager.relay_release("client_1", delivery["delivery_id"], lease_token=delivery["lease_token"])
+            assert released["result"] == "ok"
+            assert released["status"] == "pending"
+            row = manager._row(
+                "SELECT status, attempts, claim_token, claim_client_id, next_attempt_at FROM deliveries WHERE delivery_id=?",
+                (delivery["delivery_id"],),
+            )
+            assert row["status"] == "pending"
+            assert int(row["attempts"]) == int(before["attempts"])
+            assert row["claim_token"] is None
+            assert row["claim_client_id"] is None
+            assert row["next_attempt_at"] is None
+            # The released wake is immediately reclaimable by a later poll.
+            repolled = manager.relay_poll("client_1", timeout_seconds=1)
+            assert repolled and repolled[0]["delivery_id"] == delivery["delivery_id"]
         finally:
             manager.close()
 

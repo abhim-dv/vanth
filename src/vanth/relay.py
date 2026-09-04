@@ -67,6 +67,15 @@ class RelayError(RuntimeError):
     pass
 
 
+class RelayCapabilityLost(RelayError):
+    """The Desktop pipe is unavailable and no re-provisioned capability exists.
+
+    Raised by ``_deliver`` after the delivery has been released back to pending
+    (no attempt consumed). ``_run`` must back off and keep polling — never
+    ack-failed, which would terminally consume the wake at max_attempts=1.
+    """
+
+
 def _desktop_capability_file() -> dict[str, Any] | None:
     """Read the per-home Desktop wake capability file, if present.
 
@@ -207,6 +216,7 @@ class DesktopRelay:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._backoff = 0.5
+        self._outage_backoff = 0.5
         self._registered = False
 
     def start(self) -> None:
@@ -260,18 +270,19 @@ class DesktopRelay:
 
         A Desktop restart invalidates the private pipe; re-running
         ``vanth setup desktop`` rewrites ``codex_desktop.json`` with a fresh
-        ``provisioned_at``. On pipe-unavailable failure the relay re-reads the
-        capability and returns whether anything changed. If the pipe/thread
-        changed, the relay re-registers the new destination and continues; if
-        nothing changed, the failure is treated as a genuine outage with an
-        explicit reprovision diagnostic (review rc39 P1).
+        pipe. On pipe-unavailable failure the relay re-reads the capability and
+        returns True only when a NEW usable pipe appeared (then the caller
+        re-registers and retries). A vanished capability is NOT treated as a
+        change — retrying the stale dead path would just spin (self-review
+        rc40).
         """
         new_pipe = _desktop_pipe_path()
         new_thread = _codex_thread_identity()
+        if not new_pipe:
+            return False
         if new_pipe == self.pipe_path and new_thread == self.caller_thread_id:
             return False
-        if new_pipe:
-            self.pipe_path = new_pipe
+        self.pipe_path = new_pipe
         if new_thread:
             self.caller_thread_id = new_thread
         self.destinations = (
@@ -311,6 +322,25 @@ class DesktopRelay:
                 f"(lease may be stale or reclaimed): {detail}".rstrip()
             )
 
+    def _release(self, delivery: dict[str, Any]) -> None:
+        """Return a claimed delivery to pending WITHOUT consuming an attempt.
+
+        Best-effort: if the daemon is unreachable the lease simply expires and
+        the delivery is reclaimed later; if the claim already moved on, the
+        rejection is ignored. Never raises.
+        """
+        try:
+            self.client.post(
+                "/relay/release",
+                {
+                    "client_id": self.client_id,
+                    "delivery_id": delivery["delivery_id"],
+                    "lease_token": delivery.get("lease_token"),
+                },
+            )
+        except Exception:
+            pass
+
     def _deliver(self, delivery: dict[str, Any]) -> None:
         from .codex_bridge import send_delivery_to_codex_desktop
         from .codex_pipe import CodexPipeUnavailable
@@ -329,25 +359,49 @@ class DesktopRelay:
                 pipe_path=self.pipe_path,
             )
             self._ack(delivery, "delivered")
+            self._outage_backoff = 0.5
+            return
         except CodexPipeUnavailable:
-            # Desktop restart invalidates the private pipe. Try to reload the
-            # capability and re-register (a re-provisioned pipe/thread may be
-            # available); if nothing changed, this is a genuine outage and we
-            # fail the delivery WITHOUT permanently consuming it (the ack marks
-            # it failed -> retry/backoff per max_attempts, and the lease is not
-            # silently accepted). review rc39 P1.
-            if not self._reload_capability():
-                import logging
-
-                logging.getLogger("vanth").warning(
-                    "Codex Desktop pipe unavailable and capability did not change; "
-                    "delivery will be retried. If Desktop restarted, re-run `vanth setup desktop`."
-                )
-            raise
+            pass  # outage handling below
         except Exception:
             # Ack failures are handled at the _run boundary (bounded reconnect),
             # not here, so a transient daemon outage cannot kill the relay.
             raise
+        # Pipe outage (Desktop restart invalidated the pipe). If the capability
+        # was re-provisioned meanwhile, re-register and retry ONCE with the
+        # fresh pipe so an already-running relay delivers the pending wake
+        # without an MCP restart (review rc39 P1).
+        if self._reload_capability() and self._register():
+            try:
+                send_delivery_to_codex_desktop(
+                    delivery["payload"],
+                    caller_thread_id=self.caller_thread_id,
+                    pipe_path=self.pipe_path,
+                )
+                self._ack(delivery, "delivered")
+                self._outage_backoff = 0.5
+                return
+            except CodexPipeUnavailable:
+                pass  # still down; fall through to release
+            except Exception:
+                raise  # a non-pipe error on retry takes the normal failed path
+        # Persistent outage with no re-provision: release the delivery back to
+        # pending WITHOUT consuming an attempt (a failed ack would be terminal
+        # at the default max_attempts=1) and signal _run to back off and keep
+        # polling. (self-review rc40: the old code acked failed here, losing
+        # the wake on the first outage poll.)
+        import logging
+
+        logging.getLogger("vanth").warning(
+            "Codex Desktop pipe unavailable (delivery %s released, not consumed); "
+            "if Desktop restarted, re-run `vanth setup desktop` to re-provision.",
+            delivery.get("delivery_id"),
+        )
+        self._release(delivery)
+        raise RelayCapabilityLost(
+            f"Codex Desktop pipe unavailable for delivery {delivery.get('delivery_id')}; "
+            "released back to pending"
+        )
 
     def _run(self) -> None:
         try:
@@ -391,6 +445,15 @@ class DesktopRelay:
                                 self._deliver(delivery)
                         else:
                             self._deliver(delivery)
+                    except RelayCapabilityLost:
+                        # Pipe outage: the delivery was already released back to
+                        # pending (no attempt consumed). Back off and return to
+                        # register/poll so a re-provision is picked up without
+                        # an MCP restart — and NEVER ack-failed here, which
+                        # would terminally consume the wake at max_attempts=1.
+                        time.sleep(self._outage_backoff)
+                        self._outage_backoff = min(self._outage_backoff * 2, self.max_reconnect_delay)
+                        break
                     except Exception:
                         # A failed delivery (or failed ack) must not kill the
                         # relay: mark the delivery failed so it retries per the

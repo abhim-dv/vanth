@@ -721,8 +721,11 @@ routed to the CLI.
 > provisioning a second Desktop task overwrites the first, and a Desktop restart
 > invalidates the private pipe. A stale capability (older than 24h) is detected
 > and fails closed with a diagnostic asking you to re-run `vanth setup desktop`
-> inside an active Desktop session. Automatic or durable multi-task Desktop wake
-> is NOT supported yet.
+> inside an active Desktop session. If Desktop restarts mid-operation, the relay
+> reloads a re-provisioned capability and retries the pending wake; otherwise
+> the wake is released back to pending (never terminally consumed) until you
+> re-provision. Automatic or durable multi-task Desktop wake is NOT supported
+> yet.
 
 ### opencode_thread
 

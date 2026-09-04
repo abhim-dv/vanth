@@ -234,6 +234,70 @@ def test_stale_stop_does_not_cancel_replacement_launch(tmp_path):
         manager.close()
 
 
+def test_stale_stop_never_kills_replacement_processes(tmp_path):
+    """Self-review rc40: even when the stop-request CAS wins on A and B takes
+    over before the re-read, _stop must not terminate B's workload/runner, must
+    not transition B, and must clear its own flag value so B's runner is not
+    poisoned."""
+    import subprocess as _sp
+
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path, recover=False)
+    sleeper = _sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        job_id = "job_stale_stop_pids"
+        stdout_path = manager.logs / f"{job_id}.stdout.log"
+        stderr_path = manager.logs / f"{job_id}.stderr.log"
+        events_path = manager.events_dir / f"{job_id}.jsonl"
+        claim_a = "claim_A2"
+        stamp = now_iso()
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, "
+                "events_path, claim_token, worker_pid, pid) VALUES (?, ?, 'launching', ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                (job_id, "true", stamp, stamp, str(stdout_path), str(stderr_path), str(events_path), claim_a),
+            )
+            manager.db.commit()
+
+        # On the SECOND _row call (the post-CAS re-read), install claim B with
+        # a LIVE workload/runner pid first, then return the real row.
+        claim_b = "claim_B2"
+        original_row = manager._row
+        calls = {"n": 0}
+
+        def racy_row(sql, params=()):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                with manager.db_lock:
+                    manager.db.execute(
+                        "UPDATE jobs SET status='running', claim_token=?, worker_pid=?, pid=? WHERE job_id=?",
+                        (claim_b, sleeper.pid, sleeper.pid, job_id),
+                    )
+                    manager.db.commit()
+            return original_row(sql, params)
+
+        manager._row = racy_row
+        try:
+            result = manager.stop_sync(job_id, kill_after_seconds=0)
+        finally:
+            manager._row = original_row
+        assert "newer launch" in result.get("message", ""), f"unexpected: {result}"
+        # B's live process must survive the stale stop.
+        assert manager._pid_alive(sleeper.pid), "stale stop must not kill the replacement's process"
+        row = manager._row("SELECT status, claim_token, stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+        assert row["status"] == "running"
+        assert row["claim_token"] == claim_b
+        assert row["stop_requested_at"] is None, "our flag value must be cleared so B is not poisoned"
+    finally:
+        try:
+            sleeper.terminate()
+            sleeper.wait(timeout=5)
+        except Exception:
+            pass
+        manager.close()
+
+
 def test_job_start_mcp_tool_is_not_a_coroutine_function():
     from vanth.server import mcp
 

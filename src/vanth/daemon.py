@@ -713,6 +713,12 @@ class Handler(BaseHTTPRequestHandler):
                     error=payload.get("error"),
                     lease_token=payload.get("lease_token"),
                 ))
+            elif parsed.path == "/relay/release":
+                ok(self, get_manager().relay_release(
+                    client_id=payload.get("client_id", ""),
+                    delivery_id=payload.get("delivery_id", ""),
+                    lease_token=payload.get("lease_token"),
+                ))
             elif parsed.path == "/remotes/pair":
                 from .remote.pairing import pair_remote
 

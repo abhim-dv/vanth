@@ -1909,6 +1909,45 @@ class JobManager:
             self._complete_delivery(delivery, status, error, require_claim_client_id=client_id)
         return {"result": "ok", "delivery_id": delivery_id, "status": status}
 
+    def relay_release(self, client_id: str, delivery_id: str, lease_token: str | None = None) -> dict[str, Any]:
+        """Release a claimed delivery back to pending WITHOUT consuming an attempt.
+
+        Used when the relay cannot deliver for environmental reasons (a Desktop
+        restart invalidated the pipe) rather than a delivery failure: the wake
+        must survive for a re-provisioned relay instead of being failed — a
+        ``failed`` ack is terminal at the default ``max_attempts=1``
+        (self-review rc40). Ownership-CAS'd on delivery_id + dispatching +
+        claim_token + claim_client_id; zero rows raises. ``attempts`` is left
+        untouched and ``next_attempt_at`` cleared so the delivery is immediately
+        due for the next poll.
+        """
+        self._ensure_open()
+        if not isinstance(lease_token, str) or not lease_token:
+            raise ValueError("relay_release requires the opaque lease_token returned by relay_poll")
+        with self.db_lock:
+            changed = self.db.execute(
+                """
+                UPDATE deliveries SET status='pending', next_attempt_at=NULL,
+                  claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL
+                WHERE delivery_id=? AND status='dispatching' AND claim_token=? AND claim_client_id=?
+                """,
+                (delivery_id, lease_token, client_id),
+            ).rowcount
+            if changed:
+                self.db.execute(
+                    """
+                    UPDATE delivery_attempts SET status='released', ended_at=?
+                    WHERE delivery_id=? AND claim_token=? AND ended_at IS NULL
+                    """,
+                    (now_iso(), delivery_id, lease_token),
+                )
+            self.db.commit()
+            if not changed:
+                raise ValueError(
+                    "delivery is not claimed by this relay (lease reclaimed, delivered, or owned by another client)"
+                )
+        return {"result": "ok", "delivery_id": delivery_id, "status": "pending"}
+
     def relay_expire_stale(self, stale_after_seconds: int = 300) -> int:
         """Expire relay subscriptions that have not polled within the window.
 
@@ -4227,6 +4266,29 @@ class JobManager:
         row = self._row("SELECT status, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,))
         if not row or row["status"] not in {"running", "launching"}:
             return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal"}
+        # Ownership re-verification (self-review rc40): the stop-request CAS
+        # succeeded on the observed identity, but a replacement launch may have
+        # taken over the row between that CAS and this re-read. Every process
+        # termination and transition below must target the OBSERVED owner only —
+        # never kill B's workload/runner just because B now owns the row. Our
+        # flag value is also cleared so B's runner is not poisoned by a stop
+        # flag it never asked for (the clear only applies while the flag is
+        # still exactly our token, so a newer stop's flag is never removed).
+        def _ownership_changed() -> bool:
+            if observed_claim_token:
+                return row["claim_token"] != observed_claim_token
+            if observed_worker_pid is not None:
+                return row["worker_pid"] != observed_worker_pid
+            return False
+
+        if _ownership_changed():
+            with self.db_lock:
+                self.db.execute(
+                    "UPDATE jobs SET stop_requested_at=NULL WHERE job_id=? AND stop_requested_at=?",
+                    (job_id, stop_token),
+                )
+                self.db.commit()
+            return {"job_id": job_id, "status": row["status"], "message": "Job is owned by a newer launch; stop is a no-op"}
         workload_pid = int(row["pid"]) if row["pid"] else None
         if workload_pid and not self._terminate_pid(workload_pid, signal == "kill", deadline):
             with self.db_lock:

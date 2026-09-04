@@ -237,23 +237,28 @@ class CodexPipeClient:
         subprocess, so a named-pipe read that cannot be unblocked by close() is
         still killed at the process boundary (review rc37 P1).
         """
-        request_id = self._next_id()
-        self._send_frame(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        )
         # Each call shares the ONE sequence deadline: the call's own timeout is
         # capped by the remaining end-to-end budget (review rc39 P1), so a slow
         # preflight cannot consume a second full timeout. Tests that construct
         # the client via __new__ may not set sequence_deadline; fall back to a
         # fresh per-call deadline then.
         sequence_deadline = getattr(self, "sequence_deadline", None)
+        now = time.monotonic()
         if sequence_deadline is not None:
-            deadline = min(
-                time.monotonic() + self.timeout_seconds,
-                sequence_deadline,
-            )
+            if sequence_deadline - now <= 0:
+                # Budget already exhausted (e.g. a slow preflight consumed it):
+                # fail WITHOUT sending a doomed frame the host might still act
+                # on (self-review rc40).
+                raise CodexPipeError(
+                    f"timed out waiting for Codex Desktop {method} after {self.timeout_seconds}s (sequence budget exhausted)"
+                )
+            deadline = min(now + self.timeout_seconds, sequence_deadline)
         else:
-            deadline = time.monotonic() + self.timeout_seconds
+            deadline = now + self.timeout_seconds
+        request_id = self._next_id()
+        self._send_frame(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        )
         result_queue: queue.Queue[Any] = queue.Queue()
         reader = threading.Thread(
             target=_produce,
@@ -446,6 +451,11 @@ def send_desktop_message(
     except (json.JSONDecodeError, TypeError) as exc:
         raise CodexPipeError("Codex Desktop bridge helper returned an invalid response") from exc
     if payload.get("ok") is not True:
+        # Re-raise pipe-unavailable as its own class (see _helper_main): the
+        # relay matches on it to reload a re-provisioned capability after a
+        # Desktop restart. The message stays sanitized (no pipe path).
+        if payload.get("unavailable") is True:
+            raise CodexPipeUnavailable(payload.get("error") or "Codex Desktop app-tools pipe is not available")
         raise CodexPipeError(payload.get("error", "Codex Desktop wake failed"))
     return payload.get("result", {})
 
@@ -472,7 +482,12 @@ def _helper_main() -> int:
         finally:
             client.close()
     except CodexPipeUnavailable as exc:
-        sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
+        # Preserve the UNAVAILABLE class across the process boundary so the
+        # relay can distinguish a dead pipe (Desktop restart → reload capability)
+        # from other failures. Still sanitized: never the pipe path.
+        # (self-review rc40: without this flag every production outage arrived
+        # as plain CodexPipeError and the reload path never fired.)
+        sys.stdout.write(json.dumps({"ok": False, "unavailable": True, "error": str(exc)}, separators=(",", ":")))
         sys.stdout.flush()
         return 0
     except CodexPipeError as exc:
