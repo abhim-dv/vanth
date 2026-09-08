@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -13,11 +14,38 @@ from vanth.opencode_bridge import (
 )
 
 
-def test_default_command_resolves_through_which(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = r"C:\Users\someone\AppData\Roaming\npm\opencode.CMD"
-    monkeypatch.setattr(shutil, "which", lambda name: fake if name == "opencode" else None)
+def test_default_windows_npm_command_resolves_native_exe(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    fake = tmp_path / "npm" / "opencode.CMD"
+    native = fake.parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+    native.parent.mkdir(parents=True)
+    native.touch()
+    monkeypatch.setattr(shutil, "which", lambda name: str(fake) if name == "opencode" else None)
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.delenv("VANTH_OPENCODE_BIN", raising=False)
-    assert _command_argv(None) == [fake]
+    assert _command_argv(None) == [str(native)]
+
+
+def test_windows_batch_fallback_flattens_multiline_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, '{"type":"session.idle"}\n', "")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    send_delivery_to_opencode(
+        {
+            "prompt": "vanth event\ndelivery_id: del_live\nevent: completed",
+            "target": {
+                "session_id": "ses_live",
+                "attach": "http://127.0.0.1:4096",
+                "opencode_command": [r"C:\custom\opencode.cmd"],
+            },
+        }
+    )
+
+    assert seen["argv"][-1] == "vanth event delivery_id: del_live event: completed"
 
 
 def test_explicit_command_takes_precedence(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -90,6 +90,7 @@ def test_list_shows_running_job(daemon):
     tmp_path, client, port = daemon
     started = client.post("/jobs", {"command": cmd("import time; time.sleep(30)")})
     job_id = started["job_id"]
+    wait_status(client, job_id, ["running"])
     result = run_cli(tmp_path / "state", "list", port=port)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "STATUS" in result.stdout
@@ -104,6 +105,7 @@ def test_list_shows_running_job(daemon):
 def test_list_ps_alias(daemon):
     tmp_path, client, port = daemon
     started = client.post("/jobs", {"command": cmd("import time; time.sleep(30)")})
+    wait_status(client, started["job_id"], ["running"])
     result = run_cli(tmp_path / "state", "ps", port=port)
     assert result.returncode == 0
     assert started["job_id"] in result.stdout
@@ -116,6 +118,7 @@ def test_list_ps_alias(daemon):
 def test_list_json(daemon):
     tmp_path, client, port = daemon
     started = client.post("/jobs", {"command": cmd("import time; time.sleep(30)")})
+    wait_status(client, started["job_id"], ["running"])
     result = run_cli(tmp_path / "state", "list", "--json", port=port)
     assert result.returncode == 0, result.stdout + result.stderr
     jobs = json.loads(result.stdout)

@@ -725,7 +725,10 @@ routed to the CLI.
 > reloads a re-provisioned capability and retries the pending wake; otherwise
 > the wake is released back to pending (never terminally consumed) until you
 > re-provision. Automatic or durable multi-task Desktop wake is NOT supported
-> yet.
+> yet. The task must still be running in the current Desktop host lifetime;
+> arbitrary historical/unloaded Desktop threads are not supported. Live tests
+> found that the private host can accept sends to some such threads while
+> producing no usable turn, so admission alone is not a delivery guarantee.
 
 ### opencode_thread
 
@@ -744,6 +747,11 @@ Resumes an OpenCode session:
 ```
 
 The default OpenCode turn timeout is 30 seconds; raise it for long turns.
+
+On Windows, Vanth resolves the standard npm `opencode.cmd` shim to the native
+`opencode.exe` shipped in the same package. This avoids `cmd.exe` truncating a
+multiline wake prompt to its first line. Explicit/nonstandard batch shims remain
+supported; Vanth flattens their prompt line breaks so all wake fields arrive.
 
 Before dispatching to a plain (non-`attach`) session, Vanth runs a cheap
 `opencode session list` probe to confirm the session still exists — a

@@ -761,7 +761,9 @@ thread id (resolved by the MCP wrapper from `CODEX_THREAD_ID` /
 pipe — it requires the Desktop integration to be provisioned (run `vanth setup
 desktop` inside a Desktop session, or set `VANTH_CODEX_DESKTOP_PIPE` /
 `VANTH_CODEX_DESKTOP_THREAD`) and fails closed (never falls back to the CLI
-thread bridge) when it is not.
+thread bridge) when it is not. It does not support arbitrary historical or
+unloaded Desktop threads: the private host may accept those sends without
+producing a usable turn. Use `codex_cli_thread` for an unloaded persisted task.
 
 `opencode_thread` targets require an explicit `session_id` (OpenCode does not
 inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit

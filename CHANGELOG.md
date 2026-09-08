@@ -4,6 +4,22 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### Windows OpenCode live-delivery fix (rc43)
+
+- **Multiline OpenCode wakes survive the Windows npm launcher.** The standard
+  `opencode.cmd` shim forwards arguments through `%*`, which caused `cmd.exe`
+  to treat prompt line breaks as command separators. Live delivery therefore
+  reached OpenCode as only `vanth event`, without its delivery/job ids, event,
+  message, or continuation instructions. Vanth now resolves the npm shim to
+  its package's native `opencode.exe`; explicitly configured/nonstandard batch
+  shims fall back to a single-line prompt that preserves every wake field.
+- **Live wake transports validated.** Attached OpenCode and a persisted Codex
+  CLI thread both received complete wake prompts and produced exact requested
+  responses. Codex Desktop wake was validated for a current/running task. The
+  experimental Desktop docs now state the observed host boundary explicitly:
+  arbitrary historical/unloaded Desktop threads may accept a native send
+  without producing a usable turn and are not supported.
+
 ### rc41 release-readiness review fixes (rc42)
 
 - **Released claims no longer consume retry budget.** `relay_release` previously

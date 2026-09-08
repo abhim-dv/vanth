@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -35,6 +36,14 @@ def _command_argv(command: Any) -> list[str]:
         return [configured]
     found = shutil.which("opencode")
     if found:
+        if sys.platform == "win32" and Path(found).suffix.lower() in {".cmd", ".bat"}:
+            # The npm shim forwards arguments through `%*`. Embedded newlines in
+            # a wake prompt are then interpreted by cmd.exe, and live testing
+            # showed OpenCode receiving only the first line (`vanth event`).
+            # Prefer the native binary shipped by the standard npm package.
+            native = Path(found).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+            if native.is_file():
+                return [str(native)]
         return [found]
     return ["opencode"]
 
@@ -105,12 +114,19 @@ def send_message_to_session(
                 "(stale or removed; refresh the wake target's session_id or start a new session)"
             )
 
-    argv = _command_argv(opencode_command) + ["run", "--session", session_id]
+    command_argv = _command_argv(opencode_command)
+    # A user may explicitly configure a batch shim, or use a nonstandard install
+    # where its native binary cannot be resolved. Keep every wake field intact
+    # by flattening line breaks before cmd.exe expands `%*`.
+    prompt_arg = prompt
+    if sys.platform == "win32" and Path(command_argv[0]).suffix.lower() in {".cmd", ".bat"}:
+        prompt_arg = " ".join(prompt.splitlines())
+    argv = command_argv + ["run", "--session", session_id]
     if directory:
         argv += ["--dir", directory]
     if attach:
         argv += ["--attach", attach]
-    argv += ["--format", "json", prompt]
+    argv += ["--format", "json", prompt_arg]
 
     env = None
     if auth:
