@@ -1182,7 +1182,7 @@ class TestRelay:
 
     def test_relay_release_returns_to_pending_without_consuming(self, tmp_path):
         """relay_release returns a claimed delivery to pending WITHOUT
-        consuming an attempt (attempts untouched, immediately due). Wrong
+        consuming an attempt (claim bookkeeping rolled back, immediately due). Wrong
         token/client raises; the delivery stays dispatching under its owner."""
         manager = JobManager(tmp_path / "state", recover=False)
         try:
@@ -1193,13 +1193,12 @@ class TestRelay:
             polled = manager.relay_poll("client_1", timeout_seconds=1)
             assert polled
             delivery = polled[0]
-            before = manager._row(
-                "SELECT attempts FROM deliveries WHERE delivery_id=?", (delivery["delivery_id"],)
-            )
+            assert delivery["attempts"] == 1
             # Wrong token must fail and leave the row dispatching.
             with pytest.raises(ValueError, match="not claimed by this relay"):
                 manager.relay_release("client_1", delivery["delivery_id"], lease_token="bogus")
-            # Correct release: pending, attempts untouched, due immediately.
+            # Correct release: pending, the cancelled claim no longer consumes
+            # retry budget or an attempt-history row, and it is due immediately.
             released = manager.relay_release("client_1", delivery["delivery_id"], lease_token=delivery["lease_token"])
             assert released["result"] == "ok"
             assert released["status"] == "pending"
@@ -1208,15 +1207,54 @@ class TestRelay:
                 (delivery["delivery_id"],),
             )
             assert row["status"] == "pending"
-            assert int(row["attempts"]) == int(before["attempts"])
+            assert int(row["attempts"]) == 0
             assert row["claim_token"] is None
             assert row["claim_client_id"] is None
             assert row["next_attempt_at"] is None
+            assert manager.delivery_attempts(delivery["delivery_id"])["attempts"] == []
             # The released wake is immediately reclaimable by a later poll.
             repolled = manager.relay_poll("client_1", timeout_seconds=1)
             assert repolled and repolled[0]["delivery_id"] == delivery["delivery_id"]
+            assert repolled[0]["attempts"] == 1
         finally:
             manager.close()
+
+    def test_relay_outage_releases_unprocessed_batch(self, monkeypatch):
+        """An outage on the first claimed delivery must not strand the rest of
+        the poll batch under leases until expiry."""
+        import vanth.relay as relay_mod
+
+        released = []
+
+        class FakeClient:
+            def post(self, path, payload):
+                if path == "/relay/release":
+                    released.append(payload["delivery_id"])
+                return {"result": "ok"}
+
+            def get(self, path, params):
+                return {"deliveries": []}
+
+        deliveries = [
+            {"delivery_id": "del_1", "lease_token": "tok_1", "payload": {}},
+            {"delivery_id": "del_2", "lease_token": "tok_2", "payload": {}},
+            {"delivery_id": "del_3", "lease_token": "tok_3", "payload": {}},
+        ]
+        relay = relay_mod.DesktopRelay(FakeClient(), "client_batch")
+        relay._register = lambda: True
+        polls = iter([deliveries, []])
+        relay._poll = lambda: next(polls)
+
+        def outage(delivery):
+            relay._release(delivery)
+            relay._stop.set()
+            raise relay_mod.RelayCapabilityLost("down")
+
+        relay._deliver = outage
+        monkeypatch.setattr(relay_mod.time, "sleep", lambda _: None)
+        relay._run()
+
+        assert released == ["del_1", "del_2", "del_3"]
 
     def test_relay_poll_unknown_client(self, tmp_path):
         manager = JobManager(tmp_path / "state", recover=False)

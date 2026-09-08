@@ -4,6 +4,25 @@ All notable changes to Vanth are documented here.
 
 ## Unreleased / next (1.6.x)
 
+### rc41 release-readiness review fixes (rc42)
+
+- **Released claims no longer consume retry budget.** `relay_release` previously
+  left the claim-time `attempts` increment and a completed attempt-history row
+  behind. Persistent Desktop outages therefore inflated both retry accounting
+  and history despite release being documented as non-consuming. Release now
+  rolls back the claim counter and removes the cancelled attempt record before
+  returning the delivery to pending.
+- **Outages release the whole claimed batch.** Relay polling claims up to 20
+  deliveries at once. When the first delivery found a dead Desktop pipe, only
+  that delivery was released and the remaining claims were held until lease
+  expiry. The outage path now releases every unprocessed sibling immediately.
+- **Legacy stop fallback is PID-safe.** A no-token row now uses its observed
+  workload PID as the ownership CAS when no worker PID exists. If the original
+  legacy row had no identity at all, any claim or PID that appears after the
+  stop request is treated conservatively as a replacement and is never killed.
+
+Full suite: 706 passed, 6 skipped across two clean full runs.
+
 ### rc40 self-review fixes (rc41)
 
 - **Stop never touches a replacement's processes.** The ownership-guarded

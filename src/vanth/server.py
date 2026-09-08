@@ -1917,9 +1917,9 @@ class JobManager:
         must survive for a re-provisioned relay instead of being failed — a
         ``failed`` ack is terminal at the default ``max_attempts=1``
         (self-review rc40). Ownership-CAS'd on delivery_id + dispatching +
-        claim_token + claim_client_id; zero rows raises. ``attempts`` is left
-        untouched and ``next_attempt_at`` cleared so the delivery is immediately
-        due for the next poll.
+        claim_token + claim_client_id; zero rows raises. The cancelled claim is
+        removed from attempt bookkeeping and ``next_attempt_at`` is cleared so
+        the delivery is immediately due for the next poll.
         """
         self._ensure_open()
         if not isinstance(lease_token, str) or not lease_token:
@@ -1927,7 +1927,7 @@ class JobManager:
         with self.db_lock:
             changed = self.db.execute(
                 """
-                UPDATE deliveries SET status='pending', next_attempt_at=NULL,
+                UPDATE deliveries SET status='pending', attempts=MAX(0, attempts - 1), next_attempt_at=NULL,
                   claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL
                 WHERE delivery_id=? AND status='dispatching' AND claim_token=? AND claim_client_id=?
                 """,
@@ -1935,11 +1935,8 @@ class JobManager:
             ).rowcount
             if changed:
                 self.db.execute(
-                    """
-                    UPDATE delivery_attempts SET status='released', ended_at=?
-                    WHERE delivery_id=? AND claim_token=? AND ended_at IS NULL
-                    """,
-                    (now_iso(), delivery_id, lease_token),
+                    "DELETE FROM delivery_attempts WHERE delivery_id=? AND claim_token=? AND ended_at IS NULL",
+                    (delivery_id, lease_token),
                 )
             self.db.commit()
             if not changed:
@@ -4231,6 +4228,7 @@ class JobManager:
         stop_token = now_iso()
         observed_claim_token = row["claim_token"]
         observed_worker_pid = int(row["worker_pid"]) if row["worker_pid"] else None
+        observed_workload_pid = int(row["pid"]) if row["pid"] else None
         # A 'launching' row is stoppable too: the runner's launching->running
         # promotion is guarded by `stop_requested_at IS NULL`, so setting the
         # stop flag here prevents the launch from ever coming up (review rc36 P1
@@ -4254,6 +4252,11 @@ class JobManager:
                     requested = self.db.execute(
                         "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND worker_pid=?",
                         (stop_token, job_id, observed_worker_pid),
+                    ).rowcount
+                elif observed_workload_pid is not None:
+                    requested = self.db.execute(
+                        "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND pid=?",
+                        (stop_token, job_id, observed_workload_pid),
                     ).rowcount
                 else:
                     requested = self.db.execute(
@@ -4279,7 +4282,12 @@ class JobManager:
                 return row["claim_token"] != observed_claim_token
             if observed_worker_pid is not None:
                 return row["worker_pid"] != observed_worker_pid
-            return False
+            if observed_workload_pid is not None:
+                return row["pid"] != observed_workload_pid
+            # The original legacy row exposed no ownership identity. If one
+            # appears after our stop flag CAS, it may belong to a replacement;
+            # fail safe rather than terminating an unverified process.
+            return any(row[key] is not None for key in ("claim_token", "worker_pid", "pid"))
 
         if _ownership_changed():
             with self.db_lock:

@@ -298,6 +298,72 @@ def test_stale_stop_never_kills_replacement_processes(tmp_path):
         manager.close()
 
 
+def test_identityless_legacy_stop_never_kills_new_owner(tmp_path):
+    """A legacy row with no claim or PID cannot authenticate a PID that appears
+    after the stop CAS; treat it as a replacement and fail safe."""
+    import subprocess as _sp
+
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path, recover=False)
+    sleeper = _sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        job_id = "job_identityless_stop"
+        stamp = now_iso()
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, "
+                "events_path, claim_token, worker_pid, pid) VALUES (?, ?, 'launching', ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                (
+                    job_id,
+                    "true",
+                    stamp,
+                    stamp,
+                    str(manager.logs / f"{job_id}.stdout.log"),
+                    str(manager.logs / f"{job_id}.stderr.log"),
+                    str(manager.events_dir / f"{job_id}.jsonl"),
+                ),
+            )
+            manager.db.commit()
+
+        original_row = manager._row
+        calls = {"n": 0}
+
+        def racy_row(sql, params=()):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                with manager.db_lock:
+                    manager.db.execute(
+                        "UPDATE jobs SET status='running', claim_token=?, worker_pid=?, pid=? WHERE job_id=?",
+                        ("claim_new", sleeper.pid, sleeper.pid, job_id),
+                    )
+                    manager.db.commit()
+            return original_row(sql, params)
+
+        manager._row = racy_row
+        try:
+            result = manager.stop_sync(job_id, kill_after_seconds=0)
+        finally:
+            manager._row = original_row
+
+        assert "newer launch" in result.get("message", "")
+        assert manager._pid_alive(sleeper.pid)
+        row = manager._row(
+            "SELECT status, claim_token, stop_requested_at FROM jobs WHERE job_id=?",
+            (job_id,),
+        )
+        assert row["status"] == "running"
+        assert row["claim_token"] == "claim_new"
+        assert row["stop_requested_at"] is None
+    finally:
+        try:
+            sleeper.terminate()
+            sleeper.wait(timeout=5)
+        except Exception:
+            pass
+        manager.close()
+
+
 def test_job_start_mcp_tool_is_not_a_coroutine_function():
     from vanth.server import mcp
 

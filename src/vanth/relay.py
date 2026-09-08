@@ -432,7 +432,7 @@ class DesktopRelay:
                     time.sleep(self._backoff)
                     self._backoff = min(self._backoff * 2, self.max_reconnect_delay)
                     continue
-                for delivery in deliveries:
+                for index, delivery in enumerate(deliveries):
                     if self._stop.is_set():
                         break
                     try:
@@ -451,6 +451,11 @@ class DesktopRelay:
                         # register/poll so a re-provision is picked up without
                         # an MCP restart — and NEVER ack-failed here, which
                         # would terminally consume the wake at max_attempts=1.
+                        # Poll claims a batch up front. Return every unprocessed
+                        # sibling immediately rather than holding its lease until
+                        # expiry while this relay already knows the pipe is down.
+                        for remaining in deliveries[index + 1:]:
+                            self._release(remaining)
                         time.sleep(self._outage_backoff)
                         self._outage_backoff = min(self._outage_backoff * 2, self.max_reconnect_delay)
                         break
