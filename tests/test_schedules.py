@@ -142,6 +142,29 @@ def test_schedule_fires_a_job_and_advances(tmp_path):
         manager.close()
 
 
+def test_scheduled_job_masks_declared_secret(tmp_path):
+    """A schedule's secret_env must survive the fire -> start -> runner path."""
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        schedule = manager.create_schedule(
+            cmd("import os; print('tok='+os.environ['API_TOKEN'], flush=True)"),
+            interval_seconds=60,
+            env={"API_TOKEN": "s3cr3t-value"},
+            secret_env=["API_TOKEN"],
+        )
+        _force_due(manager, schedule["schedule_id"])
+        manager._fire_due_schedules()
+        jobs = manager.list()["jobs"]
+        assert jobs, "schedule should have created a job"
+        job_id = jobs[0]["job_id"]
+        assert _wait_terminal(manager, job_id) == "completed"
+        stdout = (manager.logs / f"{job_id}.stdout.log").read_text(encoding="utf-8")
+        assert "s3cr3t-value" not in stdout, stdout
+        assert "***" in stdout, stdout
+    finally:
+        manager.close()
+
+
 def test_schedule_overlap_skip_holds_while_running(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
