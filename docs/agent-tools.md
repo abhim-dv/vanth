@@ -19,7 +19,7 @@ The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_status_batch`, `job_send`, `job_list`, `job_view`, `job_events`,
 `job_deliveries`, `job_mark_delivery`, `job_retry_delivery`,
 `job_delivery_attempts`, `job_tail`, `job_wait`, `job_stop`, `job_doctor`,
-`job_cleanup`, `job_metrics_query`, `job_metric_compare`, `job_run_summary`,
+`job_cleanup`, `job_metrics_query`, `job_metric_compare`, `job_duration_stats`, `job_run_summary`,
 `job_artifact_add`, `job_artifacts`, `job_dashboard`, `job_metric_ingest`,
 `job_artifact_read`, `job_add_wake_target`, `job_wake_now`,
 `job_cleanup_preview`. The wake tools (`job_add_wake_target` / `job_wake_now` /
@@ -575,6 +575,46 @@ Compare one metric across jobs — the "which run won?" primitive.
 ```
 
 `value` is `null` when a job has no points for the metric.
+
+---
+
+## `job_duration_stats`
+
+Duration, queue-time, and flakiness analytics grouped by logical job.
+
+**Parameters**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `name` | `string?` | `None` | Substring filter on job name |
+| `tags` | `string[]?` | `None` | All tags must be present |
+| `limit` | `int` | `20` | Max groups (1–200) |
+| `runs_per_group` | `int` | `200` | Max recent runs considered per group (1–5000) |
+| `since_ms` | `int?` | `None` | Only runs ending after this epoch-ms |
+| `slowest` | `int` | `10` | Slowest runs per group and overall (1–100) |
+
+**Response**
+
+```json
+{
+  "group_count": 3,
+  "groups": [
+    { "key": "nightly backup", "runs": 42, "completed": 40, "failed": 2,
+      "success_rate": 0.9524,
+      "duration_seconds": { "p50": 120.5, "p95": 900.2, "mean": 210.0, "min": 60.0, "max": 1800.0 },
+      "queue_seconds": { "p50": 0.4, "p95": 12.0 },
+      "flaky_score": 0.0476, "flaky_runs": 2,
+      "trend": { "direction": "regressing", "factor": 1.8, "recent_p50": 2400.0, "baseline_p50": 1300.0 },
+      "slowest_runs": [ { "job_id": "job_...", "status": "completed", "duration_seconds": 1800.0, "..." } ],
+      "last_run": { "job_id": "job_...", "status": "completed", "duration_seconds": 122.0, "..." } }
+  ],
+  "slowest": [ { "key": "nightly backup", "job_id": "job_...", "duration_seconds": 1800.0, "..." } ]
+}
+```
+
+`trend.direction` is `unknown` with fewer than 6 runs; `regressing`/`improving`
+require a recent/older p50 ratio of ≥1.5x / ≤0.67x. `flaky_score` is the
+fraction of runs that failed with a success both before and after them.
 
 ---
 

@@ -20,7 +20,15 @@ All notable changes to Vanth are documented here.
   `jobs.secret_env_json`; the Go conformance fixture and
   `internal/state.LatestSchemaVersion` move to 14.
 
-Full suite: 715 passed, 6 skipped.
+### Duration + flakiness analytics
+
+- **`job_duration_stats`** groups terminal runs by logical job (`name`, falling
+  back to the command) and reports p50/p95 runtime and queue time, success
+  rate, a flaky score (a failed run with a success both before and after it),
+  each group's slowest recent runs, and a `trend` flag (`regressing` / `stable`
+  / `improving`) computed from the newer vs older half's p50 — catching "this
+  backup crept 40min → 2h over 6 weeks". The top-level `slowest` list is the
+  slowest-N runs across all groups. Exposed at `GET /analytics/durations`.
 
 ## 1.6.0 - 2026-09-10
 

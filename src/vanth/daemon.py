@@ -613,6 +613,15 @@ class Handler(BaseHTTPRequestHandler):
                     query.get("job_ids") or None,
                     int(query.get("limit", ["5000"])[0]),
                 ))
+            elif parsed.path == "/analytics/durations":
+                ok(self, get_manager().duration_stats(
+                    name=query.get("name", [None])[0],
+                    tags=query.get("tags") or None,
+                    limit=int(query.get("limit", ["20"])[0]),
+                    runs_per_group=int(query.get("runs_per_group", ["200"])[0]),
+                    since_ms=int(query["since_ms"][0]) if "since_ms" in query else None,
+                    slowest=int(query.get("slowest", ["10"])[0]),
+                ))
             elif parsed.path == "/relay/poll":
                 ok(self, {"deliveries": get_manager().relay_poll(
                     client_id=query.get("client_id", [""])[0],

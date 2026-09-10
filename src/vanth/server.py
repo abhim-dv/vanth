@@ -232,6 +232,64 @@ def _runtime_seconds(started_at: str | None, ended_at: str | None) -> float | No
     return max(0.0, seconds)
 
 
+def _elapsed_seconds(start: str | None, end: str | None) -> float | None:
+    if not start or not end:
+        return None
+    start_dt = _parse_iso(start)
+    end_dt = _parse_iso(end)
+    if start_dt is None or end_dt is None:
+        return None
+    seconds = (end_dt - start_dt).total_seconds()
+    return seconds if seconds >= 0 else None
+
+
+def _percentile(values: list[float], p: float) -> float | None:
+    """Linear-interpolated percentile (p in [0, 1]); None for an empty list."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = p * (len(ordered) - 1)
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
+
+
+def _round3(value: float | None) -> float | None:
+    return round(value, 3) if value is not None else None
+
+
+def _duration_trend(ordered: list[float]) -> dict[str, Any]:
+    """Compare the p50 runtime of a job's older half against its newer half.
+
+    Catches a backup that "crept 40min -> 2h over 6 weeks": needs at least 6
+    runs, then flags ``regressing``/``improving`` at a 1.5x/0.67x ratio.
+    ``ordered`` must be chronological.
+    """
+    unknown = {"direction": "unknown", "factor": None, "recent_p50": None, "baseline_p50": None}
+    if len(ordered) < 6:
+        return unknown
+    half = len(ordered) // 2
+    baseline = _percentile(ordered[:half], 0.5)
+    recent = _percentile(ordered[half:], 0.5)
+    if baseline is None or recent is None or baseline <= 0:
+        return unknown
+    factor = recent / baseline
+    if factor >= 1.5:
+        direction = "regressing"
+    elif factor <= 0.67:
+        direction = "improving"
+    else:
+        direction = "stable"
+    return {
+        "direction": direction,
+        "factor": round(factor, 3),
+        "recent_p50": _round3(recent),
+        "baseline_p50": _round3(baseline),
+    }
+
+
 def parse_agent_event_line(line: str) -> dict[str, Any] | None:
     if not line.startswith(EVENT_PREFIX):
         return None
@@ -3353,6 +3411,127 @@ class JobManager:
             jobs.append(item)
         return {"jobs": jobs}
 
+    def duration_stats(
+        self,
+        name: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 20,
+        runs_per_group: int = 200,
+        since_ms: int | None = None,
+        slowest: int = 10,
+    ) -> dict[str, Any]:
+        """Per-logical-job duration, queue-time, and flakiness analytics.
+
+        Groups terminal runs by ``name`` (falling back to the command) and
+        reports p50/p95 runtime and queue time, success rate, a flaky score
+        (a failed run that has a success both before and after it), each group's
+        slowest runs, and a trend flag that catches a job creeping slower over
+        time. ``slowest`` also returns the top-N slowest runs across all groups.
+        """
+        self._ensure_open()
+        validate_limit(limit, "limit", 200)
+        validate_limit(runs_per_group, "runs_per_group", 5000)
+        validate_limit(slowest, "slowest", 100)
+        where = [
+            "status IN ('completed','failed','timeout','cancelled','orphaned')",
+            "started_at IS NOT NULL",
+            "ended_at IS NOT NULL",
+        ]
+        args: list[Any] = []
+        if name:
+            where.append("name LIKE ?")
+            args.append(f"%{name}%")
+        for tag in tags or []:
+            where.append("tags_json LIKE ?")
+            args.append(f'%"{tag}"%')
+        if since_ms is not None:
+            cutoff = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            where.append("ended_at >= ?")
+            args.append(cutoff)
+        row_cap = min(50000, max(1000, runs_per_group * max(1, limit)))
+        with self.db_lock:
+            rows = self.db.execute(
+                f"SELECT job_id, name, command, status, created_at, started_at, ended_at, exit_code "
+                f"FROM jobs WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ?",
+                (*args, row_cap),
+            ).fetchall()
+        groups: dict[str, list[Any]] = {}
+        for row in rows:
+            key = row["name"] or row["command"] or row["job_id"]
+            groups.setdefault(key, []).append(row)
+        out_groups: list[dict[str, Any]] = []
+        all_runs: list[dict[str, Any]] = []
+        for key, group in groups.items():
+            group.sort(key=lambda r: r["created_at"] or "")
+            durations: list[float] = []
+            queues: list[float] = []
+            results: list[dict[str, Any]] = []
+            for row in group:
+                duration = _elapsed_seconds(row["started_at"], row["ended_at"])
+                if duration is not None:
+                    durations.append(duration)
+                queue = _elapsed_seconds(row["created_at"], row["started_at"])
+                if queue is not None:
+                    queues.append(queue)
+                results.append(
+                    {
+                        "job_id": row["job_id"],
+                        "status": row["status"],
+                        "duration_seconds": _round3(duration),
+                        "created_at": row["created_at"],
+                        "ended_at": row["ended_at"],
+                        "exit_code": row["exit_code"],
+                    }
+                )
+                all_runs.append({**results[-1], "key": key})
+            completed = sum(1 for row in group if row["status"] == "completed")
+            failed = sum(1 for row in group if row["status"] in {"failed", "timeout"})
+            flaky = 0
+            for index, row in enumerate(group):
+                if row["status"] not in {"failed", "timeout"}:
+                    continue
+                succeeded_before = any(g["status"] == "completed" for g in group[:index])
+                succeeded_after = any(g["status"] == "completed" for g in group[index + 1 :])
+                if succeeded_before and succeeded_after:
+                    flaky += 1
+            group_slowest = sorted(
+                (r for r in results if r["duration_seconds"] is not None),
+                key=lambda r: r["duration_seconds"],
+                reverse=True,
+            )[:slowest]
+            out_groups.append(
+                {
+                    "key": key,
+                    "runs": len(group),
+                    "completed": completed,
+                    "failed": failed,
+                    "success_rate": round(completed / len(group), 4) if group else None,
+                    "duration_seconds": {
+                        "p50": _round3(_percentile(durations, 0.5)),
+                        "p95": _round3(_percentile(durations, 0.95)),
+                        "mean": _round3(sum(durations) / len(durations)) if durations else None,
+                        "min": _round3(min(durations)) if durations else None,
+                        "max": _round3(max(durations)) if durations else None,
+                    },
+                    "queue_seconds": {
+                        "p50": _round3(_percentile(queues, 0.5)),
+                        "p95": _round3(_percentile(queues, 0.95)),
+                    },
+                    "flaky_score": round(flaky / len(group), 4) if group else None,
+                    "flaky_runs": flaky,
+                    "trend": _duration_trend([d for d in durations]),
+                    "slowest_runs": group_slowest,
+                    "last_run": results[-1] if results else None,
+                }
+            )
+        out_groups.sort(key=lambda g: (g["duration_seconds"]["p95"] or 0), reverse=True)
+        global_slowest = sorted(
+            (r for r in all_runs if r["duration_seconds"] is not None),
+            key=lambda r: r["duration_seconds"],
+            reverse=True,
+        )[:slowest]
+        return {"groups": out_groups[:limit], "slowest": global_slowest, "group_count": len(out_groups)}
+
     def events(self, job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20,
                reverse: bool = False) -> dict[str, Any]:
         self._ensure_open()
@@ -4953,6 +5132,23 @@ def job_metric_compare(job_ids: list[str], metric: str, aggregation: str = "late
     """Compare one metric across jobs (e.g. val_loss across training runs)."""
     return get_client().get("/metrics/compare", {"job_ids": job_ids, "metric": metric, "aggregation": aggregation,
                                                  "from_ms": from_ms, "to_ms": to_ms})
+
+
+@mcp.tool()
+def job_duration_stats(name: str | None = None, tags: list[str] | None = None, limit: int = 20,
+                       runs_per_group: int = 200, since_ms: int | None = None, slowest: int = 10) -> dict[str, Any]:
+    """Duration, queue-time, and flakiness analytics grouped by logical job.
+
+    Returns per-group p50/p95 runtime and queue time, success rate, a flaky
+    score (failed runs with a success both before and after), the group's
+    slowest runs, and a ``trend`` flag (``regressing``/``stable``/``improving``)
+    that catches a job creeping slower over weeks. ``slowest`` is the top-N
+    slowest runs across all groups.
+    """
+    return get_client().get("/analytics/durations", {
+        "name": name, "tags": tags, "limit": limit, "runs_per_group": runs_per_group,
+        "since_ms": since_ms, "slowest": slowest,
+    })
 
 
 @mcp.tool()

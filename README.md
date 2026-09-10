@@ -421,6 +421,7 @@ events.
 | `job_tail` | Bounded stdout/stderr log tail with byte offsets (`follow`/`timeout_seconds`/`grep` optional) |
 | `job_metrics_query` | Read stored scalar metric series (loss, acc, progress.percent, ...) |
 | `job_metric_compare` | Compare one metric across jobs (latest/mean/min/max/sum/count) |
+| `job_duration_stats` | Per-job p50/p95 duration + queue time, success rate, flaky score, slowest-N, trend |
 | `job_run_summary` | One-call "did it work?" — status, runtime, progress, metrics, artifacts |
 | `job_diff` | Diff the run specs of two jobs (command/env/cwd/tags/wake targets) |
 | `job_artifact_add` | Attach an artifact (checkpoint, CSV, output) to a job |
@@ -635,6 +636,21 @@ Compares one metric across jobs (e.g. val_loss across seeds or configs).
 `aggregation` is `latest`, `mean`, `min`, `max`, `sum`, or `count`; the result
 includes the per-job value plus the first/last points. This is the W&B-style
 "which run won?" primitive.
+
+### job_duration_stats — did it get slower?
+
+```text
+job_duration_stats(name="nightly backup", tags=["prod"], slowest=10)
+```
+
+Groups terminal runs by logical job (`name`, falling back to the command) and
+returns p50/p95 runtime and queue time, success rate, a **flaky score** (a
+failed run that has a success both before and after it — real intermittency,
+not a first-attempt failure), each group's slowest recent runs, and a
+`trend` flag (`regressing` / `stable` / `improving`). The trend compares the
+newer half's p50 against the older half's, so it catches "this backup crept
+40min → 2h over 6 weeks". The top-level `slowest` list is the slowest-N runs
+across all groups.
 
 ### job_run_summary — did it work?
 
@@ -1015,6 +1031,7 @@ Authenticated with `Authorization: Bearer <token>`.
 | GET | `/jobs/{id}/artifacts` | Artifacts (`limit`) |
 | POST | `/jobs/{id}/artifacts` | Add an artifact |
 | GET | `/metrics/compare` | Compare metric across jobs (`job_ids`, `metric`, `aggregation`) |
+| GET | `/analytics/durations` | Duration/flakiness analytics (`name`, `tags`, `limit`, `since_ms`, `slowest`) |
 | GET | `/dashboard` | Chart data (`job_ids`, `limit`) |
 | GET | `/jobs/{id}/tail` | Log tail (`stream`, `max_bytes`, `offset`) |
 | POST | `/jobs/{id}/wait` | Wait for an event |
