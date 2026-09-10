@@ -19,9 +19,11 @@ when a job needs attention. It is built for one trusted user on one machine.
 - **Terminal dashboard**: the native Go `monitor` renders a live
   W&B-LEET-style dashboard of jobs, metrics, and plots.
 
-Out of scope for v1: remote network access, TLS, multi-user tenancy/RBAC,
-a web UI, and distributed workers. Interactive stdin (`job_send`), concurrent
-job quotas, and automatic retention are supported (see below).
+Out of scope: TLS, multi-user tenancy/RBAC, a web UI, and distributed workers.
+Supported: interactive stdin (`job_send`), concurrent-job quotas, automatic
+retention, cron/interval schedules, pools/priority/pause queues, readiness
+triggers, kill attribution + secret masking, duration/flaky analytics, managed
+artifacts, and remote SSH execution (**beta**).
 
 **For agents:** start work with `job_start`, then `job_wait` for
 `progress`/`checkpoint`/`completed` events instead of polling; make jobs emit
@@ -1061,6 +1063,12 @@ Key knobs in one glance:
 | `VANTH_OPENCODE_SKIP_PROBE` | Skip the `opencode session list` probe before dispatch |
 | `VANTH_DELIVERY_MAX_CONCURRENT` | Cap on concurrent adapter dispatches (default 4) |
 | `VANTH_MAX_REQUEST_BYTES` | HTTP request body cap (default 1 MiB) |
+| `VANTH_PROBE_BUDGET` | Max readiness-probe I/O calls per dispatcher pass (default 8) |
+| `VANTH_OUTBOUND_ALLOW` | Strict allowlist of host/ip/cidr for webhooks + http probes (link-local/metadata always denied) |
+| `VANTH_OUTBOUND_BLOCK_PRIVATE` | `1` also denies loopback + private destinations |
+| `VANTH_ALERT_WEBHOOK` | Edge-triggered operator alert destination |
+| `VANTH_ALERT_DISK_FREE_BYTES` | Free-disk threshold that raises a `disk_low` alert |
+| `VANTH_ALERT_INTERVAL` | Alert evaluation cadence in seconds (default 30) |
 
 ---
 
@@ -1071,14 +1079,23 @@ Key knobs in one glance:
 ```
 ~/.vanth/
   jobs.sqlite      durable jobs (incl. env, notes, run-overview) / events / deliveries / targets / attempts / tombstones
+  artifacts.sqlite managed-artifact catalog (separate DB)
+  artifacts-store/ content-addressed artifact blobs (+ staging)
+  remote.sqlite    remote-host pairing + transfer journals (when remote is used)
   token            bearer token (owner-only permissions)
   daemon.lock      single-daemon OS lock
   daemon.json      discovery metadata (url, pid, started_at, schema) — written atomically, removed on graceful shutdown
   logs/            daemon.log + per-job runner/stdout/stderr logs
   events/          per-job JSONL event mirrors (monitor fallback source)
   specs/           per-job launch specs (removed once the runner starts)
-  backups/         pre-migration SQLite backups
+  backups/         pre-migration snapshots AND `vanth backup` archives
 ```
+
+`vanth backup` archives `jobs.sqlite`, `artifacts.sqlite`, the `artifacts-store/`
+blobs and the `events/` mirrors into one verified zip (`manifest.json` with a
+SHA-256 per file); `vanth restore <archive> --yes` verifies, snapshots the
+current state, and swaps it back (refuses while the daemon looks running, and
+refuses a backup from a newer schema unless `--force`).
 
 ### Health, readiness, and diagnosis
 
@@ -1093,15 +1110,30 @@ whether the Codex/OpenCode binaries resolve. It never reveals the token.
 The HTTP daemon also exposes:
 
 - `GET /health` — cheap, unauthenticated liveness probe for supervisors;
-- `GET /ready` — authenticated readiness (doctor report; 503 when not ok).
+- `GET /ready` — authenticated readiness (doctor report; 503 when not ok);
+- `GET /metrics` — authenticated Prometheus text exposition (jobs by status,
+  running/queued, pools, deliveries, dead letters, stale leases, disk/db size,
+  schema, maintenance aliveness).
+
+### Alerting
+
+Set `VANTH_ALERT_WEBHOOK` to receive **edge-triggered** operational alerts (one
+POST per state change, not per tick): the dead-letter queue becoming non-empty,
+and free disk crossing `VANTH_ALERT_DISK_FREE_BYTES`. Destinations go through the
+same outbound policy as webhooks. The payload is
+`{type, condition, active, severity, message, details, at}`.
 
 ### Upgrades and backups
 
 Schema changes are ordered SQLite migrations. Before the first migration of an
 existing database, a timestamped backup is written under `backups/` via
-SQLite's backup API (never a raw file copy while WAL is active). To upgrade
-manually, copy the latest `backups/*.sqlite` first. A future database schema is
-rejected without touching the files.
+SQLite's backup API (never a raw file copy while WAL is active). A future
+database schema is rejected without touching the files.
+
+For a full off-host copy, `vanth backup` writes one verified archive of every
+durable store (see State layout); `vanth restore <archive> --yes` puts it back
+after snapshotting the current state. Run `vanth backup` while the daemon is up
+(SQLite online backup), but stop the daemon before `vanth restore`.
 
 ---
 
@@ -1111,6 +1143,7 @@ Authenticated with `Authorization: Bearer <token>`.
 
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/metrics` | Prometheus text exposition |
 | GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`, `name`, `tags`) |
 | POST | `/jobs` | Start a job |
 | POST | `/jobs/{id}/rerun` | Rerun a job with its original configuration |
@@ -1252,9 +1285,11 @@ Release-gate automation lives in `scripts/`:
 
 ## Limitations (v1)
 
-- Interactive stdin and `job_send` are not implemented; jobs run with stdin
-  closed (use non-interactive flags on commands).
 - Delivery is at-least-once; a crash after an adapter accepts a wake but before
   Vanth records success is a documented, surfaced ambiguity.
-- Remote access, TLS, multi-user policy, quotas, distributed workers, and a
-  custom service manager are out of scope.
+- **Remote SSH execution and managed artifacts are beta** (POSIX targets;
+  single-node controller) and are not continuously live-tested against real SSH
+  hosts. Codex Desktop wake is experimental (see Wake targets).
+- Outbound webhook/probe destinations are governed by the policy in the
+  configuration table; link-local/cloud-metadata addresses are always refused.
+- TLS, multi-user policy/RBAC, distributed workers, and a web UI are out of scope.

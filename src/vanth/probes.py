@@ -101,6 +101,12 @@ def evaluate_probe(probe: dict[str, Any], *, log_text: str | None = None) -> boo
         except OSError:
             return False
     if kind == "http":
+        from .outbound import OutboundDenied, check_outbound_url
+
+        try:
+            check_outbound_url(probe["url"])
+        except OutboundDenied:
+            return False
         request = urllib.request.Request(probe["url"], method="GET")
         expected = int(probe.get("expect_status", _DEFAULT_EXPECT_STATUS))
         try:

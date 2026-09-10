@@ -41,6 +41,7 @@ from .client import VanthClient
 from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
+from .outbound import OutboundDenied, check_outbound_url
 from .paths import canonical_home
 from .probes import evaluate_probe, validate_probe
 from .runtime_info import capture_run_metadata, serialize_run_metadata
@@ -427,6 +428,10 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
                 raise ValueError("webhook target url must be a valid URL") from exc
             if scheme not in {"http", "https"}:
                 raise ValueError("webhook target url must be an http(s) URL")
+            try:
+                check_outbound_url(url)
+            except OutboundDenied as exc:
+                raise ValueError(f"webhook target url is blocked by policy: {exc}") from exc
             headers = target.get("headers")
             if headers is not None and not isinstance(headers, dict):
                 raise ValueError("webhook target headers must be an object")
@@ -531,6 +536,10 @@ class JobManager:
         self.dispatch_enabled = recover
         self.dispatcher_stop = threading.Event()
         self.dispatcher_thread: threading.Thread | None = None
+        self._started_monotonic = time.monotonic()
+        # Operator alerts: edge-triggered condition state + throttle (review B3).
+        self._alert_state: dict[str, bool] = {}
+        self._last_alert_check: float | None = None
         self.backup_path = migrate(self.db, self.home)
         if recover:
             self._recover_jobs()
@@ -771,6 +780,7 @@ class JobManager:
                 self._fire_due_schedules()
                 self._dispatch_queued_jobs()
                 self._watch_policies()
+                self._check_alerts()
                 self._maybe_auto_cleanup()
                 self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
             except Exception:
@@ -1804,6 +1814,81 @@ class JobManager:
         with self.db_lock:
             return self.db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')").fetchone()[0]
 
+    def _check_alerts(self) -> None:
+        """Edge-triggered operator alerts to ``VANTH_ALERT_WEBHOOK`` (review B3).
+
+        Fires only when a condition transitions, so a persistent problem alerts
+        once (and recovery alerts once), not every maintenance tick.
+        """
+        url = os.environ.get("VANTH_ALERT_WEBHOOK", "").strip()
+        if not url:
+            return
+        try:
+            interval = max(1.0, float(os.environ.get("VANTH_ALERT_INTERVAL", "30")))
+        except ValueError:
+            interval = 30.0
+        now = time.monotonic()
+        if self._last_alert_check is not None and now - self._last_alert_check < interval:
+            return
+        self._last_alert_check = now
+        try:
+            conditions = self._alert_conditions()
+        except Exception:
+            self.logger.exception("alert condition evaluation failed")
+            return
+        for key, condition in conditions.items():
+            if condition["active"] == self._alert_state.get(key, False):
+                continue
+            self._alert_state[key] = condition["active"]
+            try:
+                self._post_alert(url, key, condition)
+            except Exception:
+                self.logger.exception("alert delivery failed condition=%s", key)
+
+    def _alert_conditions(self) -> dict[str, dict[str, Any]]:
+        with self.db_lock:
+            failed = int(self.db.execute("SELECT COUNT(*) FROM deliveries WHERE status='failed'").fetchone()[0])
+        try:
+            threshold = int(os.environ.get("VANTH_ALERT_DISK_FREE_BYTES", "0"))
+        except ValueError:
+            threshold = 0
+        free = shutil.disk_usage(self.home).free
+        return {
+            "dead_letters": {
+                "active": failed > 0,
+                "severity": "critical" if failed > 0 else "ok",
+                "message": f"{failed} dead-lettered deliveries" if failed else "dead-letter queue empty",
+                "details": {"failed_deliveries": failed},
+            },
+            "disk_low": {
+                "active": bool(threshold and free < threshold),
+                "severity": "warning",
+                "message": f"free disk {free} below threshold {threshold}" if threshold and free < threshold else "disk free within threshold",
+                "details": {"free_bytes": free, "threshold_bytes": threshold},
+            },
+        }
+
+    def _post_alert(self, url: str, key: str, condition: dict[str, Any]) -> None:
+        check_outbound_url(url)
+        body = json.dumps(
+            {
+                "type": "vanth_alert",
+                "condition": key,
+                "active": condition["active"],
+                "severity": condition["severity"],
+                "message": condition["message"],
+                "details": condition.get("details") or {},
+                "at": now_iso(),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with _NO_REDIRECT_OPENER.open(request, timeout=10) as response:
+            if response.status not in (200, 201, 202, 204):
+                raise RuntimeError(f"alert webhook returned HTTP {response.status}")
+
     def _maybe_auto_cleanup(self) -> dict[str, Any] | None:
         if self.max_retention_seconds <= 0:
             return
@@ -2371,6 +2456,9 @@ class JobManager:
         """
         target = payload["target"]
         url = target["url"]
+        # Re-check at delivery time (policy may have changed and the host is
+        # resolved fresh); a denied destination fails the delivery, never leaks.
+        check_outbound_url(url)
         headers = dict(target.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
         # Never duplicate configured header secrets into the JSON payload.
@@ -2850,6 +2938,11 @@ class JobManager:
                 "SELECT job_id FROM jobs WHERE job_id=?", (normalized_probe["job_id"],)
             ):
                 raise ValueError(f"Unknown log_line probe job_id: {normalized_probe['job_id']}")
+            if normalized_probe["type"] == "http":
+                try:
+                    check_outbound_url(normalized_probe["url"])
+                except OutboundDenied as exc:
+                    raise ValueError(f"http probe url is blocked by policy: {exc}") from exc
             normalized["probe"] = normalized_probe
         if not normalized:
             raise ValueError("trigger must include a job_id/status gate, a probe, or both")
@@ -4934,6 +5027,82 @@ class JobManager:
             except Exception as exc:
                 failed.append({"pid": pid, "error": str(exc)})
         return {"reaped": reaped, "failed": failed, "orphan_count": len(orphans)}
+
+    def metrics_text(self) -> str:
+        """Prometheus text exposition of daemon state (review B2, no deps)."""
+        self._ensure_open()
+        with self.db_lock:
+            status_counts = {
+                row["status"]: int(row["c"])
+                for row in self.db.execute("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status").fetchall()
+            }
+            delivery_counts = {
+                row["status"]: int(row["c"])
+                for row in self.db.execute("SELECT status, COUNT(*) AS c FROM deliveries GROUP BY status").fetchall()
+            }
+            pool_rows = self.db.execute(
+                "SELECT pool, max_parallel, paused FROM pools ORDER BY pool"
+            ).fetchall()
+            pool_counts = {
+                (row["pool"], row["status"]): int(row["c"])
+                for row in self.db.execute(
+                    "SELECT pool, status, COUNT(*) AS c FROM jobs WHERE pool IS NOT NULL GROUP BY pool, status"
+                ).fetchall()
+            }
+            events_total = int(self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            schema = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+            stale_leases = int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM deliveries WHERE status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                    (now_iso(),),
+                ).fetchone()[0]
+            )
+        db_path = self.home / "jobs.sqlite"
+        try:
+            db_size = db_path.stat().st_size
+        except OSError:
+            db_size = 0
+        disk_free = shutil.disk_usage(self.home).free
+        running = status_counts.get("running", 0) + status_counts.get("launching", 0)
+
+        def emit(name: str, value: float, **labels: str) -> str:
+            if labels:
+                rendered = ",".join(f'{key}="{val}"' for key, val in sorted(labels.items()))
+                return f"{name}{{{rendered}}} {value}"
+            return f"{name} {value}"
+
+        lines = [
+            "# HELP vanth_up Daemon process is up.",
+            "# TYPE vanth_up gauge",
+            emit("vanth_up", 1),
+            emit("vanth_uptime_seconds", round(time.monotonic() - self._started_monotonic, 3)),
+            emit("vanth_schema_version", schema),
+            "# TYPE vanth_jobs gauge",
+            emit("vanth_jobs", running, status="running_or_launching"),
+            emit("vanth_jobs", status_counts.get("queued", 0), status="queued"),
+            emit("vanth_jobs_total", sum(status_counts.values())),
+            emit("vanth_events_total", events_total),
+            emit("vanth_maintenance_alive", 1 if (self.dispatcher_thread and self.dispatcher_thread.is_alive()) else 0),
+            emit("vanth_disk_free_bytes", disk_free),
+            emit("vanth_db_size_bytes", db_size),
+            emit("vanth_stale_delivery_leases", stale_leases),
+            emit("vanth_dead_letters", delivery_counts.get("failed", 0)),
+        ]
+        for status, count in sorted(delivery_counts.items()):
+            lines.append(emit("vanth_deliveries", count, status=status))
+        for row in pool_rows:
+            name = row["pool"]
+            lines.append(emit("vanth_pool_max_parallel", int(row["max_parallel"]), pool=name))
+            lines.append(emit("vanth_pool_paused", 1 if row["paused"] else 0, pool=name))
+            lines.append(
+                emit(
+                    "vanth_pool_running",
+                    pool_counts.get((name, "running"), 0) + pool_counts.get((name, "launching"), 0),
+                    pool=name,
+                )
+            )
+            lines.append(emit("vanth_pool_queued", pool_counts.get((name, "queued"), 0), pool=name))
+        return "\n".join(lines) + "\n"
 
     def doctor(self) -> dict[str, Any]:
         self._ensure_open()

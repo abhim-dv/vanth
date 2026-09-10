@@ -1039,6 +1039,70 @@ def cmd_prune(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     return 0
 
 
+def cmd_backup(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    out = None
+    include_logs = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--out":
+            i += 1
+            if i >= len(argv):
+                print("vanth backup: --out requires a path", file=sys.stderr)
+                return 2
+            out = argv[i]
+        elif arg == "--include-logs":
+            include_logs = True
+        else:
+            print(f"vanth backup: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    from .backup import create_backup
+
+    try:
+        path = create_backup(home, out=out, include_logs=include_logs)
+    except Exception as exc:
+        print(f"vanth backup: {exc}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps({"result": "ok", "archive": str(path)}))
+    else:
+        print(f"backup written: {path}")
+    return 0
+
+
+def cmd_restore(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    if not argv:
+        print("vanth restore: missing archive path", file=sys.stderr)
+        return 2
+    archive = argv[0]
+    yes = False
+    force = False
+    for arg in argv[1:]:
+        if arg == "--yes":
+            yes = True
+        elif arg == "--force":
+            force = True
+        else:
+            print(f"vanth restore: unknown option {arg!r}", file=sys.stderr)
+            return 2
+    if not yes:
+        print("vanth restore: refusing without --yes (this overwrites live state)", file=sys.stderr)
+        return 2
+    from .backup import restore_backup
+
+    try:
+        result = restore_backup(home, archive, force=force)
+    except Exception as exc:
+        print(f"vanth restore: {exc}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps(result))
+    else:
+        print(f"restored {result['files_restored']} files from {result['archive']}")
+    return 0
+
+
 def _usage() -> str:
     return (
         "usage: vanth <command> [options]\n"
@@ -1054,6 +1118,8 @@ def _usage() -> str:
         "  diff           diff the run specs of two jobs\n"
         "  stop           stop a running job\n"
         "  artifacts      list a job's artifacts\n"
+        "  backup         write one archive of jobs + artifacts + events\n"
+        "  restore        restore a backup archive (requires --yes)\n"
         "  prune          manually clean up terminal jobs (default dry-run)\n"
         "  restart        gracefully restart the daemon (jobs survive)\n"
         "  remote         pair/list/doctor/remove/pending/retry remote execution hosts\n"
@@ -1103,6 +1169,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_artifacts(argv[1:], home, json_out=json_out)
     if command == "prune":
         return cmd_prune(argv[1:], home, json_out=json_out)
+    if command == "backup":
+        return cmd_backup(argv[1:], home, json_out=json_out)
+    if command == "restore":
+        return cmd_restore(argv[1:], home, json_out=json_out)
     if command == "remote":
         return cmd_remote(argv[1:], home, json_out=json_out)
     print(f"vanth: unknown command {command!r}", file=sys.stderr)

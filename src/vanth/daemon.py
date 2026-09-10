@@ -436,6 +436,18 @@ def _max_response_bytes() -> int:
         return DEFAULT_MAX_RESPONSE_BYTES
 
 
+def text(handler: BaseHTTPRequestHandler, body: str, status: int = 200, content_type: str = "text/plain; version=0.0.4; charset=utf-8") -> None:
+    encoded = body.encode("utf-8")
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(encoded)))
+        handler.end_headers()
+        handler.wfile.write(encoded)
+    except (BrokenPipeError, ConnectionError, OSError):
+        pass
+
+
 def ok(handler: BaseHTTPRequestHandler, payload: dict[str, Any], status: int = 200) -> None:
     body = json.dumps(payload).encode()
     if len(body) > _max_response_bytes():
@@ -505,6 +517,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, report, 200 if report["ok"] else 503)
             elif parsed.path == "/doctor":
                 ok(self, get_manager().doctor())
+            elif parsed.path == "/metrics":
+                text(self, get_manager().metrics_text())
             elif parsed.path == "/remotes":
                 from .remote.pairing import list_remotes
 

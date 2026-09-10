@@ -2,6 +2,40 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.9.0 - 2026-09-10
+
+### Operational hardening (from the 2026-09 roadmap research)
+
+- **Backup/restore as one unit.** `vanth backup [--out PATH] [--include-logs]`
+  writes a verified archive (SHA-256 `manifest.json`) of `jobs.sqlite`,
+  `artifacts.sqlite`, the artifact blob store, and the event mirrors, using
+  SQLite's online backup API so it is safe while the daemon runs.
+  `vanth restore <archive> --yes` verifies integrity, snapshots the current
+  state, then swaps files in; it refuses while the daemon looks running and
+  refuses a backup from a newer schema without `--force`.
+- **Prometheus metrics.** `GET /metrics` (authenticated) exposes jobs by
+  status, running/queued, pool depth + caps, deliveries by status, dead letters,
+  stale leases, disk/db size, schema version, and maintenance aliveness.
+- **Operator alerts.** `VANTH_ALERT_WEBHOOK` receives edge-triggered alerts
+  (dead-letter queue non-empty; free disk below `VANTH_ALERT_DISK_FREE_BYTES`),
+  one POST per state change, via the outbound policy.
+- **Outbound destination policy (SSRF).** Webhooks and HTTP readiness probes now
+  share one policy that always refuses link-local / cloud-metadata / unspecified
+  destinations (every resolved IP is checked, so DNS rebinding is caught), with
+  optional `VANTH_OUTBOUND_ALLOW` (strict allowlist) and
+  `VANTH_OUTBOUND_BLOCK_PRIVATE=1`.
+- **Readiness-probe I/O budget** (`VANTH_PROBE_BUDGET`, default 8) so a batch of
+  blocked probes cannot stall delivery dispatch/recovery/schedules.
+- **Docs.** Remote execution + managed artifacts labelled **beta**; state layout,
+  backup, alert, and config docs updated; the remote-artifacts plan marked
+  historical.
+
+Deferred (tracked): re-enabling the Linux/macOS Python test matrix, which needs
+the test command builders made POSIX-safe (the runner is already POSIX-capable;
+the suite's `list2cmdline` helpers are not).
+
+Full suite: 769 passed, 6 skipped; `go test ./...` green.
+
 ## 1.8.0 - 2026-09-10
 
 ### Readiness-based triggers (#10)
