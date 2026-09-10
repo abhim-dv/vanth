@@ -122,6 +122,59 @@ def test_global_quota_limits_queued_dispatch(tmp_path, monkeypatch):
         manager.close()
 
 
+def test_paused_trigger_job_is_still_cancelled(tmp_path):
+    """A held job whose trigger parent ends incompatibly must not linger."""
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        parent = asyncio.run(manager.start(cmd(SLEEP)))
+        child = asyncio.run(manager.start(
+            cmd("print('never')"),
+            trigger={"job_id": parent["job_id"], "status": "completed"},
+        ))
+        manager.job_pause(child["job_id"])
+        manager.stop_sync(parent["job_id"])  # parent -> cancelled, not completed
+        manager._dispatch_queued_jobs()
+        assert manager.status(child["job_id"])["status"] == "cancelled"
+    finally:
+        manager.close()
+
+
+def test_pool_capacity_holds_under_concurrent_dispatch(tmp_path):
+    """Two managers dispatching at once must not both claim the last pool slot."""
+    import threading
+
+    home = tmp_path / "state"
+    m1 = JobManager(home, recover=False)
+    m2 = JobManager(home, recover=False)
+    try:
+        m1.pool_configure("p", max_parallel=1)
+        for _ in range(5):
+            asyncio.run(m1.start(cmd(SLEEP), pool="p"))
+
+        barrier = threading.Barrier(2)
+
+        def dispatch(manager):
+            barrier.wait()
+            manager._dispatch_queued_jobs()
+
+        threads = [threading.Thread(target=dispatch, args=(m,)) for m in (m1, m2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        active = m1.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE pool='p' AND status IN ('running','launching')"
+        ).fetchone()[0]
+        assert active == 1, f"pool cap violated: {active} active"
+        for job in m1.list()["jobs"]:
+            if m1.status(job["job_id"])["status"] in {"running", "launching"}:
+                m1.stop_sync(job["job_id"])
+    finally:
+        m1.close()
+        m2.close()
+
+
 def test_trigger_and_pool_gate_together(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:

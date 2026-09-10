@@ -52,6 +52,9 @@ def _zone(timezone_name: str) -> tzinfo:
 
 def _parse_field(text: str, name: str) -> set[int]:
     low, high = _FIELD_RANGES[name]
+    if name == "dow":
+        # Cron also accepts 7 as Sunday; normalized to 0 after parsing.
+        high = 7
     values: set[int] = set()
     for part in text.split(","):
         part = part.strip()

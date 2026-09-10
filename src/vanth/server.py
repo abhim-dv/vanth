@@ -1202,56 +1202,39 @@ class JobManager:
                 pool_rows = {
                     r["pool"]: r for r in self.db.execute("SELECT pool, max_parallel, paused FROM pools").fetchall()
                 }
-                pool_running = {
-                    r["pool"]: r["c"]
-                    for r in self.db.execute(
-                        "SELECT pool, COUNT(*) AS c FROM jobs "
-                        "WHERE status IN ('running','launching') AND pool IS NOT NULL GROUP BY pool"
-                    ).fetchall()
-                }
-                global_running = self.db.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
-                ).fetchone()[0]
 
             to_cancel: list[tuple[str, str, str]] = []
-            to_launch: list[str] = []
-            reserved_pool: dict[str, int] = {}
-            reserved_global = 0
+            to_launch: list[tuple[str, str | None, int]] = []
             for row in rows:
                 job_id = row["job_id"]
-                if row["paused"]:
-                    continue
                 trigger = triggers.get(job_id)
                 if trigger:
                     parent, target = trigger
                     parent_status = parents.get(parent)
                     if parent_status in TERMINAL_STATUSES and parent_status != target:
+                        # Cancellation is independent of pause: a held job whose
+                        # trigger can never fire must not linger forever.
                         to_cancel.append((job_id, parent, target))
                         continue
                     if parent_status != target:
                         continue  # trigger has not fired yet
+                if row["paused"]:
+                    continue  # held; capacity/pause are enforced again at claim
                 pool = row["pool"]
+                max_parallel = 0
                 if pool:
                     info = pool_rows.get(pool)
-                    if info is not None and info["paused"]:
-                        continue
-                    max_parallel = int(info["max_parallel"]) if info is not None else 0
-                    if max_parallel > 0:
-                        used = pool_running.get(pool, 0) + reserved_pool.get(pool, 0)
-                        if used >= max_parallel:
+                    if info is not None:
+                        if info["paused"]:
                             continue
-                if self.max_running_jobs and global_running + reserved_global >= self.max_running_jobs:
-                    continue
-                to_launch.append(job_id)
-                reserved_global += 1
-                if pool:
-                    reserved_pool[pool] = reserved_pool.get(pool, 0) + 1
+                        max_parallel = int(info["max_parallel"])
+                to_launch.append((job_id, pool, max_parallel))
 
-            for job_id in to_launch:
-                launch = self.prepare_launch(job_id)
-                if launch is None:
-                    continue
-                self._launch_prepared(launch)
+            for job_id, pool, max_parallel in to_launch:
+                # Capacity + claim are enforced in ONE guarded UPDATE so a
+                # concurrent direct start() or dispatcher can never slip past
+                # the global/pool cap (see _launch_queued_if_capacity).
+                self._launch_queued_if_capacity(job_id, pool=pool, max_parallel=max_parallel)
             for job_id, parent, status in to_cancel:
                 with self.db_lock:
                     changed = self.db.execute(
@@ -1268,6 +1251,43 @@ class JobManager:
                     )
         except Exception:
             self.logger.exception("queued-job dispatch failed")
+
+    def _launch_queued_if_capacity(self, job_id: str, *, pool: str | None, max_parallel: int) -> bool:
+        """Atomically enforce the global/pool cap and claim a queued job.
+
+        The running-count checks are subqueries INSIDE the guarded UPDATE, so
+        the read and the claim are one SQLite statement under the write lock —
+        a concurrent direct ``start()`` or another dispatcher cannot slip a job
+        in past either cap between the count and the claim (review rc37 P1
+        parity, extended to pools). Also re-checks ``paused``/``policy_disabled``
+        so a job paused after the snapshot is never launched.
+        """
+        token = "claim_" + uuid.uuid4().hex[:16]
+
+        def claim() -> int:
+            with self.db_lock:
+                if pool and max_parallel > 0:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='launching', claim_token=?, updated_at=? "
+                        "WHERE job_id=? AND status='queued' AND paused=0 AND policy_disabled=0 "
+                        "AND (? = 0 OR (SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')) < ?) "
+                        "AND (SELECT COUNT(*) FROM jobs WHERE pool=? AND status IN ('running','launching')) < ?",
+                        (token, now_iso(), job_id, self.max_running_jobs, self.max_running_jobs, pool, max_parallel),
+                    ).rowcount
+                else:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='launching', claim_token=?, updated_at=? "
+                        "WHERE job_id=? AND status='queued' AND paused=0 AND policy_disabled=0 "
+                        "AND (? = 0 OR (SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')) < ?)",
+                        (token, now_iso(), job_id, self.max_running_jobs, self.max_running_jobs),
+                    ).rowcount
+                self.db.commit()
+                return changed
+
+        if not self._retry_locked(claim):
+            return False
+        self._launch_prepared(self._build_launch(job_id, token))
+        return True
 
     @staticmethod
     def _iso_utc(value: datetime) -> str:

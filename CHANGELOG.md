@@ -55,7 +55,7 @@ All notable changes to Vanth are documented here.
   and `internal/state.LatestSchemaVersion` move to 15. A Windows-only `tzdata`
   dependency backs named schedule timezones.
 
-Full suite: 736 passed, 6 skipped; `go test ./...` green.
+Full suite: 739 passed, 6 skipped; `go test ./...` green.
 
 ## 1.6.0 - 2026-09-10
 

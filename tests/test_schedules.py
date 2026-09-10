@@ -34,6 +34,14 @@ def test_cron_basic_fields_and_steps():
     assert next_cron_fire("30 1,13 * * *", after=_utc("2026-01-01T02:00:00Z")) == _utc("2026-01-01T13:30:00Z")
 
 
+def test_cron_accepts_dow_seven_as_sunday():
+    # 2026-01-04 is a Sunday; cron accepts both 0 and 7 for Sunday.
+    for dow in ("0", "7"):
+        assert next_cron_fire(f"0 0 * * {dow}", after=_utc("2026-01-01T00:00:00Z")) == _utc("2026-01-04T00:00:00Z")
+    # A 7 in a range normalizes to Sunday too (Fri..Sun -> includes Sunday).
+    assert next_cron_fire("0 0 * * 5-7", after=_utc("2026-01-04T01:00:00Z")) == _utc("2026-01-09T00:00:00Z")
+
+
 def test_cron_macros_and_validation():
     assert next_cron_fire("@daily", after=_utc("2026-01-01T05:00:00Z")) == _utc("2026-01-02T00:00:00Z")
     assert validate_cron("@hourly") == "@hourly"
