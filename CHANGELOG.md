@@ -2,7 +2,7 @@
 
 All notable changes to Vanth are documented here.
 
-## Unreleased / next (1.6.x)
+## 1.6.0 - 2026-09-10
 
 ### Windows OpenCode live-delivery fix (rc43)
 

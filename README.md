@@ -1093,7 +1093,7 @@ Start it through `job_start` and watch it in `vanth monitor`.
 ## Development
 
 ```cmd
-uv run pytest -q                 # Python suite (112 passed, 1 Linux-only skip)
+uv run pytest -q                 # Python suite
 uv run python -m compileall -q src tests examples
 uv build                         # sdist + wheel; wheel bundles the Go monitor
 go vet ./... && go test ./...    # Go: config, state, monitor
