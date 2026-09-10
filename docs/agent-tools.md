@@ -53,7 +53,7 @@ client or daemon restarts.
 | `tags` | `string[]?` | `None` | Arbitrary labels, filterable in `job_list` |
 | `notes` | `string?` | `None` | Free-form annotation shown in the monitor |
 | `interactive` | `bool` | `false` | Open stdin for `job_send` |
-| `trigger` | `object?` | `None` | `{"job_id": A, "status": "completed"}` — start only after A reaches that status |
+| `trigger` | `object?` | `None` | DAG gate `{"job_id": A, "status": "completed"}` and/or readiness `probe` (see below) |
 | `secret_env` | `string[]?` | `None` | Env var NAMES whose values are masked (`***`) in captured logs/events (local jobs) |
 
 **Response**
@@ -79,6 +79,28 @@ queued job is `cancelled`. `vanth stop` cancels a queued job before it fires.
 On runner-launch failure: `status: "failed"`, `exit_code: 1`, `message` with
 the cause. On quota exhaustion (`VANTH_MAX_RUNNING_JOBS`):
 `{"result": "error", "error": "concurrent job quota reached (N running jobs)"}`.
+
+### Readiness probes
+
+`trigger.probe` waits for a condition instead of (or in addition to) a job
+status. One probe per trigger; when a DAG gate is also present both must pass.
+
+| Probe | Fields | Ready when |
+|---|---|---|
+| `port` | `host` (default `127.0.0.1`), `port` | a TCP connect succeeds |
+| `http` | `url` (http/https), `expect_status` (default 200) | GET returns that status |
+| `log_line` | `job_id`, `pattern`, `stream` (`stdout`/`stderr`/`all`) | the pattern is in the job's captured log tail |
+| `file` | `path` | the path exists |
+
+Any probe also accepts `timeout_seconds` (cancel the queued job if it never
+becomes ready) and `interval_seconds` (probe cadence, default 1). Probes run on
+the daemon host over a direct connection (no proxy). Timeout cancellation is
+attributed on the `cancelled` event (`actor: "daemon"`).
+
+```json
+{ "probe": { "type": "http", "url": "http://127.0.0.1:8080/health",
+             "expect_status": 200, "timeout_seconds": 120 } }
+```
 
 ---
 

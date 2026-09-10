@@ -42,6 +42,7 @@ from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .paths import canonical_home
+from .probes import evaluate_probe, validate_probe
 from .runtime_info import capture_run_metadata, serialize_run_metadata
 from .schedules import compute_next_fire, next_cron_fires, validate_schedule_spec, validate_timezone
 
@@ -507,6 +508,9 @@ class JobManager:
         self.shutdown_requested = threading.Event()
         self.max_events_per_job = max(1, int(os.environ.get("VANTH_MAX_EVENTS_PER_JOB", "100000")))
         self._events_truncated: set[str] = set()
+        # Readiness-probe throttle: job_id -> monotonic time of the last probe
+        # attempt (roadmap #10). Pruned to the current queued set each dispatch.
+        self._probe_last_attempt: dict[str, float] = {}
         self.logger = logging.getLogger(f"vanth.manager.{id(self)}")
         self.logger.setLevel(os.environ.get("VANTH_LOG_LEVEL", "INFO").upper())
         self.logger.propagate = False
@@ -1190,31 +1194,47 @@ class JobManager:
                 if not rows:
                     return
                 parents: dict[str, str | None] = {}
-                triggers: dict[str, tuple[str, str]] = {}
+                triggers: dict[str, dict[str, Any]] = {}
                 for row in rows:
                     trigger = json.loads(row["trigger_json"] or "null")
-                    if isinstance(trigger, dict) and trigger.get("job_id") and trigger.get("status"):
-                        triggers[row["job_id"]] = (trigger["job_id"], trigger["status"])
-                        parents.setdefault(trigger["job_id"], None)
+                    if isinstance(trigger, dict):
+                        triggers[row["job_id"]] = trigger
+                        if trigger.get("job_id"):
+                            parents.setdefault(trigger["job_id"], None)
                 for parent in parents:
                     status_row = self.db.execute("SELECT status FROM jobs WHERE job_id=?", (parent,)).fetchone()
                     parents[parent] = status_row["status"] if status_row else None
 
+            # Keep the probe throttle bounded to the jobs still queued.
+            queued_ids = {row["job_id"] for row in rows}
+            self._probe_last_attempt = {
+                key: value for key, value in self._probe_last_attempt.items() if key in queued_ids
+            }
+
             to_cancel: list[tuple[str, str, str]] = []
+            to_cancel_probe: list[tuple[str, dict[str, Any]]] = []
             to_launch: list[tuple[str, str | None]] = []
             for row in rows:
                 job_id = row["job_id"]
                 trigger = triggers.get(job_id)
                 if trigger:
-                    parent, target = trigger
-                    parent_status = parents.get(parent)
-                    if parent_status in TERMINAL_STATUSES and parent_status != target:
-                        # Cancellation is independent of pause: a held job whose
-                        # trigger can never fire must not linger forever.
-                        to_cancel.append((job_id, parent, target))
-                        continue
-                    if parent_status != target:
-                        continue  # trigger has not fired yet
+                    if trigger.get("job_id"):
+                        parent, target = trigger["job_id"], trigger["status"]
+                        parent_status = parents.get(parent)
+                        if parent_status in TERMINAL_STATUSES and parent_status != target:
+                            # Cancellation is independent of pause: a held job
+                            # whose trigger can never fire must not linger.
+                            to_cancel.append((job_id, parent, target))
+                            continue
+                        if parent_status != target:
+                            continue  # DAG gate not satisfied yet
+                    probe = trigger.get("probe")
+                    if probe is not None:
+                        if self._probe_timed_out(probe, row["created_at"]):
+                            to_cancel_probe.append((job_id, probe))
+                            continue
+                        if not self._probe_ready(job_id, probe):
+                            continue  # readiness gate not satisfied yet
                 if row["paused"]:
                     continue  # held; capacity/pause are enforced again at claim
                 to_launch.append((job_id, row["pool"]))
@@ -1224,6 +1244,22 @@ class JobManager:
                 # UPDATE (see _launch_queued_if_capacity), so a concurrent direct
                 # start(), dispatcher, or pool reconfiguration cannot slip past.
                 self._launch_queued_if_capacity(job_id, pool=pool)
+            for job_id, probe in to_cancel_probe:
+                reason = f"readiness probe ({probe['type']}) did not become ready within {probe['timeout_seconds']}s"
+                with self.db_lock:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='cancelled', stop_actor='daemon', stop_reason=?, "
+                        "ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
+                        (reason, now_iso(), now_iso(), job_id),
+                    ).rowcount
+                    self.db.commit()
+                if changed:
+                    self._emit(
+                        job_id,
+                        "cancelled",
+                        message=f"Queued job cancelled: {reason}",
+                        data={"actor": "daemon", "reason": reason, "probe": probe},
+                    )
             for job_id, parent, status in to_cancel:
                 with self.db_lock:
                     changed = self.db.execute(
@@ -1243,6 +1279,53 @@ class JobManager:
                     )
         except Exception:
             self.logger.exception("queued-job dispatch failed")
+
+    def _probe_timed_out(self, probe: dict[str, Any], created_at: str | None) -> bool:
+        timeout = probe.get("timeout_seconds")
+        if not timeout:
+            return False
+        created = _parse_iso(created_at) if created_at else None
+        if created is None:
+            return False
+        return (datetime.now(timezone.utc) - created).total_seconds() >= int(timeout)
+
+    def _probe_ready(self, job_id: str, probe: dict[str, Any]) -> bool:
+        """Evaluate a readiness probe, throttled per job to its cadence.
+
+        Returns False when the probe is not yet satisfied OR when it is inside
+        its throttle window (so the caller simply keeps the job queued).
+        """
+        interval = float(probe.get("interval_seconds", 1))
+        now = time.monotonic()
+        last = self._probe_last_attempt.get(job_id)
+        if last is not None and now - last < interval:
+            return False
+        self._probe_last_attempt[job_id] = now
+        try:
+            if probe["type"] == "log_line":
+                return evaluate_probe(probe, log_text=self._probe_log_text(probe))
+            return evaluate_probe(probe)
+        except Exception:
+            self.logger.exception("readiness probe failed job_id=%s type=%s", job_id, probe.get("type"))
+            return False
+
+    def _probe_log_text(self, probe: dict[str, Any], max_bytes: int = 262144) -> str:
+        """Bounded tail of a target job's captured log for a log_line probe."""
+        job_id = probe["job_id"]
+        stream = probe.get("stream", "all")
+        streams = ["stdout", "stderr"] if stream == "all" else [stream]
+        chunks: list[str] = []
+        for name in streams:
+            path = self.logs / f"{job_id}.{name}.log"
+            try:
+                size = path.stat().st_size
+                with path.open("rb") as handle:
+                    if size > max_bytes:
+                        handle.seek(size - max_bytes)
+                    chunks.append(handle.read().decode("utf-8", errors="replace"))
+            except OSError:
+                continue
+        return "\n".join(chunks)
 
     def _launch_queued_if_capacity(self, job_id: str, *, pool: str | None) -> bool:
         """Atomically enforce the global/pool cap and claim a queued job.
@@ -2542,7 +2625,7 @@ class JobManager:
         tags: list[str] | None = None,
         notes: str | None = None,
         interactive: bool = False,
-        trigger: dict[str, str] | None = None,
+        trigger: dict[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
         secret_env: list[str] | None = None,
         pool: str | None = None,
@@ -2661,10 +2744,14 @@ class JobManager:
             self._insert_wake_targets(job_id, wake_targets or [], created_at)
             self.db.commit()
         if queued:
-            if trigger:
-                message = f"Job queued; will start when {trigger['job_id']} reaches {trigger['status']}"
-            else:
-                message = f"Job queued in pool {pool!r}; will start when the pool has capacity"
+            gates = []
+            if trigger and trigger.get("job_id"):
+                gates.append(f"{trigger['job_id']} reaches {trigger['status']}")
+            if trigger and trigger.get("probe"):
+                gates.append(f"readiness probe {trigger['probe']['type']!r} passes")
+            if pool:
+                gates.append(f"pool {pool!r} has capacity")
+            message = "Job queued; will start when " + (", ".join(gates) if gates else "its gates pass")
             return {
                 "job_id": job_id,
                 "status": "queued",
@@ -2696,20 +2783,37 @@ class JobManager:
             job_id, stdout_path, stderr_path, events_path, claim_spec_path, claim_token=direct_claim_token
         )
 
-    def _validate_trigger(self, trigger: dict[str, str] | None) -> dict[str, str] | None:
+    def _validate_trigger(self, trigger: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate a queue trigger: a DAG gate, a readiness probe, or both.
+
+        A DAG gate is ``{"job_id": A, "status": S}`` (existing). A readiness gate
+        is ``{"probe": {...}}`` (roadmap #10). When both are present they are
+        ANDed. Unknown fields are rejected.
+        """
         if trigger is None:
             return None
         if not isinstance(trigger, dict):
-            raise ValueError("trigger must be an object with job_id and status")
+            raise ValueError("trigger must be an object")
+        unknown = set(trigger) - {"job_id", "status", "probe"}
+        if unknown:
+            raise ValueError(f"unknown trigger fields: {sorted(unknown)}")
         job_id = trigger.get("job_id")
         status = trigger.get("status")
-        if not isinstance(job_id, str) or not job_id:
-            raise ValueError("trigger.job_id must be a non-empty string")
-        if status not in TERMINAL_STATUSES:
-            raise ValueError(f"trigger.status must be one of {sorted(TERMINAL_STATUSES)}")
-        if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
-            raise ValueError(f"Unknown trigger job_id: {job_id}")
-        return {"job_id": job_id, "status": status}
+        probe = trigger.get("probe")
+        normalized: dict[str, Any] = {}
+        if job_id is not None or status is not None:
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("trigger.job_id must be a non-empty string")
+            if status not in TERMINAL_STATUSES:
+                raise ValueError(f"trigger.status must be one of {sorted(TERMINAL_STATUSES)}")
+            if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
+                raise ValueError(f"Unknown trigger job_id: {job_id}")
+            normalized.update(job_id=job_id, status=status)
+        if probe is not None:
+            normalized["probe"] = validate_probe(probe)
+        if not normalized:
+            raise ValueError("trigger must include a job_id/status gate, a probe, or both")
+        return normalized
 
     @staticmethod
     def _validate_secret_env(secret_env: list[str] | None) -> list[str]:
@@ -5366,7 +5470,7 @@ def job_start(
     tags: list[str] | None = None,
     notes: str | None = None,
     interactive: bool = False,
-    trigger: dict[str, str] | None = None,
+    trigger: dict[str, Any] | None = None,
     policy: dict[str, Any] | None = None,
     secret_env: list[str] | None = None,
     pool: str | None = None,
@@ -5386,11 +5490,16 @@ def job_start(
     The value is still kept in the job's own env in the owner-only database, as
     with any env var; masking protects emitted output. Local jobs only.
 
-    ``trigger`` optionally gates launch on another job: pass
-    ``{"job_id": "A", "status": "completed"}`` to start this job only once job
-    A reaches ``completed``. The new job is created ``queued`` and its runner
-    starts automatically when the trigger fires (or it is ``cancelled`` if A
-    ends in a different terminal status).
+    ``trigger`` optionally gates launch: pass ``{"job_id": "A", "status":
+    "completed"}`` to start only once job A reaches ``completed`` (the job stays
+    ``queued`` until then, or is ``cancelled`` if A ends differently). Add a
+    readiness ``probe`` (ANDed with the DAG gate when both are present):
+    ``{"probe": {"type": "port", "host": "127.0.0.1", "port": 5432,
+    "timeout_seconds": 120}}``. Probe types are ``port``, ``http``
+    (``url`` + optional ``expect_status``), ``log_line`` (``job_id`` +
+    ``pattern`` + optional ``stream``), and ``file`` (``path``). Each accepts
+    optional ``timeout_seconds`` (cancel the queued job if never ready) and
+    ``interval_seconds`` (probe cadence; default 1s).
 
     ``policy`` adds dead-man's-switch monitoring and failure reactions:
       - ``{"schedule": {"expected_interval_seconds": 3600, "grace_period_seconds": 300}}``

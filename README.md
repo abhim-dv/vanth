@@ -476,6 +476,29 @@ Returns `job_id`, `status`, `worker_pid`, and the log/event paths. With
 parent job reaches that status (or is `cancelled` if the parent ends
 differently).
 
+### Readiness triggers — wait for a condition, not just a job
+
+A `trigger` may also carry a **readiness probe**; when the DAG gate and the
+probe are both present they are ANDed. The job stays `queued` until the probe
+passes (or is `cancelled` once an optional `timeout_seconds` elapses):
+
+```text
+job_start(command="migrate.sh", trigger={"probe": {"type": "port",
+           "host": "127.0.0.1", "port": 5432, "timeout_seconds": 120}})
+
+# probe types
+{"probe": {"type": "port",     "host": "127.0.0.1", "port": 5432}}
+{"probe": {"type": "http",     "url": "http://127.0.0.1:8080/health", "expect_status": 200}}
+{"probe": {"type": "log_line", "job_id": "job_B", "pattern": "ready", "stream": "stdout"}}
+{"probe": {"type": "file",     "path": "/tmp/ready"}}
+```
+
+This lets one job orchestrate a stack — "start the DB, wait until the port
+accepts, then migrate" — instead of `sleep` hacks. Probes run on the daemon host
+(direct connection; no proxy), at `interval_seconds` cadence (default 1s), and a
+missed deadline is attributed (`actor="daemon"` + reason) on the `cancelled`
+event.
+
 ### job_send — feed stdin to an interactive job
 
 ```text

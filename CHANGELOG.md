@@ -2,6 +2,22 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased / next (1.8.x)
+
+### Readiness-based triggers (#10)
+
+- A queued job's `trigger` may now carry a **readiness probe** (ANDed with the
+  existing DAG gate when both are present). The job stays `queued` until the
+  probe passes, then launches through the same dispatcher. Probe types: `port`
+  (TCP connect), `http` (GET status), `log_line` (pattern in a job's captured
+  log), and `file` (path exists). Each accepts optional `timeout_seconds`
+  (cancel the queued job, attributed `actor="daemon"`) and `interval_seconds`
+  (probe cadence, default 1s). Probes run on the daemon host over a direct
+  connection (no proxy) and are throttled per job. No schema change — the probe
+  lives in the existing `trigger_json`.
+
+Full suite: 750 passed, 6 skipped; `go test ./...` green.
+
 ## 1.7.0 - 2026-09-10
 
 ### Kill attribution + declared-secret masking (schema v14)
