@@ -2,7 +2,7 @@
 
 All notable changes to Vanth are documented here.
 
-## Unreleased / next (1.8.x)
+## 1.8.0 - 2026-09-10
 
 ### Readiness-based triggers (#10)
 
