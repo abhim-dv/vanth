@@ -622,6 +622,15 @@ class Handler(BaseHTTPRequestHandler):
                     since_ms=int(query["since_ms"][0]) if "since_ms" in query else None,
                     slowest=int(query.get("slowest", ["10"])[0]),
                 ))
+            elif parsed.path == "/schedules":
+                ok(self, get_manager().list_schedules())
+            elif parsed.path.startswith("/schedules/") and parsed.path.endswith("/next"):
+                ok(self, get_manager().schedule_next_fires(
+                    parsed.path.split("/")[2],
+                    int(query.get("count", ["5"])[0]),
+                ))
+            elif parsed.path == "/pools":
+                ok(self, get_manager().pool_list())
             elif parsed.path == "/relay/poll":
                 ok(self, {"deliveries": get_manager().relay_poll(
                     client_id=query.get("client_id", [""])[0],
@@ -662,7 +671,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy", "secret_env", "remote_id", "idempotency_key"}
+                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy", "secret_env", "pool", "priority", "remote_id", "idempotency_key"}
                 if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)
@@ -710,6 +719,18 @@ class Handler(BaseHTTPRequestHandler):
                     ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/send"):
                 ok(self, get_manager().send_sync(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/pause"):
+                ok(self, get_manager().job_pause(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/resume"):
+                ok(self, get_manager().job_resume(parsed.path.split("/")[2]))
+            elif parsed.path == "/schedules":
+                ok(self, get_manager().create_schedule(**payload))
+            elif parsed.path.startswith("/schedules/") and parsed.path.endswith("/update"):
+                ok(self, get_manager().update_schedule(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/schedules/") and parsed.path.endswith("/delete"):
+                ok(self, get_manager().delete_schedule(parsed.path.split("/")[2]))
+            elif parsed.path == "/pools":
+                ok(self, get_manager().pool_configure(**payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/mark"):
                 ok(self, get_manager().mark_delivery(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/retry"):

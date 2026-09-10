@@ -36,6 +36,9 @@ classifiers = [
 dependencies = [
     "mcp>=1.0,<2.0",
     "loguru>=0.7,<1.0",
+    # zoneinfo ships no tz database on Windows; named schedule timezones need it
+    # there (Linux/macOS use the OS database). UTC works without it everywhere.
+    "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

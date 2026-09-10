@@ -33,7 +33,29 @@ All notable changes to Vanth are documented here.
   table of the longest terminal runs (runtime + status + name), read from the
   same `jobs.sqlite`.
 
-Full suite: 719 passed, 6 skipped; `go test ./...` green.
+### Schedules and queues (schema v15)
+
+- **Cron/interval schedules.** `schedule_create` (and list/update/delete/next)
+  launches a fresh job per fire with a cron expression (5-field or `@daily`-style)
+  or a fixed `interval_seconds`. Timezones are IANA names matched against the
+  local wall clock; DST is handled by construction (nonexistent local times are
+  skipped, ambiguous ones fire once per UTC minute). `overlap=skip` (default)
+  holds a fire while the previous run is active. No scheduler process: the
+  daemon's existing maintenance loop fires due rows; missed fires are not
+  backfilled. UTC needs no tz database; Windows named zones use the bundled
+  `tzdata` package.
+- **Queues: pools, priority, pause.** `job_start(pool=, priority=)` queues a job
+  behind a named pool (`pool_configure` sets `max_parallel`, `0` = unlimited,
+  and `paused`). The single dispatcher launches queued (pool and/or trigger)
+  jobs by `priority` descending, oldest first, once every gate passes; the
+  global `VANTH_MAX_RUNNING_JOBS` quota still applies. `job_pause`/`job_resume`
+  hold/release a queued job; `pool_configure(paused=True)` holds a whole pool.
+- **Schema v15** adds `jobs.pool` / `priority` / `paused` / `schedule_id`, the
+  `pools` and `schedules` tables, and their indexes; the Go conformance fixture
+  and `internal/state.LatestSchemaVersion` move to 15. A Windows-only `tzdata`
+  dependency backs named schedule timezones.
+
+Full suite: 736 passed, 6 skipped; `go test ./...` green.
 
 ## 1.6.0 - 2026-09-10
 

@@ -43,6 +43,7 @@ from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .paths import canonical_home
 from .runtime_info import capture_run_metadata, serialize_run_metadata
+from .schedules import compute_next_fire, next_cron_fires, validate_schedule_spec, validate_timezone
 
 EVENT_PREFIX = "AGENT_EVENT "
 DEFAULT_MAX_EVENT_BYTES = 65536
@@ -758,7 +759,8 @@ class JobManager:
                 self._dispatch_due_deliveries()
                 self._reconcile_running_jobs()
                 self._recover_stale_launch_claims()
-                self._fire_triggered_jobs()
+                self._fire_due_schedules()
+                self._dispatch_queued_jobs()
                 self._watch_policies()
                 self._maybe_auto_cleanup()
                 self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
@@ -1170,41 +1172,81 @@ class JobManager:
                     pass
             self._emit(job_id, "failure_threshold", message=f"{message}; launched reaction job {target_job}", data={**data, "reaction_job_id": target_job})
 
-    def _fire_triggered_jobs(self) -> None:
-        """Launch queued jobs whose trigger parent has reached the status.
+    def _dispatch_queued_jobs(self) -> None:
+        """Launch queued jobs whose gates are satisfied, in priority order.
 
-        Lightweight DAG: a job started with ``trigger={"job_id": A, "status":
-        S}`` stays ``queued`` until A reaches S, then its runner is launched.
+        A queued job is gated by its trigger (a DAG parent status) and/or its
+        pool (not paused, under ``max_parallel``). Eligible jobs launch
+        highest-priority first and consume the global concurrent-job quota. A
+        trigger job whose parent ended in a different terminal status is
+        cancelled. One method covers trigger DAGs and pools — no second queue.
         """
         try:
             with self.db_lock:
                 rows = self.db.execute(
-                    "SELECT job_id, trigger_json FROM jobs WHERE status='queued'"
+                    "SELECT job_id, trigger_json, pool, priority, paused, created_at "
+                    "FROM jobs WHERE status='queued' ORDER BY priority DESC, created_at ASC"
                 ).fetchall()
-                parents: dict[str, str] = {}
+                if not rows:
+                    return
+                parents: dict[str, str | None] = {}
                 triggers: dict[str, tuple[str, str]] = {}
                 for row in rows:
                     trigger = json.loads(row["trigger_json"] or "null")
                     if isinstance(trigger, dict) and trigger.get("job_id") and trigger.get("status"):
                         triggers[row["job_id"]] = (trigger["job_id"], trigger["status"])
                         parents.setdefault(trigger["job_id"], None)
-                if not triggers:
-                    return
                 for parent in parents:
-                    status_row = self.db.execute(
-                        "SELECT status FROM jobs WHERE job_id=?", (parent,)
-                    ).fetchone()
-                    if status_row:
-                        parents[parent] = status_row["status"]
-            to_launch = [
-                job_id for job_id, (parent, status) in triggers.items()
-                if parents.get(parent) == status
-            ]
-            to_cancel = [
-                (job_id, parent, status)
-                for job_id, (parent, status) in triggers.items()
-                if parents.get(parent) in TERMINAL_STATUSES and parents.get(parent) != status
-            ]
+                    status_row = self.db.execute("SELECT status FROM jobs WHERE job_id=?", (parent,)).fetchone()
+                    parents[parent] = status_row["status"] if status_row else None
+                pool_rows = {
+                    r["pool"]: r for r in self.db.execute("SELECT pool, max_parallel, paused FROM pools").fetchall()
+                }
+                pool_running = {
+                    r["pool"]: r["c"]
+                    for r in self.db.execute(
+                        "SELECT pool, COUNT(*) AS c FROM jobs "
+                        "WHERE status IN ('running','launching') AND pool IS NOT NULL GROUP BY pool"
+                    ).fetchall()
+                }
+                global_running = self.db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
+                ).fetchone()[0]
+
+            to_cancel: list[tuple[str, str, str]] = []
+            to_launch: list[str] = []
+            reserved_pool: dict[str, int] = {}
+            reserved_global = 0
+            for row in rows:
+                job_id = row["job_id"]
+                if row["paused"]:
+                    continue
+                trigger = triggers.get(job_id)
+                if trigger:
+                    parent, target = trigger
+                    parent_status = parents.get(parent)
+                    if parent_status in TERMINAL_STATUSES and parent_status != target:
+                        to_cancel.append((job_id, parent, target))
+                        continue
+                    if parent_status != target:
+                        continue  # trigger has not fired yet
+                pool = row["pool"]
+                if pool:
+                    info = pool_rows.get(pool)
+                    if info is not None and info["paused"]:
+                        continue
+                    max_parallel = int(info["max_parallel"]) if info is not None else 0
+                    if max_parallel > 0:
+                        used = pool_running.get(pool, 0) + reserved_pool.get(pool, 0)
+                        if used >= max_parallel:
+                            continue
+                if self.max_running_jobs and global_running + reserved_global >= self.max_running_jobs:
+                    continue
+                to_launch.append(job_id)
+                reserved_global += 1
+                if pool:
+                    reserved_pool[pool] = reserved_pool.get(pool, 0) + 1
+
             for job_id in to_launch:
                 launch = self.prepare_launch(job_id)
                 if launch is None:
@@ -1225,7 +1267,384 @@ class JobManager:
                         data={"trigger": {"job_id": parent, "status": status}, "parent_status": parents.get(parent)},
                     )
         except Exception:
-            self.logger.exception("triggered-job fire failed")
+            self.logger.exception("queued-job dispatch failed")
+
+    @staticmethod
+    def _iso_utc(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _schedule_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schedule_id": row["schedule_id"],
+            "name": row["name"],
+            "cron": row["cron"],
+            "interval_seconds": row["interval_seconds"],
+            "timezone": row["timezone"],
+            "command": row["command"],
+            "cwd": row["cwd"],
+            "env": json.loads(row["env_json"] or "{}"),
+            "timeout_seconds": row["timeout_seconds"],
+            "tags": json.loads(row["tags_json"] or "[]"),
+            "notes": row["notes"],
+            "secret_env": json.loads(row["secret_env_json"] or "[]"),
+            "overlap": row["overlap"],
+            "enabled": bool(row["enabled"]),
+            "next_fire_at": row["next_fire_at"],
+            "last_fired_at": row["last_fired_at"],
+            "fire_count": row["fire_count"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def create_schedule(
+        self,
+        command: str,
+        *,
+        name: str | None = None,
+        cron: str | None = None,
+        interval_seconds: int | None = None,
+        timezone_name: str = "UTC",
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
+        tags: list[str] | None = None,
+        notes: str | None = None,
+        secret_env: list[str] | None = None,
+        overlap: str = "skip",
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Create a cron/interval schedule that launches a fresh job per fire."""
+        self._ensure_open()
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        cron = cron.strip() if isinstance(cron, str) and cron.strip() else None
+        validate_schedule_spec(cron=cron, interval_seconds=interval_seconds)
+        tz = validate_timezone(timezone_name)
+        if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
+            raise ValueError("timeout_seconds must be an integer >= 1")
+        if overlap not in {"skip", "allow"}:
+            raise ValueError("overlap must be 'skip' or 'allow'")
+        if env is not None and not isinstance(env, dict):
+            raise ValueError("env must be an object of string values")
+        secret_env = self._validate_secret_env(secret_env)
+        schedule_id = "sched_" + uuid.uuid4().hex[:12]
+        now = now_iso()
+        next_at = (
+            self._iso_utc(compute_next_fire(cron=cron, interval_seconds=interval_seconds, timezone_name=tz))
+            if enabled
+            else None
+        )
+        with self.db_lock:
+            self.db.execute(
+                """
+                INSERT INTO schedules(schedule_id, name, cron, interval_seconds, timezone, command, cwd, env_json,
+                  timeout_seconds, tags_json, notes, secret_env_json, overlap, enabled, next_fire_at, last_fired_at,
+                  fire_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)
+                """,
+                (
+                    schedule_id,
+                    name,
+                    cron,
+                    interval_seconds,
+                    tz,
+                    command,
+                    cwd,
+                    json.dumps(env or {}, separators=(",", ":")),
+                    timeout_seconds,
+                    json.dumps(tags or [], separators=(",", ":")),
+                    notes,
+                    json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
+                    overlap,
+                    1 if enabled else 0,
+                    next_at,
+                    now,
+                    now,
+                ),
+            )
+            self.db.commit()
+        return self.get_schedule(schedule_id)
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any]:
+        row = self._row("SELECT * FROM schedules WHERE schedule_id=?", (schedule_id,))
+        if not row:
+            raise ValueError(f"Unknown schedule_id: {schedule_id}")
+        return self._schedule_dict(row)
+
+    def list_schedules(self) -> dict[str, Any]:
+        self._ensure_open()
+        with self.db_lock:
+            rows = self.db.execute("SELECT * FROM schedules ORDER BY created_at ASC").fetchall()
+        return {"schedules": [self._schedule_dict(row) for row in rows], "count": len(rows)}
+
+    def update_schedule(self, schedule_id: str, **changes: Any) -> dict[str, Any]:
+        """Edit a schedule in place (never its id) and recompute the next fire."""
+        self._ensure_open()
+        row = self._row("SELECT * FROM schedules WHERE schedule_id=?", (schedule_id,))
+        if not row:
+            raise ValueError(f"Unknown schedule_id: {schedule_id}")
+        allowed = {
+            "name", "cron", "interval_seconds", "timezone", "command", "cwd", "env",
+            "timeout_seconds", "tags", "notes", "secret_env", "overlap", "enabled",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unknown schedule fields: {sorted(unknown)}")
+        merged = {**self._schedule_dict(row), **changes}
+        command = merged.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        cron = merged.get("cron")
+        cron = cron.strip() if isinstance(cron, str) and cron.strip() else None
+        interval = merged.get("interval_seconds")
+        if interval is not None and (isinstance(interval, bool) or not isinstance(interval, int) or interval < 1):
+            raise ValueError("interval_seconds must be an integer >= 1")
+        validate_schedule_spec(cron=cron, interval_seconds=interval)
+        tz = validate_timezone(merged.get("timezone") or "UTC")
+        overlap = merged.get("overlap", "skip")
+        if overlap not in {"skip", "allow"}:
+            raise ValueError("overlap must be 'skip' or 'allow'")
+        timeout = merged.get("timeout_seconds")
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1):
+            raise ValueError("timeout_seconds must be an integer >= 1")
+        env = merged.get("env") or {}
+        if not isinstance(env, dict):
+            raise ValueError("env must be an object of string values")
+        secret_env = self._validate_secret_env(merged.get("secret_env"))
+        enabled = bool(merged.get("enabled", True))
+        now = now_iso()
+        next_at = (
+            self._iso_utc(compute_next_fire(cron=cron, interval_seconds=interval, timezone_name=tz))
+            if enabled
+            else None
+        )
+        with self.db_lock:
+            self.db.execute(
+                "UPDATE schedules SET name=?, cron=?, interval_seconds=?, timezone=?, command=?, cwd=?, env_json=?, "
+                "timeout_seconds=?, tags_json=?, notes=?, secret_env_json=?, overlap=?, enabled=?, next_fire_at=?, updated_at=? "
+                "WHERE schedule_id=?",
+                (
+                    merged.get("name"),
+                    cron,
+                    interval,
+                    tz,
+                    command,
+                    merged.get("cwd"),
+                    json.dumps(env, separators=(",", ":")),
+                    timeout,
+                    json.dumps(merged.get("tags") or [], separators=(",", ":")),
+                    merged.get("notes"),
+                    json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
+                    overlap,
+                    1 if enabled else 0,
+                    next_at,
+                    now,
+                    schedule_id,
+                ),
+            )
+            self.db.commit()
+        return self.get_schedule(schedule_id)
+
+    def delete_schedule(self, schedule_id: str) -> dict[str, Any]:
+        self._ensure_open()
+        with self.db_lock:
+            changed = self.db.execute("DELETE FROM schedules WHERE schedule_id=?", (schedule_id,)).rowcount
+            self.db.commit()
+        if not changed:
+            raise ValueError(f"Unknown schedule_id: {schedule_id}")
+        return {"result": "ok", "schedule_id": schedule_id}
+
+    def schedule_next_fires(self, schedule_id: str, count: int = 5) -> dict[str, Any]:
+        self._ensure_open()
+        validate_limit(count, "count", 50)
+        row = self._row("SELECT * FROM schedules WHERE schedule_id=?", (schedule_id,))
+        if not row:
+            raise ValueError(f"Unknown schedule_id: {schedule_id}")
+        schedule = self._schedule_dict(row)
+        now = datetime.now(timezone.utc)
+        if schedule["cron"]:
+            fires = [self._iso_utc(dt) for dt in next_cron_fires(schedule["cron"], timezone_name=schedule["timezone"], after=now, count=count)]
+        else:
+            fires = [self._iso_utc(compute_next_fire(interval_seconds=schedule["interval_seconds"], after=now))]
+        return {"schedule_id": schedule_id, "timezone": schedule["timezone"], "next_fires": fires}
+
+    def _fire_due_schedules(self) -> None:
+        """Launch a fresh job for every enabled schedule whose fire time passed."""
+        try:
+            now = now_iso()
+            with self.db_lock:
+                due = self.db.execute(
+                    "SELECT * FROM schedules WHERE enabled=1 AND next_fire_at IS NOT NULL AND next_fire_at <= ? "
+                    "ORDER BY next_fire_at ASC",
+                    (now,),
+                ).fetchall()
+            for row in due:
+                self._fire_schedule(row)
+        except Exception:
+            self.logger.exception("schedule dispatch failed")
+
+    def _fire_schedule(self, row: sqlite3.Row) -> None:
+        schedule_id = row["schedule_id"]
+        fired_at = now_iso()
+        now_dt = _parse_iso(fired_at) or datetime.now(timezone.utc)
+        if row["overlap"] != "allow":
+            with self.db_lock:
+                active = self.db.execute(
+                    "SELECT 1 FROM jobs WHERE schedule_id=? AND status NOT IN "
+                    "('completed','failed','timeout','cancelled','orphaned') LIMIT 1",
+                    (schedule_id,),
+                ).fetchone()
+            if active:
+                self.logger.warning("schedule %s fire skipped: previous run is still active", schedule_id)
+                self._advance_schedule(schedule_id, row, now_dt, fired_at, fired=False)
+                return
+        tags = json.loads(row["tags_json"] or "[]")
+        if "scheduled" not in tags:
+            tags.append("scheduled")
+        try:
+            result = asyncio.run(
+                self.start(
+                    command=row["command"],
+                    cwd=row["cwd"],
+                    name=row["name"] or schedule_id,
+                    env=json.loads(row["env_json"] or "{}") or None,
+                    timeout_seconds=row["timeout_seconds"],
+                    tags=tags,
+                    notes=row["notes"],
+                    secret_env=json.loads(row["secret_env_json"] or "[]") or None,
+                    schedule_id=schedule_id,
+                )
+            )
+            self.logger.info("schedule %s fired job %s", schedule_id, result.get("job_id"))
+        except Exception:
+            self.logger.exception("schedule %s failed to launch a job", schedule_id)
+        self._advance_schedule(schedule_id, row, now_dt, fired_at, fired=True)
+
+    def _advance_schedule(self, schedule_id: str, row: sqlite3.Row, after: datetime, fired_at: str, *, fired: bool) -> None:
+        try:
+            nxt = self._iso_utc(
+                compute_next_fire(
+                    cron=row["cron"],
+                    interval_seconds=row["interval_seconds"],
+                    timezone_name=row["timezone"],
+                    after=after,
+                )
+            )
+        except ValueError:
+            self.logger.exception("schedule %s has no next fire; disabling it", schedule_id)
+            with self.db_lock:
+                self.db.execute("UPDATE schedules SET enabled=0, next_fire_at=NULL, updated_at=? WHERE schedule_id=?", (fired_at, schedule_id))
+                self.db.commit()
+            return
+        with self.db_lock:
+            if fired:
+                self.db.execute(
+                    "UPDATE schedules SET last_fired_at=?, next_fire_at=?, fire_count=fire_count+1, updated_at=? WHERE schedule_id=?",
+                    (fired_at, nxt, fired_at, schedule_id),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE schedules SET next_fire_at=?, updated_at=? WHERE schedule_id=?",
+                    (nxt, fired_at, schedule_id),
+                )
+            self.db.commit()
+
+    def pool_configure(self, pool: str, *, max_parallel: int = 0, paused: bool | None = None) -> dict[str, Any]:
+        """Create/update a pool's concurrency cap and paused flag."""
+        self._ensure_open()
+        pool = self._validate_pool(pool)
+        if pool is None:
+            raise ValueError("pool must be a non-empty string")
+        if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 0:
+            raise ValueError("max_parallel must be an integer >= 0")
+        now = now_iso()
+        with self.db_lock:
+            existing = self.db.execute("SELECT * FROM pools WHERE pool=?", (pool,)).fetchone()
+            if existing is None:
+                self.db.execute(
+                    "INSERT INTO pools(pool, max_parallel, paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (pool, max_parallel, 1 if paused else 0, now, now),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE pools SET max_parallel=?, paused=?, updated_at=? WHERE pool=?",
+                    (max_parallel, (1 if paused else 0) if paused is not None else existing["paused"], now, pool),
+                )
+            self.db.commit()
+        return self.pool_get(pool)
+
+    def pool_get(self, pool: str) -> dict[str, Any]:
+        row = self._row("SELECT * FROM pools WHERE pool=?", (pool,))
+        if not row:
+            raise ValueError(f"Unknown pool: {pool}")
+        return {
+            "pool": row["pool"],
+            "max_parallel": row["max_parallel"],
+            "paused": bool(row["paused"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def pool_list(self) -> dict[str, Any]:
+        self._ensure_open()
+        with self.db_lock:
+            pools = [dict(row) for row in self.db.execute("SELECT * FROM pools ORDER BY pool").fetchall()]
+            counts = {
+                (row["pool"], row["status"]): row["c"]
+                for row in self.db.execute(
+                    "SELECT pool, status, COUNT(*) AS c FROM jobs WHERE pool IS NOT NULL GROUP BY pool, status"
+                ).fetchall()
+            }
+        out = []
+        for pool in pools:
+            name = pool["pool"]
+            out.append(
+                {
+                    "pool": name,
+                    "max_parallel": pool["max_parallel"],
+                    "paused": bool(pool["paused"]),
+                    "queued": counts.get((name, "queued"), 0),
+                    "running": counts.get((name, "running"), 0) + counts.get((name, "launching"), 0),
+                    "updated_at": pool["updated_at"],
+                }
+            )
+        return {"pools": out, "count": len(out)}
+
+    def job_pause(self, job_id: str) -> dict[str, Any]:
+        """Hold a queued job so the dispatcher will not launch it."""
+        self._ensure_open()
+        with self.db_lock:
+            changed = self.db.execute(
+                "UPDATE jobs SET paused=1, updated_at=? WHERE job_id=? AND status='queued' AND paused=0",
+                (now_iso(), job_id),
+            ).rowcount
+            self.db.commit()
+        if changed:
+            return {"result": "ok", "job_id": job_id, "paused": True}
+        row = self._row("SELECT status, paused FROM jobs WHERE job_id=?", (job_id,))
+        if not row:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        if row["status"] != "queued":
+            raise ValueError(f"only a queued job can be paused (status={row['status']})")
+        return {"result": "ok", "job_id": job_id, "paused": True}
+
+    def job_resume(self, job_id: str) -> dict[str, Any]:
+        """Release a paused queued job back to the dispatcher."""
+        self._ensure_open()
+        with self.db_lock:
+            changed = self.db.execute(
+                "UPDATE jobs SET paused=0, updated_at=? WHERE job_id=? AND status='queued' AND paused=1",
+                (now_iso(), job_id),
+            ).rowcount
+            self.db.commit()
+        if changed:
+            return {"result": "ok", "job_id": job_id, "paused": False}
+        row = self._row("SELECT status, paused FROM jobs WHERE job_id=?", (job_id,))
+        if not row:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        if row["status"] != "queued":
+            raise ValueError(f"only a queued job can be resumed (status={row['status']})")
+        return {"result": "ok", "job_id": job_id, "paused": False}
 
     def _running_count(self) -> int:
         # Direct starts are inserted 'launching' and promoted by the runner
@@ -2092,6 +2511,9 @@ class JobManager:
         trigger: dict[str, str] | None = None,
         policy: dict[str, Any] | None = None,
         secret_env: list[str] | None = None,
+        pool: str | None = None,
+        priority: int = 0,
+        schedule_id: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         # Thread identity (review P1-4 / P2-2): the LAUNCHING thread is the
@@ -2119,7 +2541,12 @@ class JobManager:
         trigger = self._validate_trigger(trigger)
         policy = validate_policy(policy)
         secret_env = self._validate_secret_env(secret_env)
-        queued = trigger is not None
+        pool = self._validate_pool(pool)
+        priority = self._validate_priority(priority)
+        # A trigger OR a pool gates launch: the job is created 'queued' and the
+        # single dispatcher launches it once the trigger fires and the pool has
+        # capacity (and is not paused).
+        queued = trigger is not None or pool is not None
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
         stderr_path = self.logs / f"{job_id}.stderr.log"
@@ -2162,8 +2589,9 @@ class JobManager:
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
                   timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
-                  stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token, secret_env_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token, secret_env_json,
+                  pool, priority, schedule_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -2190,20 +2618,29 @@ class JobManager:
                     json.dumps(policy, separators=(",", ":")) if policy else None,
                     direct_claim_token,
                     json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
+                    pool,
+                    priority,
+                    schedule_id,
                 ),
             )
             self.db.commit()
             self._insert_wake_targets(job_id, wake_targets or [], created_at)
             self.db.commit()
         if queued:
+            if trigger:
+                message = f"Job queued; will start when {trigger['job_id']} reaches {trigger['status']}"
+            else:
+                message = f"Job queued in pool {pool!r}; will start when the pool has capacity"
             return {
                 "job_id": job_id,
                 "status": "queued",
                 "trigger": trigger,
+                "pool": pool,
+                "priority": priority,
                 "stdout_path": str(stdout_path),
                 "stderr_path": str(stderr_path),
                 "events_path": str(events_path),
-                "message": f"Job queued; will start when {trigger['job_id']} reaches {trigger['status']}",
+                "message": message,
             }
         claim_spec_path = self._write_spec(
             job_id,
@@ -2260,6 +2697,24 @@ class JobManager:
             if name not in names:
                 names.append(name)
         return names
+
+    @staticmethod
+    def _validate_pool(pool: str | None) -> str | None:
+        if pool is None:
+            return None
+        if not isinstance(pool, str) or not pool.strip():
+            raise ValueError("pool must be a non-empty string")
+        if len(pool) > 64:
+            raise ValueError("pool must be at most 64 characters")
+        return pool.strip()
+
+    @staticmethod
+    def _validate_priority(priority: int) -> int:
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("priority must be an integer")
+        if priority < -1000000 or priority > 1000000:
+            raise ValueError("priority must be between -1000000 and 1000000")
+        return priority
 
     def _write_spec(self, job_id: str, spec: dict[str, Any], *, spec_name: str | None = None) -> Path:
         """Write a job's run spec JSON and return its path.
@@ -2508,7 +2963,7 @@ class JobManager:
     def _build_launch(self, job_id: str, token: str) -> dict[str, Any]:
         """Read the run spec for a claimed job and write its spec file."""
         spec_row = self._row(
-            "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json FROM jobs WHERE job_id=?",
+            "SELECT job_id, command, cwd, env_json, timeout_seconds, run_json, secret_env_json FROM jobs WHERE job_id=?",
             (job_id,),
         )
         interactive = False
@@ -2526,6 +2981,9 @@ class JobManager:
                 "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
                 "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
                 "interactive": interactive,
+                # Declared-secret masking must survive a queued (trigger/pool)
+                # launch, which does not go through start()'s direct spec path.
+                "secret_env": json.loads(spec_row["secret_env_json"] or "[]"),
                 # The runner uses this token to atomically promote the claim
                 # (launching -> running) and to guard every terminal transition
                 # so a stale run can never touch a newer launch.
@@ -2541,6 +2999,7 @@ class JobManager:
                 "stdout_path": str(self.logs / f"{job_id}.stdout.log"),
                 "stderr_path": str(self.logs / f"{job_id}.stderr.log"),
                 "interactive": False,
+                "secret_env": [],
                 "claim_token": token,
             }
         spec_path = self._write_spec(job_id, spec, spec_name=f"{job_id}-{token}.json")
@@ -2883,7 +3342,7 @@ class JobManager:
         self._ensure_open()
         row = self._row(
             "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
-            "tags_json, name, notes, run_json, policy_json, secret_env_json FROM jobs WHERE job_id=?",
+            "tags_json, name, notes, run_json, policy_json, secret_env_json, pool, priority FROM jobs WHERE job_id=?",
             (job_id,),
         )
         if not row:
@@ -2928,6 +3387,8 @@ class JobManager:
             interactive=stored_interactive if not isinstance(interactive, bool) else interactive,
             policy=json.loads(row["policy_json"] or "null"),
             secret_env=secret_env if secret_env is not None else (json.loads(row["secret_env_json"] or "null") or None),
+            pool=row["pool"],
+            priority=row["priority"] or 0,
         ))
         if prior_state and json.loads(row["policy_json"] or "null"):
             # Carry ONLY the failure streak: reacted_* dedup markers belong to
@@ -3349,6 +3810,10 @@ class JobManager:
             "secret_env": json.loads(row["secret_env_json"] or "[]"),
             "stop_actor": row["stop_actor"],
             "stop_reason": row["stop_reason"],
+            "pool": row["pool"],
+            "priority": row["priority"],
+            "paused": bool(row["paused"]),
+            "schedule_id": row["schedule_id"],
             "runtime_seconds": _runtime_seconds(row["started_at"], row["ended_at"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -4869,10 +5334,17 @@ def job_start(
     trigger: dict[str, str] | None = None,
     policy: dict[str, Any] | None = None,
     secret_env: list[str] | None = None,
+    pool: str | None = None,
+    priority: int = 0,
     remote_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Start a background job.
+
+    ``pool`` queues the job behind a named concurrency pool instead of starting
+    it immediately; ``priority`` (higher first) orders queued pool/trigger jobs.
+    Configure pools with ``pool_configure`` and hold/release a queued job with
+    ``job_pause`` / ``job_resume``.
 
     ``secret_env`` names environment variables whose values must be masked
     (``***``) in captured stdout/stderr and structured events — the GitHub
@@ -4936,6 +5408,8 @@ def job_start(
             "trigger": trigger,
             "policy": policy,
             "secret_env": secret_env,
+            "pool": pool,
+            "priority": priority,
             "remote_id": remote_id,
             "idempotency_key": idempotency_key,
         },
@@ -5107,6 +5581,75 @@ def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 1
     return get_client().post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after_seconds,
                                                        "actor": "tool", "reason": reason,
                                                        "remote_id": remote_id, "idempotency_key": idempotency_key})
+
+
+@mcp.tool()
+def job_pause(job_id: str) -> dict[str, Any]:
+    """Hold a queued job so the dispatcher will not launch it (pool/trigger)."""
+    return get_client().post(f"/jobs/{job_id}/pause", {})
+
+
+@mcp.tool()
+def job_resume(job_id: str) -> dict[str, Any]:
+    """Release a paused queued job back to the dispatcher."""
+    return get_client().post(f"/jobs/{job_id}/resume", {})
+
+
+@mcp.tool()
+def pool_configure(pool: str, max_parallel: int = 0, paused: bool | None = None) -> dict[str, Any]:
+    """Create/update a concurrency pool. ``max_parallel`` 0 = unlimited."""
+    return get_client().post("/pools", {"pool": pool, "max_parallel": max_parallel, "paused": paused})
+
+
+@mcp.tool()
+def pool_list() -> dict[str, Any]:
+    """List concurrency pools with queued/running counts."""
+    return get_client().get("/pools")
+
+
+@mcp.tool()
+def schedule_create(command: str, cron: str | None = None, interval_seconds: int | None = None,
+                    name: str | None = None, timezone_name: str = "UTC", cwd: str | None = None,
+                    env: dict[str, str] | None = None, timeout_seconds: int | None = None,
+                    tags: list[str] | None = None, notes: str | None = None,
+                    secret_env: list[str] | None = None, overlap: str = "skip",
+                    enabled: bool = True) -> dict[str, Any]:
+    """Create a schedule that launches a fresh job per fire.
+
+    Pass exactly one of ``cron`` (5-field, or ``@daily`` etc.) or
+    ``interval_seconds``. ``overlap`` is ``skip`` (default; hold the fire while
+    the previous run is active) or ``allow``.
+    """
+    return get_client().post("/schedules", {
+        "command": command, "cron": cron, "interval_seconds": interval_seconds, "name": name,
+        "timezone_name": timezone_name, "cwd": cwd, "env": env, "timeout_seconds": timeout_seconds,
+        "tags": tags, "notes": notes, "secret_env": secret_env, "overlap": overlap, "enabled": enabled,
+    })
+
+
+@mcp.tool()
+def schedule_list() -> dict[str, Any]:
+    """List all schedules."""
+    return get_client().get("/schedules")
+
+
+@mcp.tool()
+def schedule_update(schedule_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+    """Edit a schedule in place (name/cron/interval_seconds/timezone/command/
+    cwd/env/timeout_seconds/tags/notes/secret_env/overlap/enabled)."""
+    return get_client().post(f"/schedules/{schedule_id}/update", changes)
+
+
+@mcp.tool()
+def schedule_delete(schedule_id: str) -> dict[str, Any]:
+    """Delete a schedule (already-created jobs are unaffected)."""
+    return get_client().post(f"/schedules/{schedule_id}/delete", {})
+
+
+@mcp.tool()
+def schedule_next(schedule_id: str, count: int = 5) -> dict[str, Any]:
+    """Preview the next ``count`` fire times for a schedule."""
+    return get_client().get(f"/schedules/{schedule_id}/next", {"count": count})
 
 
 @mcp.tool()

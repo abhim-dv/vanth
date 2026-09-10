@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 14
+LATEST_SCHEMA_VERSION = 15
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -59,7 +59,8 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
           env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
           trigger_json TEXT, policy_json TEXT, policy_state_json TEXT, policy_disabled INTEGER NOT NULL DEFAULT 0,
-          claim_token TEXT, stop_actor TEXT, stop_reason TEXT, secret_env_json TEXT
+          claim_token TEXT, stop_actor TEXT, stop_reason TEXT, secret_env_json TEXT,
+          pool TEXT, priority INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0, schedule_id TEXT
         );
         CREATE TABLE IF NOT EXISTS events (
           event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -109,7 +110,22 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id, created_at);
-        PRAGMA user_version=14;
+        CREATE TABLE IF NOT EXISTS pools (
+          pool TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 0,
+          paused INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS schedules (
+          schedule_id TEXT PRIMARY KEY, name TEXT, cron TEXT, interval_seconds INTEGER,
+          timezone TEXT NOT NULL DEFAULT 'UTC', command TEXT NOT NULL, cwd TEXT, env_json TEXT,
+          timeout_seconds INTEGER, tags_json TEXT, notes TEXT, secret_env_json TEXT,
+          overlap TEXT NOT NULL DEFAULT 'skip', enabled INTEGER NOT NULL DEFAULT 1,
+          next_fire_at TEXT, last_fired_at TEXT, fire_count INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_fire_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON jobs(schedule_id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_pool_status ON jobs(pool, status);
+        PRAGMA user_version=15;
         """
     )
 
@@ -259,6 +275,44 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 )
                 db.execute("PRAGMA user_version=14")
                 version = 14
+            if version < 15:
+                # Queues (pool/priority/pause), schedule linkage, and the
+                # schedule/pool tables.
+                _add_missing(
+                    db,
+                    "jobs",
+                    {
+                        "pool": "TEXT",
+                        "priority": "INTEGER NOT NULL DEFAULT 0",
+                        "paused": "INTEGER NOT NULL DEFAULT 0",
+                        "schedule_id": "TEXT",
+                    },
+                )
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pools (
+                      pool TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 0,
+                      paused INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schedules (
+                      schedule_id TEXT PRIMARY KEY, name TEXT, cron TEXT, interval_seconds INTEGER,
+                      timezone TEXT NOT NULL DEFAULT 'UTC', command TEXT NOT NULL, cwd TEXT, env_json TEXT,
+                      timeout_seconds INTEGER, tags_json TEXT, notes TEXT, secret_env_json TEXT,
+                      overlap TEXT NOT NULL DEFAULT 'skip', enabled INTEGER NOT NULL DEFAULT 1,
+                      next_fire_at TEXT, last_fired_at TEXT, fire_count INTEGER NOT NULL DEFAULT 0,
+                      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_fire_at)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON jobs(schedule_id)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pool_status ON jobs(pool, status)")
+                db.execute("PRAGMA user_version=15")
+                version = 15
             db.commit()
         except Exception:
             db.rollback()

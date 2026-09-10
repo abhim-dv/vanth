@@ -18,11 +18,13 @@ Conventions:
 The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_status_batch`, `job_send`, `job_list`, `job_view`, `job_events`,
 `job_deliveries`, `job_mark_delivery`, `job_retry_delivery`,
-`job_delivery_attempts`, `job_tail`, `job_wait`, `job_stop`, `job_doctor`,
-`job_cleanup`, `job_metrics_query`, `job_metric_compare`, `job_duration_stats`, `job_run_summary`,
+`job_delivery_attempts`, `job_tail`, `job_wait`, `job_stop`, `job_pause`,
+`job_resume`, `job_doctor`, `job_cleanup`, `job_metrics_query`,
+`job_metric_compare`, `job_duration_stats`, `job_run_summary`,
 `job_artifact_add`, `job_artifacts`, `job_dashboard`, `job_metric_ingest`,
-`job_artifact_read`, `job_add_wake_target`, `job_wake_now`,
-`job_cleanup_preview`. The wake tools (`job_add_wake_target` / `job_wake_now` /
+`job_artifact_read`, `job_add_wake_target`, `job_wake_now`, `job_cleanup_preview`,
+`pool_configure`, `pool_list`, `schedule_create`, `schedule_list`,
+`schedule_update`, `schedule_delete`, `schedule_next`. The wake tools (`job_add_wake_target` / `job_wake_now` /
 `daemon_wake`) and their `daemon_wake` / `job_wake_now` / `job_add_wake_target`
 Python counterparts, plus `job_wait` `return_progress` and `job_tail` `follow` /
 `timeout_seconds`, are documented below. The MCP tools are registered under
@@ -458,6 +460,66 @@ The resulting `cancelled` event carries `data: {"actor": "tool", "reason": ...}`
 MCP call), `user` (the `vanth stop` CLI / human HTTP call), `watchdog`
 (recovery or heartbeat reconciliation), and `timeout` (the runner's timeout).
 Use `vanth stop <id> --reason "..."` for the user-facing equivalent.
+
+---
+
+## `job_pause` / `job_resume`
+
+Hold or release a **queued** job (pool- or trigger-gated) so the dispatcher
+skips it. Only a job whose status is `queued` can be paused/resumed; a running
+or terminal job returns an error.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `job_id` | `string` | required | The queued job |
+
+Response: `{ "result": "ok", "job_id": "...", "paused": true|false }`.
+
+---
+
+## `pool_configure` / `pool_list`
+
+`pool_configure(pool, max_parallel=0, paused=None)` upserts a concurrency pool.
+`max_parallel` `0` means unlimited; `paused` holds every queued job in the pool
+(omit to leave it unchanged). `pool_list()` returns each pool with its
+`queued` and `running` counts.
+
+```json
+{ "pools": [ { "pool": "gpu", "max_parallel": 1, "paused": false, "queued": 3, "running": 1 } ] }
+```
+
+---
+
+## `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete` / `schedule_next`
+
+A schedule launches a fresh job per fire. Pass **exactly one** of `cron` or
+`interval_seconds`.
+
+`schedule_create` parameters:
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `command` | `string` | required | Job command |
+| `cron` | `string?` | `None` | 5-field cron or an `@daily`-style macro |
+| `interval_seconds` | `int?` | `None` | Fixed interval |
+| `name` | `string?` | `None` | Label (also the job name) |
+| `timezone_name` | `string` | `UTC` | IANA name for cron matching |
+| `cwd` | `string?` | `None` | Job working directory |
+| `env` | `map?` | `None` | Job env |
+| `timeout_seconds` | `int?` | `None` | Per-run timeout |
+| `tags` | `string[]?` | `None` | Job tags (`scheduled` is added) |
+| `notes` | `string?` | `None` | Job notes |
+| `secret_env` | `string[]?` | `None` | Masked env values (see `job_start`) |
+| `overlap` | `string` | `skip` | `skip` (hold while a run is active) or `allow` |
+| `enabled` | `bool` | `true` | `false` parks the schedule |
+
+The response is the schedule object: `schedule_id`, `next_fire_at` (UTC),
+`last_fired_at`, `fire_count`, `enabled`, and the template fields.
+
+`schedule_update(schedule_id, changes={...})` edits any of the above in place
+and recomputes `next_fire_at`. `schedule_delete(schedule_id)` removes the
+schedule (already-created jobs are untouched). `schedule_next(schedule_id,
+count=5)` previews the next fire times.
 
 ---
 

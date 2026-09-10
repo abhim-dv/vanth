@@ -432,6 +432,11 @@ events.
 | `job_retry_delivery` | Requeue a failed delivery for dispatch |
 | `job_delivery_attempts` | Attempt/lease history for one delivery |
 | `job_stop` | Stop a running job (terminate process tree) |
+| `job_pause` / `job_resume` | Hold / release a queued (pool or trigger) job |
+| `pool_configure` / `pool_list` | Per-pool `max_parallel` + pause state, and live queue depths |
+| `schedule_create` | Create a cron or interval schedule that launches a job per fire |
+| `schedule_list` / `schedule_update` / `schedule_delete` | Manage schedules in place |
+| `schedule_next` | Preview a schedule's next N fire times |
 | `job_doctor` | Daemon health, schema, tables, binary availability |
 | `job_cleanup` | Dry-run or real removal of old terminal jobs |
 | `daemon_wake` | Schedule a self-resume wake target — full target dict or `events`/`type`/`...config` shorthand (Python API) |
@@ -682,6 +687,63 @@ job_dashboard(job_ids=["job_..."], limit=5000)
 Returns the job list plus every stored metric series, downsampled to `limit`
 points per series — the same data the Go terminal monitor charts, exposed over
 HTTP/MCP so any client (a future web/cloud dashboard) can render it.
+
+---
+
+## Schedules and queues
+
+Vanth has no external scheduler process: the daemon's existing 0.2s maintenance
+loop fires schedules and launches queued jobs, and everything lives in
+`jobs.sqlite`.
+
+### Schedules (cron or interval)
+
+A schedule launches a **fresh job per fire** (optionally masked with
+`secret_env`, tagged `scheduled`, and linked by `job_status`'s `schedule_id`):
+
+```text
+schedule_create(name="nightly backup", command="backup.sh",
+                cron="0 3 * * *", timezone_name="America/New_York",
+                overlap="skip")          # cron: 5 fields or @daily/@hourly/...
+schedule_create(name="poll", command="poll.sh", interval_seconds=300)
+schedule_next(schedule_id="sched_...", count=5)   # preview fire times
+schedule_update(schedule_id="sched_...", changes={"cron": "0 4 * * *"})
+schedule_update(schedule_id="sched_...", changes={"enabled": False})  # pause
+schedule_list()
+schedule_delete(schedule_id="sched_...")
+```
+
+- **Cron** is 5-field (`minute hour day-of-month month day-of-week`), numeric
+  values with `*`, ranges (`1-5`), lists (`1,13`), and steps (`*/15`), plus the
+  `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly` shorthands.
+- **Timezones** are IANA names, matched against the local wall clock. DST is
+  handled by construction: a nonexistent local time (spring forward) is skipped;
+  an ambiguous one (fall back) matches once per UTC minute that maps to it.
+  UTC needs no timezone database; named zones use the OS database on Linux/macOS
+  and the bundled `tzdata` package on Windows.
+- **`overlap`**: `skip` (default) holds a fire while a job from the same
+  schedule is still active; `allow` always launches.
+- Missed fires while the daemon was down are **not** backfilled — the schedule
+  resumes at the next future match (the dead-man's-switch policy already alerts
+  on missed runs).
+
+### Queues: pools, priority, pause
+
+Start a job into a named pool instead of launching it immediately:
+
+```text
+pool_configure(pool="gpu", max_parallel=1)     # 0 = unlimited
+pool_list()                                    # queued/running per pool
+job_start(command="train.py", pool="gpu", priority=5)
+job_pause(job_id="job_...")                    # hold a queued job
+job_resume(job_id="job_...")
+pool_configure(pool="gpu", paused=True)        # hold the whole pool
+```
+
+Queued jobs (pool, trigger, or both) launch from the one dispatcher ordered by
+`priority` (higher first), oldest first, once the trigger is satisfied, the pool
+is not paused and is under `max_parallel`, and the global `VANTH_MAX_RUNNING_JOBS`
+quota allows. Pausing affects queued jobs only; running jobs are untouched.
 
 ---
 
@@ -1036,6 +1098,13 @@ Authenticated with `Authorization: Bearer <token>`.
 | GET | `/jobs/{id}/tail` | Log tail (`stream`, `max_bytes`, `offset`) |
 | POST | `/jobs/{id}/wait` | Wait for an event |
 | POST | `/jobs/{id}/stop` | Stop a job |
+| POST | `/jobs/{id}/pause` / `/resume` | Hold / release a queued job |
+| GET | `/schedules` | List schedules |
+| POST | `/schedules` | Create a schedule |
+| POST | `/schedules/{id}/update` / `/delete` | Edit in place / delete |
+| GET | `/schedules/{id}/next` | Next fire times (`count`) |
+| GET | `/pools` | List pools with queue depths |
+| POST | `/pools` | Configure a pool (`pool`, `max_parallel`, `paused`) |
 | GET | `/view` | Agent view (`thread_id`, `limit`) |
 | GET | `/deliveries` | Deliveries (`job_id`, `status`, `limit`) |
 | GET | `/deliveries/{id}/attempts` | Attempt history |
