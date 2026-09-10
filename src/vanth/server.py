@@ -1199,12 +1199,9 @@ class JobManager:
                 for parent in parents:
                     status_row = self.db.execute("SELECT status FROM jobs WHERE job_id=?", (parent,)).fetchone()
                     parents[parent] = status_row["status"] if status_row else None
-                pool_rows = {
-                    r["pool"]: r for r in self.db.execute("SELECT pool, max_parallel, paused FROM pools").fetchall()
-                }
 
             to_cancel: list[tuple[str, str, str]] = []
-            to_launch: list[tuple[str, str | None, int]] = []
+            to_launch: list[tuple[str, str | None]] = []
             for row in rows:
                 job_id = row["job_id"]
                 trigger = triggers.get(job_id)
@@ -1220,25 +1217,19 @@ class JobManager:
                         continue  # trigger has not fired yet
                 if row["paused"]:
                     continue  # held; capacity/pause are enforced again at claim
-                pool = row["pool"]
-                max_parallel = 0
-                if pool:
-                    info = pool_rows.get(pool)
-                    if info is not None:
-                        if info["paused"]:
-                            continue
-                        max_parallel = int(info["max_parallel"])
-                to_launch.append((job_id, pool, max_parallel))
+                to_launch.append((job_id, row["pool"]))
 
-            for job_id, pool, max_parallel in to_launch:
-                # Capacity + claim are enforced in ONE guarded UPDATE so a
-                # concurrent direct start() or dispatcher can never slip past
-                # the global/pool cap (see _launch_queued_if_capacity).
-                self._launch_queued_if_capacity(job_id, pool=pool, max_parallel=max_parallel)
+            for job_id, pool in to_launch:
+                # Capacity, current pool pause/max, and the claim are one guarded
+                # UPDATE (see _launch_queued_if_capacity), so a concurrent direct
+                # start(), dispatcher, or pool reconfiguration cannot slip past.
+                self._launch_queued_if_capacity(job_id, pool=pool)
             for job_id, parent, status in to_cancel:
                 with self.db_lock:
                     changed = self.db.execute(
-                        "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
+                        "UPDATE jobs SET status='cancelled', stop_actor='daemon', "
+                        "stop_reason='trigger parent reached an incompatible terminal status', "
+                        "ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
                         (now_iso(), now_iso(), job_id),
                     ).rowcount
                     self.db.commit()
@@ -1247,32 +1238,40 @@ class JobManager:
                         job_id,
                         "cancelled",
                         message=f"Trigger parent {parent} reached a different terminal status than {status}",
-                        data={"trigger": {"job_id": parent, "status": status}, "parent_status": parents.get(parent)},
+                        data={"actor": "daemon", "reason": "trigger parent reached an incompatible terminal status",
+                              "trigger": {"job_id": parent, "status": status}, "parent_status": parents.get(parent)},
                     )
         except Exception:
             self.logger.exception("queued-job dispatch failed")
 
-    def _launch_queued_if_capacity(self, job_id: str, *, pool: str | None, max_parallel: int) -> bool:
+    def _launch_queued_if_capacity(self, job_id: str, *, pool: str | None) -> bool:
         """Atomically enforce the global/pool cap and claim a queued job.
 
-        The running-count checks are subqueries INSIDE the guarded UPDATE, so
-        the read and the claim are one SQLite statement under the write lock —
-        a concurrent direct ``start()`` or another dispatcher cannot slip a job
-        in past either cap between the count and the claim (review rc37 P1
-        parity, extended to pools). Also re-checks ``paused``/``policy_disabled``
-        so a job paused after the snapshot is never launched.
+        Every gate is a subquery INSIDE the guarded UPDATE, so the read and the
+        claim are one SQLite statement under the write lock: a concurrent direct
+        ``start()``, another dispatcher, or a pool reconfiguration/pause cannot
+        slip a job in past a cap between the check and the claim (review rc37
+        P1 parity, extended to pools). The job's own ``paused``/``policy_disabled``
+        and the pool's CURRENT ``paused``/``max_parallel`` are all re-read here.
         """
         token = "claim_" + uuid.uuid4().hex[:16]
 
         def claim() -> int:
             with self.db_lock:
-                if pool and max_parallel > 0:
+                if pool:
                     changed = self.db.execute(
                         "UPDATE jobs SET status='launching', claim_token=?, updated_at=? "
                         "WHERE job_id=? AND status='queued' AND paused=0 AND policy_disabled=0 "
                         "AND (? = 0 OR (SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')) < ?) "
-                        "AND (SELECT COUNT(*) FROM jobs WHERE pool=? AND status IN ('running','launching')) < ?",
-                        (token, now_iso(), job_id, self.max_running_jobs, self.max_running_jobs, pool, max_parallel),
+                        "AND COALESCE((SELECT paused FROM pools WHERE pool=?), 0) = 0 "
+                        "AND (COALESCE((SELECT max_parallel FROM pools WHERE pool=?), 0) = 0 "
+                        "     OR (SELECT COUNT(*) FROM jobs WHERE pool=? AND status IN ('running','launching')) "
+                        "        < (SELECT max_parallel FROM pools WHERE pool=?))",
+                        (
+                            token, now_iso(), job_id,
+                            self.max_running_jobs, self.max_running_jobs,
+                            pool, pool, pool, pool,
+                        ),
                     ).rowcount
                 else:
                     changed = self.db.execute(
@@ -1505,8 +1504,28 @@ class JobManager:
 
     def _fire_schedule(self, row: sqlite3.Row) -> None:
         schedule_id = row["schedule_id"]
+        due_at = row["next_fire_at"]
         fired_at = now_iso()
         now_dt = _parse_iso(fired_at) or datetime.now(timezone.utc)
+        try:
+            next_at = self._iso_utc(
+                compute_next_fire(
+                    cron=row["cron"],
+                    interval_seconds=row["interval_seconds"],
+                    timezone_name=row["timezone"],
+                    after=now_dt,
+                )
+            )
+        except ValueError:
+            self.logger.exception("schedule %s has no next fire; disabling it", schedule_id)
+            with self.db_lock:
+                self.db.execute(
+                    "UPDATE schedules SET enabled=0, next_fire_at=NULL, updated_at=? WHERE schedule_id=?",
+                    (fired_at, schedule_id),
+                )
+                self.db.commit()
+            return
+        skip = False
         if row["overlap"] != "allow":
             with self.db_lock:
                 active = self.db.execute(
@@ -1514,10 +1533,35 @@ class JobManager:
                     "('completed','failed','timeout','cancelled','orphaned') LIMIT 1",
                     (schedule_id,),
                 ).fetchone()
-            if active:
-                self.logger.warning("schedule %s fire skipped: previous run is still active", schedule_id)
-                self._advance_schedule(schedule_id, row, now_dt, fired_at, fired=False)
-                return
+            skip = active is not None
+
+        # Atomically CLAIM the occurrence before acting: the guarded UPDATE
+        # advances next_fire_at only while it still equals the value we read, so
+        # a second daemon firing the same due row claims zero rows and returns.
+        # A fire is therefore at-most-once across managers (a genuinely missed
+        # run is surfaced by the dead-man's switch).
+        def claim() -> int:
+            with self.db_lock:
+                if skip:
+                    changed = self.db.execute(
+                        "UPDATE schedules SET next_fire_at=?, updated_at=? "
+                        "WHERE schedule_id=? AND enabled=1 AND next_fire_at=?",
+                        (next_at, fired_at, schedule_id, due_at),
+                    ).rowcount
+                else:
+                    changed = self.db.execute(
+                        "UPDATE schedules SET last_fired_at=?, next_fire_at=?, fire_count=fire_count+1, updated_at=? "
+                        "WHERE schedule_id=? AND enabled=1 AND next_fire_at=?",
+                        (fired_at, next_at, fired_at, schedule_id, due_at),
+                    ).rowcount
+                self.db.commit()
+                return changed
+
+        if not self._retry_locked(claim):
+            return  # another manager already claimed this fire
+        if skip:
+            self.logger.warning("schedule %s fire skipped: previous run is still active", schedule_id)
+            return
         tags = json.loads(row["tags_json"] or "[]")
         if "scheduled" not in tags:
             tags.append("scheduled")
@@ -1538,36 +1582,6 @@ class JobManager:
             self.logger.info("schedule %s fired job %s", schedule_id, result.get("job_id"))
         except Exception:
             self.logger.exception("schedule %s failed to launch a job", schedule_id)
-        self._advance_schedule(schedule_id, row, now_dt, fired_at, fired=True)
-
-    def _advance_schedule(self, schedule_id: str, row: sqlite3.Row, after: datetime, fired_at: str, *, fired: bool) -> None:
-        try:
-            nxt = self._iso_utc(
-                compute_next_fire(
-                    cron=row["cron"],
-                    interval_seconds=row["interval_seconds"],
-                    timezone_name=row["timezone"],
-                    after=after,
-                )
-            )
-        except ValueError:
-            self.logger.exception("schedule %s has no next fire; disabling it", schedule_id)
-            with self.db_lock:
-                self.db.execute("UPDATE schedules SET enabled=0, next_fire_at=NULL, updated_at=? WHERE schedule_id=?", (fired_at, schedule_id))
-                self.db.commit()
-            return
-        with self.db_lock:
-            if fired:
-                self.db.execute(
-                    "UPDATE schedules SET last_fired_at=?, next_fire_at=?, fire_count=fire_count+1, updated_at=? WHERE schedule_id=?",
-                    (fired_at, nxt, fired_at, schedule_id),
-                )
-            else:
-                self.db.execute(
-                    "UPDATE schedules SET next_fire_at=?, updated_at=? WHERE schedule_id=?",
-                    (nxt, fired_at, schedule_id),
-                )
-            self.db.commit()
 
     def pool_configure(self, pool: str, *, max_parallel: int = 0, paused: bool | None = None) -> dict[str, Any]:
         """Create/update a pool's concurrency cap and paused flag."""
@@ -5010,8 +5024,9 @@ class JobManager:
         if row and row["status"] == "queued":
             with self.db_lock:
                 changed = self.db.execute(
-                    "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
-                    (now_iso(), now_iso(), job_id),
+                    "UPDATE jobs SET status='cancelled', stop_actor=?, stop_reason=?, ended_at=?, updated_at=? "
+                    "WHERE job_id=? AND status='queued'",
+                    (actor, reason, now_iso(), now_iso(), job_id),
                 ).rowcount
                 self.db.commit()
             if changed:
@@ -5366,10 +5381,10 @@ def job_start(
     Configure pools with ``pool_configure`` and hold/release a queued job with
     ``job_pause`` / ``job_resume``.
 
-    ``secret_env`` names environment variables whose values must be masked
-    (``***``) in captured stdout/stderr and structured events — the GitHub
-    ``::add-mask::`` pattern. Only names are stored; values are resolved and
-    scrubbed by the runner and never rewritten to disk. Local jobs only.
+    ``secret_env`` names env vars whose values are masked (``***``) in captured
+    stdout/stderr and structured events — the GitHub ``::add-mask::`` pattern.
+    The value is still kept in the job's own env in the owner-only database, as
+    with any env var; masking protects emitted output. Local jobs only.
 
     ``trigger`` optionally gates launch on another job: pass
     ``{"job_id": "A", "status": "completed"}`` to start this job only once job
@@ -5637,7 +5652,7 @@ def schedule_create(command: str, cron: str | None = None, interval_seconds: int
     """Create a schedule that launches a fresh job per fire.
 
     Pass exactly one of ``cron`` (5-field, or ``@daily`` etc.) or
-    ``interval_seconds``. ``overlap`` is ``skip`` (default; hold the fire while
+    ``interval_seconds``. ``overlap`` is ``skip`` (default; skip the fire while
     the previous run is active) or ``allow``.
     """
     return get_client().post("/schedules", {

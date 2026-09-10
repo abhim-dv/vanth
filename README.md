@@ -581,11 +581,14 @@ HTTP call), `watchdog` (recovery / heartbeat reconciliation), and `timeout`
 job_start(command="python train.py", env={"HF_TOKEN": "hf_..."}, secret_env=["HF_TOKEN"])
 ```
 
-Every value named in `secret_env` is replaced with `***` in the job's captured
-stdout/stderr logs and in structured events (the GitHub Actions `::add-mask::`
-pattern), so a declared secret never reaches durable state or the monitor. Only
-the env var *names* are stored; values are resolved and scrubbed by the runner.
-Masking applies to local jobs (remote jobs ignore `secret_env`).
+Every value named in `secret_env` is replaced with `***` before it is written to
+the job's captured stdout/stderr logs or parsed into structured events (the
+GitHub Actions `::add-mask::` pattern), so masked output never leaks through
+logs, events, deliveries, or the monitor. Note this protects *emitted output*:
+as with any `env` value, a declared secret is still stored in the job's
+environment in the owner-only `jobs.sqlite` (the single-user state directory is
+protected by owner-only permissions). Masking applies to local jobs (remote jobs
+ignore `secret_env`).
 
 ### job_mark_delivery / job_retry_delivery — manual delivery control
 
@@ -721,8 +724,8 @@ schedule_delete(schedule_id="sched_...")
   an ambiguous one (fall back) matches once per UTC minute that maps to it.
   UTC needs no timezone database; named zones use the OS database on Linux/macOS
   and the bundled `tzdata` package on Windows.
-- **`overlap`**: `skip` (default) holds a fire while a job from the same
-  schedule is still active; `allow` always launches.
+- **`overlap`**: `skip` (default) skips the fire (advancing to the next) while a
+  job from the same schedule is still active; `allow` always launches.
 - Missed fires while the daemon was down are **not** backfilled — the schedule
   resumes at the next future match (the dead-man's-switch policy already alerts
   on missed runs).

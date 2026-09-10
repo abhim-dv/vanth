@@ -510,7 +510,7 @@ A schedule launches a fresh job per fire. Pass **exactly one** of `cron` or
 | `tags` | `string[]?` | `None` | Job tags (`scheduled` is added) |
 | `notes` | `string?` | `None` | Job notes |
 | `secret_env` | `string[]?` | `None` | Masked env values (see `job_start`) |
-| `overlap` | `string` | `skip` | `skip` (hold while a run is active) or `allow` |
+| `overlap` | `string` | `skip` | `skip` (skip the fire while a run is active) or `allow` |
 | `enabled` | `bool` | `true` | `false` parks the schedule |
 
 The response is the schedule object: `schedule_id`, `next_fire_at` (UTC),
@@ -542,7 +542,7 @@ None.
   "delivery_counts": {"pending": 0, "delivered": 3},
   "codex": {"command": "codex", "available": true},
   "opencode": {"command": "opencode", "available": true},
-  "schema_version": 14,
+  "schema_version": 15,
   "quick_check": "ok",
   "maintenance_alive": true,
   "stale_delivery_leases": 0,

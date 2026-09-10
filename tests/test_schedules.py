@@ -165,6 +165,38 @@ def test_scheduled_job_masks_declared_secret(tmp_path):
         manager.close()
 
 
+def test_schedule_fires_once_under_concurrent_dispatch(tmp_path):
+    """Two managers firing the same due schedule must produce one job."""
+    import threading
+
+    home = tmp_path / "state"
+    m1 = JobManager(home, recover=False)
+    m2 = JobManager(home, recover=False)
+    try:
+        schedule = m1.create_schedule(cmd("print('once')"), interval_seconds=60)
+        _force_due(m1, schedule["schedule_id"])
+        barrier = threading.Barrier(2)
+
+        def fire(manager):
+            barrier.wait()
+            manager._fire_due_schedules()
+
+        threads = [threading.Thread(target=fire, args=(m,)) for m in (m1, m2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert m1.get_schedule(schedule["schedule_id"])["fire_count"] == 1
+        created = m1.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE schedule_id=?", (schedule["schedule_id"],)
+        ).fetchone()[0]
+        assert created == 1, f"expected one fired job, got {created}"
+    finally:
+        m1.close()
+        m2.close()
+
+
 def test_schedule_overlap_skip_holds_while_running(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:

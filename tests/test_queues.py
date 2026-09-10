@@ -122,6 +122,25 @@ def test_global_quota_limits_queued_dispatch(tmp_path, monkeypatch):
         manager.close()
 
 
+def test_queued_stop_persists_attribution(tmp_path):
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        parent = asyncio.run(manager.start(cmd(SLEEP)))
+        child = asyncio.run(manager.start(
+            cmd("print('x')"),
+            trigger={"job_id": parent["job_id"], "status": "completed"},
+        ))
+        assert child["status"] == "queued"
+        manager.stop_sync(child["job_id"], actor="user", reason="changed plan")
+        status = manager.status(child["job_id"])
+        assert status["status"] == "cancelled"
+        assert status["stop_actor"] == "user"
+        assert status["stop_reason"] == "changed plan"
+        manager.stop_sync(parent["job_id"])
+    finally:
+        manager.close()
+
+
 def test_paused_trigger_job_is_still_cancelled(tmp_path):
     """A held job whose trigger parent ends incompatibly must not linger."""
     manager = JobManager(tmp_path, recover=False)

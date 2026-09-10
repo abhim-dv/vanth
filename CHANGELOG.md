@@ -2,7 +2,7 @@
 
 All notable changes to Vanth are documented here.
 
-## Unreleased / next (1.7.x)
+## 1.7.0 - 2026-09-10
 
 ### Kill attribution + declared-secret masking (schema v14)
 
@@ -11,14 +11,17 @@ All notable changes to Vanth are documented here.
   carries `data: {"actor": ..., "reason": ...}`. Actors: `tool` (MCP call),
   `user` (CLI/human), `watchdog` (recovery / heartbeat reconciliation), and
   `timeout` (runner timeout). `job_status` exposes both fields.
-- **Declared secrets never reach durable state.** `job_start(secret_env=[...])`
+- **Declared secrets are masked in captured output.** `job_start(secret_env=[...])`
   names env vars whose values are replaced with `***` in captured stdout/stderr
   and structured events before they are written — the GitHub `::add-mask::`
-  pattern. `job_rerun` preserves the declaration; masking is local-only for
+  pattern — so they never appear in logs, events, deliveries, or the monitor.
+  The job's `env` (like any env var) is still stored in the owner-only
+  `jobs.sqlite`; masking protects emitted output, not the environment
+  definition. `job_rerun` preserves the declaration; masking is local-only for
   remote jobs.
 - **Schema v14** adds `jobs.stop_actor`, `jobs.stop_reason`, and
-  `jobs.secret_env_json`; the Go conformance fixture and
-  `internal/state.LatestSchemaVersion` move to 14.
+  `jobs.secret_env_json` (the Go conformance fixture and
+  `internal/state.LatestSchemaVersion` moved to 14 here, then to 15 below).
 
 ### Duration + flakiness analytics
 
@@ -55,7 +58,7 @@ All notable changes to Vanth are documented here.
   and `internal/state.LatestSchemaVersion` move to 15. A Windows-only `tzdata`
   dependency backs named schedule timezones.
 
-Full suite: 740 passed, 6 skipped; `go test ./...` green.
+Full suite: 742 passed, 6 skipped; `go test ./...` green.
 
 ## 1.6.0 - 2026-09-10
 
