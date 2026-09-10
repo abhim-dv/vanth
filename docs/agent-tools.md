@@ -52,6 +52,7 @@ client or daemon restarts.
 | `notes` | `string?` | `None` | Free-form annotation shown in the monitor |
 | `interactive` | `bool` | `false` | Open stdin for `job_send` |
 | `trigger` | `object?` | `None` | `{"job_id": A, "status": "completed"}` — start only after A reaches that status |
+| `secret_env` | `string[]?` | `None` | Env var NAMES whose values are masked (`***`) in captured logs/events (local jobs) |
 
 **Response**
 
@@ -440,6 +441,7 @@ Stop a running job by terminating its process tree.
 | `job_id` | `string` | required | Running job to stop |
 | `signal` | `string` | `terminate` | `terminate` (graceful) or `kill` |
 | `kill_after_seconds` | `int` | `10` | 0–86400; escalate to force-kill after this |
+| `reason` | `string?` | `None` | Why the caller stopped it; recorded on the `cancelled` event |
 
 **Response**
 
@@ -450,6 +452,12 @@ Stop a running job by terminating its process tree.
 The job becomes `cancelled` only after the workload tree actually terminated;
 otherwise the stop is retryable (and a `RuntimeError` "Failed to stop workload
 process tree" is returned).
+
+The resulting `cancelled` event carries `data: {"actor": "tool", "reason": ...}`;
+`job_status` also exposes `stop_actor` / `stop_reason`. Actors are `tool` (an
+MCP call), `user` (the `vanth stop` CLI / human HTTP call), `watchdog`
+(recovery or heartbeat reconciliation), and `timeout` (the runner's timeout).
+Use `vanth stop <id> --reason "..."` for the user-facing equivalent.
 
 ---
 
@@ -472,7 +480,7 @@ None.
   "delivery_counts": {"pending": 0, "delivered": 3},
   "codex": {"command": "codex", "available": true},
   "opencode": {"command": "opencode", "available": true},
-  "schema_version": 8,
+  "schema_version": 14,
   "quick_check": "ok",
   "maintenance_alive": true,
   "stale_delivery_leases": 0,

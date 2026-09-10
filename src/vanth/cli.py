@@ -860,10 +860,17 @@ def cmd_stop(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     job_id = argv[0]
     signal = "terminate"
     kill_after = 10
+    reason = None
     i = 1
     while i < len(argv):
         arg = argv[i]
-        if arg == "--signal":
+        if arg == "--reason":
+            i += 1
+            if i >= len(argv):
+                print("vanth stop: --reason requires a value", file=sys.stderr)
+                return 2
+            reason = argv[i]
+        elif arg == "--signal":
             i += 1
             if i >= len(argv):
                 print("vanth stop: --signal requires a value", file=sys.stderr)
@@ -890,7 +897,10 @@ def cmd_stop(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     client = VanthClient(home=home)
     try:
         client.ensure()
-        result = client.post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after})
+        result = client.post(
+            f"/jobs/{job_id}/stop",
+            {"signal": signal, "kill_after_seconds": kill_after, "actor": "user", "reason": reason},
+        )
     except Exception as exc:
         print(f"vanth stop: failed to reach daemon: {exc}", file=sys.stderr)
         return 1

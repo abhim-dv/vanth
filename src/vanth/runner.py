@@ -166,6 +166,14 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
         claim_token = spec.get("claim_token")
         env = os.environ.copy()
         env.update(spec.get("env") or {})
+        # Declared-secret env values are scrubbed from captured stdout/stderr and
+        # structured events (review #9). Resolve them from the job's merged
+        # environment; only names are persisted, never the values.
+        mask_values = [
+            env[name]
+            for name in (spec.get("secret_env") or [])
+            if isinstance(name, str) and isinstance(env.get(name), str) and env.get(name)
+        ]
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
@@ -198,12 +206,12 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
     manager.reader_threads[job_id] = [
         threading.Thread(
             target=manager._read_stream,
-            args=(job_id, proc.stdout, Path(spec["stdout_path"]), "stdout"),
+            args=(job_id, proc.stdout, Path(spec["stdout_path"]), "stdout", mask_values),
             daemon=True,
         ),
         threading.Thread(
             target=manager._read_stream,
-            args=(job_id, proc.stderr, Path(spec["stderr_path"]), "stderr"),
+            args=(job_id, proc.stderr, Path(spec["stderr_path"]), "stderr", mask_values),
             daemon=True,
         ),
     ]

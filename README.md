@@ -459,6 +459,7 @@ job_start(
   notify_on=["progress","checkpoint","failed","completed"],
   origin_thread_id="019f...",        # the agent thread that launched it
   tags=["training","gpu"],           # optional
+  secret_env=["HF_TOKEN"],           # optional; mask these env values in logs/events
   wake_targets=[...],                # optional, see below
   trigger={"job_id": "job_A", "status": "completed"}  # optional DAG: start after job_A completes
 )
@@ -553,13 +554,32 @@ delivery counts.
 ### job_stop — stop a running job
 
 ```text
-job_stop(job_id="job_...", signal="terminate", kill_after_seconds=10)
+job_stop(job_id="job_...", signal="terminate", kill_after_seconds=10, reason="superseded by run #2")
 ```
 
 Terminates the job's process tree. A graceful `signal` (default `terminate`) is
 sent first; if the job has not exited within `kill_after_seconds`, it is killed.
 The job becomes `cancelled` only after the workload tree actually terminated;
 otherwise it stays `running` and the stop is retryable.
+
+**Kill attribution.** The `cancelled` event carries
+`data={"actor": ..., "reason": ...}` so a stop is never an unattributable
+"killed". Actors are `tool` (an MCP call), `user` (`vanth stop`, or a human
+HTTP call), `watchdog` (recovery / heartbeat reconciliation), and `timeout`
+(the runner's timeout); `job_status` exposes the persisted `stop_actor` /
+`stop_reason`. `vanth stop <id> --reason "..."` sets the user reason.
+
+### secret_env — mask declared secrets in captured output
+
+```text
+job_start(command="python train.py", env={"HF_TOKEN": "hf_..."}, secret_env=["HF_TOKEN"])
+```
+
+Every value named in `secret_env` is replaced with `***` in the job's captured
+stdout/stderr logs and in structured events (the GitHub Actions `::add-mask::`
+pattern), so a declared secret never reaches durable state or the monitor. Only
+the env var *names* are stored; values are resolved and scrubbed by the runner.
+Masking applies to local jobs (remote jobs ignore `secret_env`).
 
 ### job_mark_delivery / job_retry_delivery — manual delivery control
 

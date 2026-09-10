@@ -2,6 +2,26 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased / next (1.7.x)
+
+### Kill attribution + declared-secret masking (schema v14)
+
+- **Stops are attributable.** `job_stop` (and `vanth stop --reason`) persist
+  `stop_actor` / `stop_reason` on the job, and every resulting `cancelled` event
+  carries `data: {"actor": ..., "reason": ...}`. Actors: `tool` (MCP call),
+  `user` (CLI/human), `watchdog` (recovery / heartbeat reconciliation), and
+  `timeout` (runner timeout). `job_status` exposes both fields.
+- **Declared secrets never reach durable state.** `job_start(secret_env=[...])`
+  names env vars whose values are replaced with `***` in captured stdout/stderr
+  and structured events before they are written — the GitHub `::add-mask::`
+  pattern. `job_rerun` preserves the declaration; masking is local-only for
+  remote jobs.
+- **Schema v14** adds `jobs.stop_actor`, `jobs.stop_reason`, and
+  `jobs.secret_env_json`; the Go conformance fixture and
+  `internal/state.LatestSchemaVersion` move to 14.
+
+Full suite: 715 passed, 6 skipped.
+
 ## 1.6.0 - 2026-09-10
 
 ### Windows OpenCode live-delivery fix (rc43)

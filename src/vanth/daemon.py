@@ -653,7 +653,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy", "remote_id", "idempotency_key"}
+                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy", "secret_env", "remote_id", "idempotency_key"}
                 if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)
@@ -670,7 +670,14 @@ class Handler(BaseHTTPRequestHandler):
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:
                     job_id = parsed.path.split("/")[2]
-                    ok(self, _remote_submit(remote_id, "job.rerun", {"job_id": job_id, **payload}))
+                    # secret_env masking is local-only; drop it before the strict
+                    # remote protocol (which rejects unknown fields).
+                    remote_payload = {
+                        key: value
+                        for key, value in payload.items()
+                        if key in {"command", "env", "timeout_seconds", "name", "tags", "notes", "cwd", "interactive", "idempotency_key"}
+                    }
+                    ok(self, _remote_submit(remote_id, "job.rerun", {"job_id": job_id, **remote_payload}))
                 else:
                     ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2], **payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wait"):
@@ -682,7 +689,14 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/stop"):
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:
-                    ok(self, _remote_submit(remote_id, "job.stop", {"job_id": parsed.path.split("/")[2], **payload}))
+                    # actor/reason are local stop attribution; the remote
+                    # protocol accepts only signal/kill_after_seconds.
+                    remote_payload = {
+                        key: value
+                        for key, value in payload.items()
+                        if key in {"signal", "kill_after_seconds", "idempotency_key"}
+                    }
+                    ok(self, _remote_submit(remote_id, "job.stop", {"job_id": parsed.path.split("/")[2], **remote_payload}))
                 else:
                     ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/send"):

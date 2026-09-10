@@ -57,6 +57,50 @@ DEFAULT_MAX_LOG_BYTES = 10 * 1024 * 1024
 _UNSET = object()
 DEFAULT_MAX_ERROR_BYTES = 4096
 TERMINAL_STATUSES = {"completed", "failed", "timeout", "cancelled", "orphaned"}
+# Who requested a stop, carried on the resulting terminal event (review #9).
+# "tool" = an MCP tool call, "user" = the human CLI/API, "watchdog" =
+# recovery/heartbeat reconciliation, "timeout" = the runner's timeout,
+# "policy" = a policy reaction, "remote" = a remote dispatcher.
+STOP_ACTORS = {"user", "tool", "watchdog", "timeout", "daemon", "policy", "remote"}
+DEFAULT_STOP_ACTOR = "user"
+
+
+def stop_event_data(row: Any, *, default_actor: str = "watchdog", default_reason: str | None = None) -> dict[str, Any]:
+    """Build terminal-event ``data`` carrying who/why a run ended.
+
+    Reads the persisted ``stop_actor``/``stop_reason`` from a job row (missing
+    on pre-v14 rows) and falls back to the emitter's defaults, so every
+    ``cancelled``/``orphaned``/``timeout`` event is attributable.
+    """
+    actor = reason = None
+    try:
+        actor = row["stop_actor"]
+        reason = row["stop_reason"]
+    except (KeyError, IndexError):
+        pass
+    return {"actor": actor or default_actor, "reason": reason or default_reason}
+
+
+def mask_secrets(line: bytes, secrets: list[str] | None) -> bytes:
+    """Replace declared-secret values with ``***`` in one captured log line.
+
+    The ``::add-mask::`` pattern: a job names secret env vars, the runner
+    resolves their values from the job's merged environment, and every value is
+    scrubbed from stdout/stderr before it is written to a durable log file or
+    parsed into a structured event. Masking is line-scoped (a value split across
+    two reads would not be fully masked), which matches the convention.
+    """
+    if not secrets:
+        return line
+    for value in secrets:
+        if value:
+            try:
+                needle = value.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
+            if needle:
+                line = line.replace(needle, b"***")
+    return line
 
 
 def validate_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -447,7 +491,10 @@ class JobManager:
             return False
 
     def _recover_jobs(self) -> None:
-        rows = self.db.execute("SELECT job_id, worker_pid, stop_requested_at, claim_token FROM jobs WHERE status='running'").fetchall()
+        rows = self.db.execute(
+            "SELECT job_id, worker_pid, stop_requested_at, stop_actor, stop_reason, claim_token "
+            "FROM jobs WHERE status='running'"
+        ).fetchall()
         for row in rows:
             if self._pid_alive(row["worker_pid"]):
                 continue
@@ -485,13 +532,19 @@ class JobManager:
             else:
                 transitioned = self._transition_terminal(job_id, terminal, worker_pid=row["worker_pid"])
             if transitioned:
-                self._emit(job_id, terminal, message="Job runner was not alive during recovery")
+                self._emit(
+                    job_id,
+                    terminal,
+                    message="Job runner was not alive during recovery",
+                    data=stop_event_data(row, default_actor="watchdog", default_reason="runner not alive during recovery"),
+                )
 
     def _reconcile_running_jobs(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_stale_after)
         cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
         rows = self.db.execute(
-            "SELECT job_id, worker_pid, pid, stop_requested_at, claim_token FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < ?)",
+            "SELECT job_id, worker_pid, pid, stop_requested_at, stop_actor, stop_reason, claim_token "
+            "FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < ?)",
             (cutoff_text,),
         ).fetchall()
         for row in rows:
@@ -525,7 +578,12 @@ class JobManager:
             else:
                 transitioned = self._transition_terminal(job_id, terminal, worker_pid=row["worker_pid"])
             if transitioned:
-                self._emit(job_id, terminal, message="Runner heartbeat is stale and the runner is not alive")
+                self._emit(
+                    job_id,
+                    terminal,
+                    message="Runner heartbeat is stale and the runner is not alive",
+                    data=stop_event_data(row, default_actor="watchdog", default_reason="runner heartbeat stale"),
+                )
 
     def begin_shutdown(self) -> None:
         self.shutdown_requested.set()
@@ -1975,6 +2033,7 @@ class JobManager:
         interactive: bool = False,
         trigger: dict[str, str] | None = None,
         policy: dict[str, Any] | None = None,
+        secret_env: list[str] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         # Thread identity (review P1-4 / P2-2): the LAUNCHING thread is the
@@ -2001,6 +2060,7 @@ class JobManager:
             raise ValueError("timeout_seconds must be an integer >= 1")
         trigger = self._validate_trigger(trigger)
         policy = validate_policy(policy)
+        secret_env = self._validate_secret_env(secret_env)
         queued = trigger is not None
         job_id = "job_" + uuid.uuid4().hex[:12]
         stdout_path = self.logs / f"{job_id}.stdout.log"
@@ -2044,8 +2104,8 @@ class JobManager:
                 """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
                   timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
-                  stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token, secret_env_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -2071,6 +2131,7 @@ class JobManager:
                     json.dumps(trigger, separators=(",", ":")) if trigger else None,
                     json.dumps(policy, separators=(",", ":")) if policy else None,
                     direct_claim_token,
+                    json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
                 ),
             )
             self.db.commit()
@@ -2098,6 +2159,7 @@ class JobManager:
                 "stderr_path": str(stderr_path),
                 "interactive": interactive,
                 "claim_token": direct_claim_token,
+                "secret_env": secret_env or [],
             },
             spec_name=f"{job_id}-{direct_claim_token}.json",
         )
@@ -2119,6 +2181,27 @@ class JobManager:
         if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
             raise ValueError(f"Unknown trigger job_id: {job_id}")
         return {"job_id": job_id, "status": status}
+
+    @staticmethod
+    def _validate_secret_env(secret_env: list[str] | None) -> list[str]:
+        """Validate the declared-secret env NAMES whose values are masked.
+
+        Only environment variable names are accepted (never literal secret
+        values). The runner resolves each name in the job's merged environment
+        and replaces the value with ``***`` in captured logs and structured
+        events, so a job can never leak a declared secret into durable state.
+        """
+        if secret_env is None:
+            return []
+        if not isinstance(secret_env, list):
+            raise ValueError("secret_env must be a list of environment variable names")
+        names: list[str] = []
+        for name in secret_env:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("secret_env entries must be non-empty strings")
+            if name not in names:
+                names.append(name)
+        return names
 
     def _write_spec(self, job_id: str, spec: dict[str, Any], *, spec_name: str | None = None) -> Path:
         """Write a job's run spec JSON and return its path.
@@ -2737,11 +2820,12 @@ class JobManager:
         notes: str | None = None,
         cwd: str | None = None,
         interactive: bool | None = None,
+        secret_env: list[str] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         row = self._row(
             "SELECT job_id, command, cwd, env_json, timeout_seconds, notify_on, origin_thread_id, wake_thread_id, "
-            "tags_json, name, notes, run_json, policy_json FROM jobs WHERE job_id=?",
+            "tags_json, name, notes, run_json, policy_json, secret_env_json FROM jobs WHERE job_id=?",
             (job_id,),
         )
         if not row:
@@ -2785,6 +2869,7 @@ class JobManager:
             notes=notes if notes is not None else row["notes"],
             interactive=stored_interactive if not isinstance(interactive, bool) else interactive,
             policy=json.loads(row["policy_json"] or "null"),
+            secret_env=secret_env if secret_env is not None else (json.loads(row["secret_env_json"] or "null") or None),
         ))
         if prior_state and json.loads(row["policy_json"] or "null"):
             # Carry ONLY the failure streak: reacted_* dedup markers belong to
@@ -2801,7 +2886,11 @@ class JobManager:
     ) -> None:
         proc.wait()
         try:
-            row = self._row("SELECT status, pid, worker_pid, stop_requested_at, claim_token FROM jobs WHERE job_id=?", (job_id,))
+            row = self._row(
+                "SELECT status, pid, worker_pid, stop_requested_at, stop_actor, stop_reason, claim_token "
+                "FROM jobs WHERE job_id=?",
+                (job_id,),
+            )
             if not row:
                 return
             if claim_token and row["status"] == "launching" and row["claim_token"] == claim_token:
@@ -2861,7 +2950,12 @@ class JobManager:
                     return
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
             if self._transition_terminal(job_id, terminal, claim_token=claim_token):
-                self._emit(job_id, terminal, message="Job runner exited before recording a terminal status")
+                self._emit(
+                    job_id,
+                    terminal,
+                    message="Job runner exited before recording a terminal status",
+                    data=stop_event_data(row, default_actor="watchdog", default_reason="runner exited before terminal status"),
+                )
         except (sqlite3.Error, RuntimeError):
             return
 
@@ -2898,6 +2992,7 @@ class JobManager:
         stream,
         path: Path,
         source: str,
+        mask_values: list[str] | None = None,
     ) -> None:
         if stream is None:
             return
@@ -2905,6 +3000,11 @@ class JobManager:
         written = path.stat().st_size if path.exists() else 0
         with path.open("ab") as f:
             while line := stream.readline(self.max_event_line_bytes + 1):
+                # Scrub declared-secret values BEFORE anything durable happens:
+                # the masked bytes are what reach the log file and the parsed
+                # AGENT_EVENT payload (review #9).
+                if mask_values:
+                    line = mask_secrets(line, mask_values)
                 if written < max_bytes:
                     chunk = line[: max_bytes - written]
                     f.write(chunk)
@@ -3018,11 +3118,15 @@ class JobManager:
         return not self._pid_alive(pid)
 
     def _finish(self, job_id: str, status: str, exit_code: int | None = None, *, claim_token: str | None = None) -> None:
-        row = self._row("SELECT stop_requested_at FROM jobs WHERE job_id=?", (job_id,))
+        row = self._row("SELECT stop_requested_at, stop_actor, stop_reason, timeout_seconds FROM jobs WHERE job_id=?", (job_id,))
         if row and row["stop_requested_at"]:
             status = "cancelled"
         if self._transition_terminal(job_id, status, exit_code, claim_token=claim_token):
-            data = {"exit_code": exit_code} if exit_code is not None else {}
+            data: dict[str, Any] = {"exit_code": exit_code} if exit_code is not None else {}
+            if status == "cancelled":
+                data.update(stop_event_data(row or {}, default_actor="user", default_reason="stop requested"))
+            elif status == "timeout":
+                data.update({"actor": "timeout", "reason": f"exceeded timeout of {row['timeout_seconds']}s" if row and row["timeout_seconds"] else "exceeded configured timeout"})
             self._emit(job_id, status, data=data)
         self.processes.pop(job_id, None)
 
@@ -3184,6 +3288,9 @@ class JobManager:
             "run": json.loads(row["run_json"] or "{}"),
             "trigger": json.loads(row["trigger_json"] or "null"),
             "policy": json.loads(row["policy_json"] or "null"),
+            "secret_env": json.loads(row["secret_env_json"] or "[]"),
+            "stop_actor": row["stop_actor"],
+            "stop_reason": row["stop_reason"],
             "runtime_seconds": _runtime_seconds(row["started_at"], row["ended_at"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -4186,15 +4293,46 @@ class JobManager:
                     self.db.execute("DELETE FROM cleanup_tombstones WHERE tombstone_id=?", (tombstone["tombstone_id"],))
                     self.db.commit()
 
-    async def stop(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
-        return await asyncio.get_running_loop().run_in_executor(None, self.stop_sync, job_id, signal, kill_after_seconds)
+    async def stop(
+        self,
+        job_id: str,
+        signal: str = "terminate",
+        kill_after_seconds: int = 10,
+        actor: str = DEFAULT_STOP_ACTOR,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.get_running_loop().run_in_executor(
+            None, self.stop_sync, job_id, signal, kill_after_seconds, actor, reason
+        )
 
-    def stop_sync(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
-        return self._stop(job_id, signal, kill_after_seconds)
+    def stop_sync(
+        self,
+        job_id: str,
+        signal: str = "terminate",
+        kill_after_seconds: int = 10,
+        actor: str = DEFAULT_STOP_ACTOR,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return self._stop(job_id, signal, kill_after_seconds, actor, reason)
 
-    def _stop(self, job_id: str, signal: str = "terminate", kill_after_seconds: int = 10) -> dict[str, Any]:
+    def _stop(
+        self,
+        job_id: str,
+        signal: str = "terminate",
+        kill_after_seconds: int = 10,
+        actor: str = DEFAULT_STOP_ACTOR,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
         if isinstance(kill_after_seconds, bool) or not isinstance(kill_after_seconds, int) or kill_after_seconds < 0 or kill_after_seconds > 86400:
             raise ValueError("kill_after_seconds must be between 0 and 86400")
+        if actor not in STOP_ACTORS:
+            raise ValueError(f"actor must be one of {sorted(STOP_ACTORS)}")
+        if reason is not None:
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("reason must be a non-empty string when provided")
+            reason = reason.strip()
+        else:
+            reason = "stop requested"
         proc = self.processes.get(job_id)
         # First read captures the FULL ownership identity (claim token) — the
         # stop-request update AND every terminal transition below CAS against
@@ -4213,7 +4351,12 @@ class JobManager:
                 ).rowcount
                 self.db.commit()
             if changed:
-                self._emit(job_id, "cancelled", message="Queued job cancelled before its trigger fired")
+                self._emit(
+                    job_id,
+                    "cancelled",
+                    message="Queued job cancelled before its trigger fired",
+                    data={"actor": actor, "reason": reason},
+                )
             return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Queued job cancelled"}
         if row and row["status"] not in {"running", "launching"}:
             # Already-terminal stop is an idempotent no-op (review rc14 P1-11):
@@ -4242,26 +4385,30 @@ class JobManager:
         with self.db_lock:
             if observed_claim_token:
                 requested = self.db.execute(
-                    "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND claim_token=?",
-                    (stop_token, job_id, observed_claim_token),
+                    "UPDATE jobs SET stop_requested_at=?, stop_actor=?, stop_reason=? "
+                    "WHERE job_id=? AND status IN ('running','launching') AND claim_token=?",
+                    (stop_token, actor, reason, job_id, observed_claim_token),
                 ).rowcount
             else:
                 # No-token path (legacy/no-claim row): guard on the observed
                 # worker identity so a replacement worker is never stopped.
                 if observed_worker_pid is not None:
                     requested = self.db.execute(
-                        "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND worker_pid=?",
-                        (stop_token, job_id, observed_worker_pid),
+                        "UPDATE jobs SET stop_requested_at=?, stop_actor=?, stop_reason=? "
+                        "WHERE job_id=? AND status IN ('running','launching') AND worker_pid=?",
+                        (stop_token, actor, reason, job_id, observed_worker_pid),
                     ).rowcount
                 elif observed_workload_pid is not None:
                     requested = self.db.execute(
-                        "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND pid=?",
-                        (stop_token, job_id, observed_workload_pid),
+                        "UPDATE jobs SET stop_requested_at=?, stop_actor=?, stop_reason=? "
+                        "WHERE job_id=? AND status IN ('running','launching') AND pid=?",
+                        (stop_token, actor, reason, job_id, observed_workload_pid),
                     ).rowcount
                 else:
                     requested = self.db.execute(
-                        "UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status IN ('running','launching') AND stop_requested_at IS NULL",
-                        (stop_token, job_id),
+                        "UPDATE jobs SET stop_requested_at=?, stop_actor=?, stop_reason=? "
+                        "WHERE job_id=? AND status IN ('running','launching') AND stop_requested_at IS NULL",
+                        (stop_token, actor, reason, job_id),
                     ).rowcount
             self.db.commit()
         if not requested:
@@ -4336,12 +4483,17 @@ class JobManager:
                     self._terminate_pid(proc.pid, force=True, deadline=deadline)
                 self._readers_done(job_id)
                 self.processes.pop(job_id, None)
-                self._emit(job_id, "cancelled", message="Job cancelled while its runner was still launching")
+                self._emit(
+                    job_id,
+                    "cancelled",
+                    message="Job cancelled while its runner was still launching",
+                    data={"actor": actor, "reason": reason},
+                )
                 return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
         changed = self._transition_terminal(job_id, "cancelled", claim_token=observed_claim_token)
         if not changed:
             return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal or owned by a newer launch"}
-        self._emit(job_id, "cancelled")
+        self._emit(job_id, "cancelled", data={"actor": actor, "reason": reason})
         failures = []
         runner_pid = int(row["worker_pid"]) if row["worker_pid"] else None
         if runner_pid and not self._terminate_pid(runner_pid, signal == "kill", deadline):
@@ -4537,10 +4689,16 @@ def job_start(
     interactive: bool = False,
     trigger: dict[str, str] | None = None,
     policy: dict[str, Any] | None = None,
+    secret_env: list[str] | None = None,
     remote_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Start a background job.
+
+    ``secret_env`` names environment variables whose values must be masked
+    (``***``) in captured stdout/stderr and structured events — the GitHub
+    ``::add-mask::`` pattern. Only names are stored; values are resolved and
+    scrubbed by the runner and never rewritten to disk. Local jobs only.
 
     ``trigger`` optionally gates launch on another job: pass
     ``{"job_id": "A", "status": "completed"}`` to start this job only once job
@@ -4598,6 +4756,7 @@ def job_start(
             "interactive": interactive,
             "trigger": trigger,
             "policy": policy,
+            "secret_env": secret_env,
             "remote_id": remote_id,
             "idempotency_key": idempotency_key,
         },
@@ -4608,6 +4767,7 @@ def job_start(
 def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | None = None,
               timeout_seconds: int | None = None, name: str | None = None, tags: list[str] | None = None,
               notes: str | None = None, cwd: str | None = None, interactive: bool | None = None,
+              secret_env: list[str] | None = None,
               remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
     payload = {key: value for key, value in {
         "command": command,
@@ -4618,6 +4778,7 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
         "notes": notes,
         "cwd": cwd,
         "interactive": interactive,
+        "secret_env": secret_env,
         "remote_id": remote_id,
         "idempotency_key": idempotency_key,
     }.items() if value is not None}
@@ -4756,8 +4917,16 @@ def job_wait(
 
 @mcp.tool()
 def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10,
+             reason: str | None = None,
              remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Stop a running job.
+
+    ``reason`` optionally records why the caller is stopping it; the resulting
+    ``cancelled`` event carries ``{"actor": "tool", "reason": ...}`` so the kill
+    is attributable after the fact.
+    """
     return get_client().post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after_seconds,
+                                                       "actor": "tool", "reason": reason,
                                                        "remote_id": remote_id, "idempotency_key": idempotency_key})
 
 
