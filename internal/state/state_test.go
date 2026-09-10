@@ -5,15 +5,16 @@ import (
 	"testing"
 )
 
-// fixturePath returns the Python-generated schema-v5 fixture. The generator is
-// scripts/generate_go_fixture.py; the fixture is checked into testdata/.
+// fixturePath returns the Python-generated fixture. The generator is
+// scripts/generate_go_fixture.py; the fixture is checked into testdata/ and is
+// always seeded at the latest schema version.
 func fixturePath(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", "testdata", "state", "jobs.sqlite")
 	return path
 }
 
-func TestGoOpensPythonSchemaV5Fixture(t *testing.T) {
+func TestGoOpensPythonFixture(t *testing.T) {
 	db, err := OpenReadOnly(fixturePath(t))
 	if err != nil {
 		t.Fatalf("open python fixture: %v", err)

@@ -1,6 +1,6 @@
-// Package state owns schema-v9 SQLite access and typed queries for the native
-// Vanth port. Compatibility rule: every database this package opens or writes
-// must round-trip through Python's sqlite3, and vice versa.
+// Package state owns SQLite access and typed queries for the native Vanth port.
+// Compatibility rule: every database this package opens or writes must
+// round-trip through Python's sqlite3, and vice versa.
 package state
 
 import (
@@ -13,8 +13,8 @@ import (
 // DefaultBusyTimeoutMS mirrors src/vanth/migrations.py DEFAULT_BUSY_TIMEOUT_MS.
 const DefaultBusyTimeoutMS = 30000
 
-// SchemaVersion is the current schema version (matches migrations.py).
-const LatestSchemaVersion = 9
+// LatestSchemaVersion is the current schema version (matches migrations.py).
+const LatestSchemaVersion = 13
 
 // Open opens the database read-write and applies the shared connection policy.
 func Open(path string) (*sql.DB, error) {

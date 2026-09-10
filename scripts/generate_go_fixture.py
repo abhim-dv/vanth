@@ -1,10 +1,14 @@
-"""Generate a deterministic schema-v9 database fixture for Go conformance.
+"""Generate a deterministic database fixture for Go conformance.
 
 The fixture is checked in at testdata/state/jobs.sqlite so the Go test suite
 can run without Python present. Values are fixed (no timestamps or absolute
 paths) so regeneration is byte-stable across OSes and machines. The Go side
 opens the same file with modernc.org/sqlite to prove cross-language
 compatibility, and a round-trip test has Go write rows that Python verifies.
+
+The schema is built through the SAME ``migrate()`` path the daemon uses, so the
+fixture can never drift from ``LATEST_SCHEMA_VERSION`` again (a frozen DDL once
+left the fixture at v9 while the daemon reached v13).
 
 Regenerate (keep in sync with any schema change):
     uv run python scripts/generate_go_fixture.py testdata
@@ -17,7 +21,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from vanth.migrations import LATEST_SCHEMA_VERSION
+from vanth.migrations import LATEST_SCHEMA_VERSION, migrate
 
 
 def seed(db_path: Path) -> None:
@@ -29,63 +33,11 @@ def seed(db_path: Path) -> None:
         db_path.unlink()
     db = sqlite3.connect(db_path)
     try:
-        db.executescript(
-            """
-            CREATE TABLE jobs (
-              job_id TEXT PRIMARY KEY, name TEXT, command TEXT NOT NULL, cwd TEXT,
-              status TEXT NOT NULL, pid INTEGER, worker_pid INTEGER,
-              runner_heartbeat_at TEXT, stop_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-              started_at TEXT, ended_at TEXT, exit_code INTEGER, timeout_seconds INTEGER,
-              notify_on TEXT, origin_thread_id TEXT, wake_thread_id TEXT, tags_json TEXT,
-              env_json TEXT, notes TEXT, run_json TEXT, stdout_path TEXT NOT NULL, stderr_path TEXT NOT NULL, events_path TEXT NOT NULL,
-              trigger_json TEXT
-            );
-            CREATE TABLE events (
-              event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, seq INTEGER NOT NULL,
-              type TEXT NOT NULL, level TEXT, message TEXT, data_json TEXT,
-              source TEXT, created_at TEXT NOT NULL
-            );
-            CREATE INDEX idx_events_job_seq ON events(job_id, seq);
-            CREATE INDEX idx_events_job_type_seq ON events(job_id, type, seq);
-            CREATE TABLE wake_targets (
-              target_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, type TEXT NOT NULL,
-              events_json TEXT NOT NULL, config_json TEXT NOT NULL, created_at TEXT NOT NULL
-            );
-            CREATE INDEX idx_wake_targets_job ON wake_targets(job_id);
-            CREATE TABLE deliveries (
-              delivery_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, target_id TEXT NOT NULL,
-              job_id TEXT NOT NULL, target_type TEXT NOT NULL, status TEXT NOT NULL,
-              attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
-              created_at TEXT NOT NULL, next_attempt_at TEXT, delivered_at TEXT,
-              last_error TEXT, claim_token TEXT, claimed_at TEXT, lease_expires_at TEXT,
-              UNIQUE(event_id, target_id)
-            );
-            CREATE INDEX idx_deliveries_status ON deliveries(status, next_attempt_at, created_at);
-            CREATE TABLE delivery_attempts (
-              attempt_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL, attempt INTEGER NOT NULL,
-              claim_token TEXT, target_type TEXT, started_at TEXT, ended_at TEXT,
-              status TEXT NOT NULL, error TEXT, reclaimed INTEGER NOT NULL DEFAULT 0,
-              created_at TEXT NOT NULL
-            );
-            CREATE TABLE cleanup_tombstones (
-              tombstone_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, artifacts_json TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            );
-            CREATE TABLE metric_series (
-              series_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, metric TEXT NOT NULL,
-              x REAL NOT NULL, y REAL NOT NULL, stage TEXT, event_id TEXT NOT NULL,
-              seq INTEGER NOT NULL, created_at TEXT NOT NULL
-            );
-            CREATE INDEX idx_metric_series_job_metric ON metric_series(job_id, metric, seq);
-            CREATE TABLE artifacts (
-              artifact_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, name TEXT NOT NULL,
-              uri TEXT NOT NULL, kind TEXT, size_bytes INTEGER, sha256 TEXT, meta_json TEXT,
-              created_at TEXT NOT NULL
-            );
-            CREATE INDEX idx_artifacts_job ON artifacts(job_id, created_at);
-            PRAGMA user_version=9;
-            """
-        )
+        # Build the schema through the SAME migration path the daemon uses so the
+        # fixture can never drift from LATEST_SCHEMA_VERSION again (a frozen DDL
+        # once left the fixture at v9 while the daemon reached v13). migrate()
+        # creates the full latest schema on a fresh database.
+        migrate(db, db_path.parent)
         stamp = "2026-01-01T00:00:00Z"
         with db:
             db.execute(

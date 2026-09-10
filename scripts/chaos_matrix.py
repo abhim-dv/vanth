@@ -35,6 +35,7 @@ import asyncio
 import http.client
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -50,7 +51,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    argv = [sys.executable, "-c", code]
+    # The runner executes this string through the platform shell (shell=True),
+    # so it must use that platform's quoting. list2cmdline applies Windows rules
+    # and leaves POSIX-invalid input such as ``python -c print('ok')`` unquoted
+    # (bash: syntax error near unexpected token `('), which made every
+    # parenthesis-only command fail on the Linux chaos job. shlex.join is the
+    # POSIX-correct equivalent.
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
 
 
 def free_port() -> int:
