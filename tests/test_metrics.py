@@ -36,7 +36,7 @@ def test_metrics_text_contains_core_series(tmp_path):
         assert "vanth_up 1" in text
         assert 'vanth_jobs{status="running_or_launching"} 1' in text
         assert 'vanth_jobs{status="queued"} 1' in text
-        assert "vanth_jobs_total 3" in text
+        assert "vanth_jobs_count 3" in text
         assert 'vanth_pool_max_parallel{pool="gpu"} 2' in text
         assert 'vanth_pool_running{pool="gpu"} 1' in text
         assert 'vanth_pool_queued{pool="gpu"} 1' in text

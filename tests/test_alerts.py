@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -82,6 +83,32 @@ def test_alert_on_dead_letters(tmp_path, monkeypatch):
         manager.close()
         server.shutdown()
         server.server_close()
+
+
+def test_alert_send_failure_does_not_suppress_retry(tmp_path, monkeypatch):
+    manager = JobManager(tmp_path, recover=False)
+    server = None
+    try:
+        monkeypatch.setenv("VANTH_ALERT_DISK_FREE_BYTES", str(10**18))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            dead_port = probe.getsockname()[1]
+        monkeypatch.setenv("VANTH_ALERT_WEBHOOK", f"http://127.0.0.1:{dead_port}/alert")
+        manager._last_alert_check = None
+        manager._check_alerts()
+        assert manager._alert_state.get("disk_low") is None, "a failed send must not advance the state"
+
+        server, port = _start_sink()
+        _Sink.received = []
+        monkeypatch.setenv("VANTH_ALERT_WEBHOOK", f"http://127.0.0.1:{port}/alert")
+        manager._last_alert_check = None
+        manager._check_alerts()
+        assert any(item["condition"] == "disk_low" and item["active"] for item in _Sink.received)
+    finally:
+        manager.close()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
 
 
 def test_alerts_disabled_without_webhook(tmp_path, monkeypatch):

@@ -536,6 +536,7 @@ class JobManager:
         self.dispatch_enabled = recover
         self.dispatcher_stop = threading.Event()
         self.dispatcher_thread: threading.Thread | None = None
+        self.alert_thread: threading.Thread | None = None
         self._started_monotonic = time.monotonic()
         # Operator alerts: edge-triggered condition state + throttle (review B3).
         self._alert_state: dict[str, bool] = {}
@@ -548,6 +549,11 @@ class JobManager:
             self._dispatch_due_deliveries()
             self.dispatcher_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
             self.dispatcher_thread.start()
+            # Alerts run on their OWN thread: a slow alert POST (or DNS) must
+            # never stall delivery dispatch, recovery, or schedule firing.
+            if os.environ.get("VANTH_ALERT_WEBHOOK", "").strip():
+                self.alert_thread = threading.Thread(target=self._alert_loop, name="vanth-alerts", daemon=True)
+                self.alert_thread.start()
 
     def _pid_alive(self, pid: int | None) -> bool:
         if not pid:
@@ -780,7 +786,6 @@ class JobManager:
                 self._fire_due_schedules()
                 self._dispatch_queued_jobs()
                 self._watch_policies()
-                self._check_alerts()
                 self._maybe_auto_cleanup()
                 self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
             except Exception:
@@ -1814,6 +1819,17 @@ class JobManager:
         with self.db_lock:
             return self.db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')").fetchone()[0]
 
+    def _alert_loop(self) -> None:
+        try:
+            interval = max(1.0, float(os.environ.get("VANTH_ALERT_INTERVAL", "30")))
+        except ValueError:
+            interval = 30.0
+        while not self.dispatcher_stop.wait(interval):
+            try:
+                self._check_alerts()
+            except Exception:
+                self.logger.exception("alert check failed")
+
     def _check_alerts(self) -> None:
         """Edge-triggered operator alerts to ``VANTH_ALERT_WEBHOOK`` (review B3).
 
@@ -1839,15 +1855,31 @@ class JobManager:
         for key, condition in conditions.items():
             if condition["active"] == self._alert_state.get(key, False):
                 continue
-            self._alert_state[key] = condition["active"]
             try:
                 self._post_alert(url, key, condition)
             except Exception:
+                # Do NOT advance the state on a failed send: the transition is
+                # retried on the next pass instead of being silently lost.
                 self.logger.exception("alert delivery failed condition=%s", key)
+                continue
+            self._alert_state[key] = condition["active"]
+
+    def _dead_letter_count(self) -> int:
+        """Truly exhausted deliveries (failed with attempts >= target max_attempts).
+
+        A bare ``status='failed'`` also matches transient failures awaiting retry
+        and administrative drains, so it overcounts (review P2).
+        """
+        with self.db_lock:
+            return int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM deliveries WHERE status='failed' "
+                    "AND attempts >= COALESCE(json_extract(payload_json, '$.target.max_attempts'), 1)"
+                ).fetchone()[0]
+            )
 
     def _alert_conditions(self) -> dict[str, dict[str, Any]]:
-        with self.db_lock:
-            failed = int(self.db.execute("SELECT COUNT(*) FROM deliveries WHERE status='failed'").fetchone()[0])
+        failed = self._dead_letter_count()
         try:
             threshold = int(os.environ.get("VANTH_ALERT_DISK_FREE_BYTES", "0"))
         except ValueError:
@@ -1885,7 +1917,7 @@ class JobManager:
         request = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
-        with _NO_REDIRECT_OPENER.open(request, timeout=10) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=5) as response:
             if response.status not in (200, 201, 202, 204):
                 raise RuntimeError(f"alert webhook returned HTTP {response.status}")
 
@@ -5065,9 +5097,12 @@ class JobManager:
         disk_free = shutil.disk_usage(self.home).free
         running = status_counts.get("running", 0) + status_counts.get("launching", 0)
 
+        def escape(value: object) -> str:
+            return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
         def emit(name: str, value: float, **labels: str) -> str:
             if labels:
-                rendered = ",".join(f'{key}="{val}"' for key, val in sorted(labels.items()))
+                rendered = ",".join(f'{key}="{escape(val)}"' for key, val in sorted(labels.items()))
                 return f"{name}{{{rendered}}} {value}"
             return f"{name} {value}"
 
@@ -5075,18 +5110,20 @@ class JobManager:
             "# HELP vanth_up Daemon process is up.",
             "# TYPE vanth_up gauge",
             emit("vanth_up", 1),
+            "# TYPE vanth_uptime_seconds gauge",
             emit("vanth_uptime_seconds", round(time.monotonic() - self._started_monotonic, 3)),
+            "# TYPE vanth_schema_version gauge",
             emit("vanth_schema_version", schema),
             "# TYPE vanth_jobs gauge",
             emit("vanth_jobs", running, status="running_or_launching"),
             emit("vanth_jobs", status_counts.get("queued", 0), status="queued"),
-            emit("vanth_jobs_total", sum(status_counts.values())),
-            emit("vanth_events_total", events_total),
+            emit("vanth_jobs_count", sum(status_counts.values())),
+            emit("vanth_events_count", events_total),
             emit("vanth_maintenance_alive", 1 if (self.dispatcher_thread and self.dispatcher_thread.is_alive()) else 0),
             emit("vanth_disk_free_bytes", disk_free),
             emit("vanth_db_size_bytes", db_size),
             emit("vanth_stale_delivery_leases", stale_leases),
-            emit("vanth_dead_letters", delivery_counts.get("failed", 0)),
+            emit("vanth_dead_letters", self._dead_letter_count()),
         ]
         for status, count in sorted(delivery_counts.items()):
             lines.append(emit("vanth_deliveries", count, status=status))

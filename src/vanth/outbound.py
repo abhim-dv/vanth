@@ -38,9 +38,21 @@ def _block_private() -> bool:
     return os.environ.get("VANTH_OUTBOUND_BLOCK_PRIVATE", "0").strip().lower() not in {"", "0", "false", "no"}
 
 
+def _normalize(ip: ipaddress._BaseAddress) -> ipaddress._BaseAddress:
+    # Collapse IPv4-mapped IPv6 (::ffff:127.0.0.1) to its IPv4 form so the
+    # loopback/private/link-local checks see the real address.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
 def _tripwire(ip: ipaddress._BaseAddress) -> bool:
     # Always-denied: link-local (cloud metadata), unspecified, multicast,
-    # reserved. Loopback/private are intentionally NOT here.
+    # reserved. Loopback/private are intentionally NOT here (local-first), but
+    # note IPv6 ::1 is classed `reserved`, so loopback is checked first.
+    ip = _normalize(ip)
+    if ip.is_loopback:
+        return False
     return ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved
 
 
@@ -67,28 +79,31 @@ def check_outbound_url(url: str) -> None:
     host = parts.hostname
     if not host:
         raise OutboundDenied("outbound URL has no host")
-    lowered = host.lower()
+    lowered = host.lower().rstrip(".")
     allow = _allowlist()
-    if allow and lowered in allow:
-        return
+    allow_by_name = bool(allow) and lowered in allow
     port = parts.port or (443 if parts.scheme == "https" else 80)
+    # Always resolve — an allowlisted NAME must not bypass the address checks
+    # (a name can resolve to link-local/metadata, or rebind). The tripwire set
+    # is denied even in allowlist mode.
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise OutboundDenied(f"cannot resolve outbound host {host!r}") from exc
-    addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
+    addresses = {_normalize(ipaddress.ip_address(info[4][0])) for info in infos}
     if not addresses:
         raise OutboundDenied(f"outbound host {host!r} resolved to no address")
     if lowered in _METADATA_HOSTS:
         raise OutboundDenied(f"cloud metadata host is not allowed: {host}")
-    if allow:
-        # Strict: EVERY resolved address must be allowlisted.
-        if not all(_matches_allow(ip, allow) for ip in addresses):
-            raise OutboundDenied(f"outbound host {host!r} is not in VANTH_OUTBOUND_ALLOW")
-        return
-    block_private = _block_private()
     for ip in addresses:
         if _tripwire(ip):
             raise OutboundDenied(f"outbound address {ip} is blocked (link-local/metadata/unspecified)")
-        if block_private and (ip.is_private or ip.is_loopback):
-            raise OutboundDenied(f"outbound address {ip} is blocked (VANTH_OUTBOUND_BLOCK_PRIVATE)")
+    if allow:
+        if allow_by_name:
+            return
+        # Strict: EVERY resolved address must fall in the allowlist.
+        if not all(_matches_allow(ip, allow) for ip in addresses):
+            raise OutboundDenied(f"outbound host {host!r} is not in VANTH_OUTBOUND_ALLOW")
+        return
+    if _block_private() and any(ip.is_private or ip.is_loopback for ip in addresses):
+        raise OutboundDenied("outbound address is blocked (VANTH_OUTBOUND_BLOCK_PRIVATE)")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -97,6 +98,46 @@ def test_restore_refuses_newer_schema(tmp_path):
         )
     with pytest.raises(ValueError, match="newer than"):
         restore_backup(tmp_path / "home", archive)
+
+
+def test_restore_rejects_zipslip_before_mutation(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "sentinel.txt").write_text("keep", encoding="utf-8")
+    archive = tmp_path / "slip.zip"
+    good, evil = b"good", b"evil"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("good.sqlite", good)
+        bundle.writestr("../escaped.txt", evil)
+        bundle.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "format": "vanth-backup/1",
+                    "schema_version": LATEST_SCHEMA_VERSION,
+                    "files": [
+                        {"path": "good.sqlite", "sha256": hashlib.sha256(good).hexdigest(), "size": 4},
+                        {"path": "../escaped.txt", "sha256": hashlib.sha256(evil).hexdigest(), "size": 4},
+                    ],
+                }
+            ),
+        )
+    with pytest.raises(ValueError, match="unsafe path|escapes"):
+        restore_backup(home, archive)
+    assert not (tmp_path / "escaped.txt").exists()
+    assert not (home / "good.sqlite").exists(), "no member may be written before full validation"
+    assert (home / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_restore_removes_stale_managed_files(tmp_path):
+    home = tmp_path / "state"
+    _seed(home)
+    archive = create_backup(home)
+    stale = home / "artifacts-store" / "blobs" / "cc" / "dd" / "stale"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale")
+    restore_backup(home, archive)
+    assert not stale.exists(), "stale managed files must not survive a restore"
 
 
 def test_cli_backup_and_restore_guard(tmp_path, capsys):

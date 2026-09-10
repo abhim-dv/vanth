@@ -51,11 +51,29 @@ def test_allowlist_mode_is_strict(monkeypatch):
     monkeypatch.setenv("VANTH_OUTBOUND_ALLOW", "127.0.0.1,10.0.0.0/8,ntfy.local")
     check_outbound_url("http://127.0.0.1:8765/")
     check_outbound_url("http://10.5.6.7/")
-    check_outbound_url("http://ntfy.local/")  # name match, no resolution needed
-    # A resolved address outside the allowlist is refused even in allowlist mode.
+    # A name-matched host is still resolved and validated.
     monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("93.184.216.34"))
+    check_outbound_url("http://ntfy.local/")
+    # A resolved address outside the allowlist is refused even in allowlist mode.
     with pytest.raises(OutboundDenied):
         check_outbound_url("http://public.example.com/")
+
+
+def test_allowlist_name_cannot_bypass_tripwire(monkeypatch):
+    # An allowlisted NAME that resolves to a metadata address is still denied.
+    monkeypatch.setenv("VANTH_OUTBOUND_ALLOW", "evil.example")
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("169.254.169.254"))
+    with pytest.raises(OutboundDenied):
+        check_outbound_url("http://evil.example/")
+
+
+def test_ipv6_loopback_allowed_by_default(monkeypatch):
+    monkeypatch.delenv("VANTH_OUTBOUND_ALLOW", raising=False)
+    monkeypatch.delenv("VANTH_OUTBOUND_BLOCK_PRIVATE", raising=False)
+    check_outbound_url("http://[::1]:8765/")
+    monkeypatch.setenv("VANTH_OUTBOUND_BLOCK_PRIVATE", "1")
+    with pytest.raises(OutboundDenied):
+        check_outbound_url("http://[::1]:8765/")
 
 
 def test_block_private_mode(monkeypatch):

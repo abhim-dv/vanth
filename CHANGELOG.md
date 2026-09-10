@@ -34,7 +34,7 @@ Deferred (tracked): re-enabling the Linux/macOS Python test matrix, which needs
 the test command builders made POSIX-safe (the runner is already POSIX-capable;
 the suite's `list2cmdline` helpers are not).
 
-Full suite: 769 passed, 6 skipped; `go test ./...` green.
+Full suite: 774 passed, 6 skipped; `go test ./...` green.
 
 ## 1.8.0 - 2026-09-10
 
