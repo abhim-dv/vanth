@@ -93,9 +93,11 @@ status. One probe per trigger; when a DAG gate is also present both must pass.
 | `file` | `path` | the path exists |
 
 Any probe also accepts `timeout_seconds` (cancel the queued job if it never
-becomes ready) and `interval_seconds` (probe cadence, default 1). Probes run on
-the daemon host over a direct connection (no proxy). Timeout cancellation is
-attributed on the `cancelled` event (`actor: "daemon"`).
+becomes ready; measured from when the DAG gate is satisfied, or from queue
+creation with no DAG gate) and `interval_seconds` (probe cadence, default 1).
+Probes run on the daemon host over a direct connection (no proxy), bounded per
+dispatcher pass. Timeout cancellation is attributed on the `cancelled` event
+(`actor: "daemon"`). A `log_line` probe's `job_id` must be an existing job.
 
 ```json
 { "probe": { "type": "http", "url": "http://127.0.0.1:8080/health",

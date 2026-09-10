@@ -511,6 +511,11 @@ class JobManager:
         # Readiness-probe throttle: job_id -> monotonic time of the last probe
         # attempt (roadmap #10). Pruned to the current queued set each dispatch.
         self._probe_last_attempt: dict[str, float] = {}
+        # Max actual probe I/O calls per dispatch pass, so a batch of blocked
+        # HTTP/port probes cannot stall the maintenance loop (deliveries,
+        # recovery, schedules). Throttled jobs cost nothing, so successive
+        # passes drain the whole queue.
+        self.probe_budget = max(1, int(os.environ.get("VANTH_PROBE_BUDGET", "8")))
         self.logger = logging.getLogger(f"vanth.manager.{id(self)}")
         self.logger.setLevel(os.environ.get("VANTH_LOG_LEVEL", "INFO").upper())
         self.logger.propagate = False
@@ -1193,23 +1198,29 @@ class JobManager:
                 ).fetchall()
                 if not rows:
                     return
-                parents: dict[str, str | None] = {}
+                parents: dict[str, tuple[str | None, str | None]] = {}
                 triggers: dict[str, dict[str, Any]] = {}
                 for row in rows:
                     trigger = json.loads(row["trigger_json"] or "null")
                     if isinstance(trigger, dict):
                         triggers[row["job_id"]] = trigger
                         if trigger.get("job_id"):
-                            parents.setdefault(trigger["job_id"], None)
+                            parents.setdefault(trigger["job_id"], (None, None))
                 for parent in parents:
-                    status_row = self.db.execute("SELECT status FROM jobs WHERE job_id=?", (parent,)).fetchone()
-                    parents[parent] = status_row["status"] if status_row else None
+                    status_row = self.db.execute(
+                        "SELECT status, ended_at FROM jobs WHERE job_id=?", (parent,)
+                    ).fetchone()
+                    parents[parent] = (status_row["status"], status_row["ended_at"]) if status_row else (None, None)
 
             # Keep the probe throttle bounded to the jobs still queued.
             queued_ids = {row["job_id"] for row in rows}
             self._probe_last_attempt = {
                 key: value for key, value in self._probe_last_attempt.items() if key in queued_ids
             }
+            # If the global quota is already exhausted, nothing can launch, so
+            # skip probe I/O entirely this pass (DAG cancels still run).
+            capacity_open = (not self.max_running_jobs) or (self._running_count() < self.max_running_jobs)
+            probe_budget = [self.probe_budget]
 
             to_cancel: list[tuple[str, str, str]] = []
             to_cancel_probe: list[tuple[str, dict[str, Any]]] = []
@@ -1217,33 +1228,41 @@ class JobManager:
             for row in rows:
                 job_id = row["job_id"]
                 trigger = triggers.get(job_id)
-                if trigger:
-                    if trigger.get("job_id"):
-                        parent, target = trigger["job_id"], trigger["status"]
-                        parent_status = parents.get(parent)
-                        if parent_status in TERMINAL_STATUSES and parent_status != target:
-                            # Cancellation is independent of pause: a held job
-                            # whose trigger can never fire must not linger.
-                            to_cancel.append((job_id, parent, target))
-                            continue
-                        if parent_status != target:
-                            continue  # DAG gate not satisfied yet
-                    probe = trigger.get("probe")
-                    if probe is not None:
-                        if self._probe_timed_out(probe, row["created_at"]):
-                            to_cancel_probe.append((job_id, probe))
-                            continue
-                        if not self._probe_ready(job_id, probe):
-                            continue  # readiness gate not satisfied yet
+                probe = trigger.get("probe") if trigger else None
+                # The readiness deadline runs from when the dependency gate is
+                # satisfied (the parent's end), or from queue creation when there
+                # is no DAG gate.
+                probe_start = row["created_at"]
+                if trigger and trigger.get("job_id"):
+                    parent, target = trigger["job_id"], trigger["status"]
+                    parent_status, parent_ended = parents.get(parent, (None, None))
+                    if parent_status in TERMINAL_STATUSES and parent_status != target:
+                        # Cancellation is independent of pause: a held job whose
+                        # trigger can never fire must not linger.
+                        to_cancel.append((job_id, parent, target))
+                        continue
+                    if parent_status != target:
+                        continue  # DAG gate not satisfied yet
+                    if parent_ended:
+                        probe_start = parent_ended
+                if probe is not None and self._probe_timed_out(probe, probe_start):
+                    to_cancel_probe.append((job_id, probe))
+                    continue
                 if row["paused"]:
                     continue  # held; capacity/pause are enforced again at claim
+                if probe is not None:
+                    if not capacity_open:
+                        continue  # global quota full; keep waiting without I/O
+                    if not self._probe_ready(job_id, probe, probe_budget):
+                        continue  # readiness gate not satisfied yet
                 to_launch.append((job_id, row["pool"]))
 
             for job_id, pool in to_launch:
                 # Capacity, current pool pause/max, and the claim are one guarded
                 # UPDATE (see _launch_queued_if_capacity), so a concurrent direct
                 # start(), dispatcher, or pool reconfiguration cannot slip past.
-                self._launch_queued_if_capacity(job_id, pool=pool)
+                if self._launch_queued_if_capacity(job_id, pool=pool):
+                    self._probe_last_attempt.pop(job_id, None)
             for job_id, probe in to_cancel_probe:
                 reason = f"readiness probe ({probe['type']}) did not become ready within {probe['timeout_seconds']}s"
                 with self.db_lock:
@@ -1254,6 +1273,7 @@ class JobManager:
                     ).rowcount
                     self.db.commit()
                 if changed:
+                    self._probe_last_attempt.pop(job_id, None)
                     self._emit(
                         job_id,
                         "cancelled",
@@ -1275,7 +1295,8 @@ class JobManager:
                         "cancelled",
                         message=f"Trigger parent {parent} reached a different terminal status than {status}",
                         data={"actor": "daemon", "reason": "trigger parent reached an incompatible terminal status",
-                              "trigger": {"job_id": parent, "status": status}, "parent_status": parents.get(parent)},
+                              "trigger": {"job_id": parent, "status": status},
+                              "parent_status": parents.get(parent, (None, None))[0]},
                     )
         except Exception:
             self.logger.exception("queued-job dispatch failed")
@@ -1289,17 +1310,22 @@ class JobManager:
             return False
         return (datetime.now(timezone.utc) - created).total_seconds() >= int(timeout)
 
-    def _probe_ready(self, job_id: str, probe: dict[str, Any]) -> bool:
-        """Evaluate a readiness probe, throttled per job to its cadence.
+    def _probe_ready(self, job_id: str, probe: dict[str, Any], budget: list[int]) -> bool:
+        """Evaluate a readiness probe, throttled per job and budgeted per pass.
 
-        Returns False when the probe is not yet satisfied OR when it is inside
-        its throttle window (so the caller simply keeps the job queued).
+        Returns False when the probe is not yet satisfied, inside its throttle
+        window, or the per-pass I/O budget is exhausted (so the caller keeps the
+        job queued). A throttled check consumes no budget, so successive passes
+        drain the whole queue without stalling the maintenance loop.
         """
         interval = float(probe.get("interval_seconds", 1))
         now = time.monotonic()
         last = self._probe_last_attempt.get(job_id)
         if last is not None and now - last < interval:
             return False
+        if budget[0] <= 0:
+            return False
+        budget[0] -= 1
         self._probe_last_attempt[job_id] = now
         try:
             if probe["type"] == "log_line":
@@ -1310,13 +1336,22 @@ class JobManager:
             return False
 
     def _probe_log_text(self, probe: dict[str, Any], max_bytes: int = 262144) -> str:
-        """Bounded tail of a target job's captured log for a log_line probe."""
+        """Bounded tail of a target job's captured log for a log_line probe.
+
+        The path is resolved and confined under the logs directory as defense in
+        depth; the target ``job_id`` is validated to be a real job at trigger
+        creation, so it is always a generated ``job_<hex>`` id.
+        """
         job_id = probe["job_id"]
         stream = probe.get("stream", "all")
         streams = ["stdout", "stderr"] if stream == "all" else [stream]
+        logs_root = self.logs.resolve()
         chunks: list[str] = []
         for name in streams:
-            path = self.logs / f"{job_id}.{name}.log"
+            path = (self.logs / f"{job_id}.{name}.log").resolve()
+            if not path.is_relative_to(logs_root):
+                self.logger.warning("log_line probe path escaped the logs dir; ignoring")
+                continue
             try:
                 size = path.stat().st_size
                 with path.open("rb") as handle:
@@ -2810,7 +2845,12 @@ class JobManager:
                 raise ValueError(f"Unknown trigger job_id: {job_id}")
             normalized.update(job_id=job_id, status=status)
         if probe is not None:
-            normalized["probe"] = validate_probe(probe)
+            normalized_probe = validate_probe(probe)
+            if normalized_probe["type"] == "log_line" and not self._row(
+                "SELECT job_id FROM jobs WHERE job_id=?", (normalized_probe["job_id"],)
+            ):
+                raise ValueError(f"Unknown log_line probe job_id: {normalized_probe['job_id']}")
+            normalized["probe"] = normalized_probe
         if not normalized:
             raise ValueError("trigger must include a job_id/status gate, a probe, or both")
         return normalized

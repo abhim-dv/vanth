@@ -164,6 +164,74 @@ def test_probe_timeout_cancels_with_attribution(tmp_path):
         manager.close()
 
 
+def test_log_line_probe_requires_known_job(tmp_path):
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        with pytest.raises(ValueError, match="Unknown log_line probe job_id"):
+            asyncio.run(manager.start(
+                cmd(SLEEP),
+                trigger={"probe": {"type": "log_line", "job_id": "..\\escape", "pattern": "x"}},
+            ))
+    finally:
+        manager.close()
+
+
+def test_probe_timeout_clock_starts_after_dag_gate(tmp_path):
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        parent = asyncio.run(manager.start(cmd("print('done')")))
+        _wait_status(manager, parent["job_id"], {"completed", "failed"})
+        port = _free_port()
+        child = asyncio.run(manager.start(
+            cmd(SLEEP),
+            trigger={
+                "job_id": parent["job_id"],
+                "status": "completed",
+                "probe": {"type": "port", "host": "127.0.0.1", "port": port, "timeout_seconds": 1},
+            },
+        ))
+        # Backdate the child's creation far past the probe timeout; because the
+        # DAG parent only just completed, the readiness clock starts there and
+        # the job must NOT be cancelled.
+        with manager.db_lock:
+            manager.db.execute(
+                "UPDATE jobs SET created_at=? WHERE job_id=?",
+                ("2000-01-01T00:00:00Z", child["job_id"]),
+            )
+            manager.db.commit()
+        manager._dispatch_queued_jobs()
+        assert manager.status(child["job_id"])["status"] == "queued"
+    finally:
+        manager.close()
+
+
+def test_probe_budget_limits_io_per_pass(tmp_path, monkeypatch):
+    import vanth.server as server_module
+
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        calls = {"n": 0}
+
+        def counting(probe, **kwargs):
+            calls["n"] += 1
+            return False
+
+        monkeypatch.setattr(server_module, "evaluate_probe", counting)
+        manager.probe_budget = 1
+        for index in range(3):
+            asyncio.run(manager.start(
+                cmd(SLEEP),
+                trigger={"probe": {"type": "file", "path": f"/nonexistent/{index}"}},
+            ))
+        manager._dispatch_queued_jobs()
+        assert calls["n"] == 1, f"only the budgeted probe should run: {calls}"
+        # The first job is now throttled (no I/O), so the next pass probes the next.
+        manager._dispatch_queued_jobs()
+        assert calls["n"] == 2, calls
+    finally:
+        manager.close()
+
+
 def test_log_line_probe_releases_when_pattern_appears(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:

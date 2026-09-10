@@ -13,10 +13,14 @@ All notable changes to Vanth are documented here.
   log), and `file` (path exists). Each accepts optional `timeout_seconds`
   (cancel the queued job, attributed `actor="daemon"`) and `interval_seconds`
   (probe cadence, default 1s). Probes run on the daemon host over a direct
-  connection (no proxy) and are throttled per job. No schema change — the probe
-  lives in the existing `trigger_json`.
+  connection (no proxy), are throttled per job, and are bounded per dispatcher
+  pass (`VANTH_PROBE_BUDGET`, default 8) so blocked probes cannot stall other
+  maintenance. `timeout_seconds` is measured from when the DAG gate is satisfied
+  (or from queue creation with no gate). A `log_line` probe must target an
+  existing job, and its log path is confined under the logs directory. No schema
+  change — the probe lives in the existing `trigger_json`.
 
-Full suite: 750 passed, 6 skipped; `go test ./...` green.
+Full suite: 753 passed, 6 skipped; `go test ./...` green.
 
 ## 1.7.0 - 2026-09-10
 

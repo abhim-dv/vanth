@@ -495,9 +495,11 @@ job_start(command="migrate.sh", trigger={"probe": {"type": "port",
 
 This lets one job orchestrate a stack — "start the DB, wait until the port
 accepts, then migrate" — instead of `sleep` hacks. Probes run on the daemon host
-(direct connection; no proxy), at `interval_seconds` cadence (default 1s), and a
-missed deadline is attributed (`actor="daemon"` + reason) on the `cancelled`
-event.
+(direct connection; no proxy) at `interval_seconds` cadence (default 1s), bounded
+per dispatcher pass so blocked probes can't stall other work. `timeout_seconds`
+is measured from when the dependency gate is satisfied (or from queue creation
+with no dependency gate); a missed deadline is attributed (`actor="daemon"` +
+reason) on the `cancelled` event.
 
 ### job_send — feed stdin to an interactive job
 
