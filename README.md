@@ -926,8 +926,8 @@ bin\vanth.exe monitor
 ```
 
 Keys: `up/down` or `j/k` select jobs · `enter` pins a job's series · `e` event
-table · `l` log tail · `+`/`-` zoom a chart · `[`/`]` pan · `t` back to live
-tail · `?` help · `q` or `Ctrl+C` quit.
+table · `l` log tail · `s` slowest-runs table · `+`/`-` zoom a chart · `[`/`]`
+pan · `t` back to live tail · `?` help · `q` or `Ctrl+C` quit.
 
 ---
 

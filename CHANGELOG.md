@@ -29,6 +29,11 @@ All notable changes to Vanth are documented here.
   / `improving`) computed from the newer vs older half's p50 — catching "this
   backup crept 40min → 2h over 6 weeks". The top-level `slowest` list is the
   slowest-N runs across all groups. Exposed at `GET /analytics/durations`.
+- **Monitor slowest-runs pane.** Press `s` in `vanth-monitor` for a top-20
+  table of the longest terminal runs (runtime + status + name), read from the
+  same `jobs.sqlite`.
+
+Full suite: 719 passed, 6 skipped; `go test ./...` green.
 
 ## 1.6.0 - 2026-09-10
 

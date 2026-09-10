@@ -49,6 +49,8 @@ type JobSummary struct {
 	ExitCode   *int64
 	CreatedAt  string
 	UpdatedAt  string
+	StartedAt  string
+	EndedAt    string
 	StdoutPath string
 	StderrPath string
 	EventsPath string
@@ -65,6 +67,28 @@ type JobSummary struct {
 
 // IsRemote reports whether this summary is a projected remote shadow.
 func (j JobSummary) IsRemote() bool { return j.Shadow }
+
+// DurationSeconds returns the run's wall-clock runtime for terminal jobs whose
+// started_at and ended_at are both present and well-formed. ok is false for
+// running, queued, or remote-shadow rows (which carry no local timestamps).
+func (j JobSummary) DurationSeconds() (float64, bool) {
+	if j.StartedAt == "" || j.EndedAt == "" {
+		return 0, false
+	}
+	start, err := time.Parse(time.RFC3339, j.StartedAt)
+	if err != nil {
+		return 0, false
+	}
+	end, err := time.Parse(time.RFC3339, j.EndedAt)
+	if err != nil {
+		return 0, false
+	}
+	seconds := end.Sub(start).Seconds()
+	if seconds < 0 {
+		return 0, false
+	}
+	return seconds, true
+}
 
 // Location returns "local" or the remote id for display.
 func (j JobSummary) Location() string {

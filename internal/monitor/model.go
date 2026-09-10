@@ -81,6 +81,7 @@ type Model struct {
 	focus       focus
 	showEvents  bool
 	showLogs    bool
+	showSlowest bool
 	logLoading  bool
 	logTail     []string
 	logTailJob  string
@@ -202,6 +203,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.toggleLogs()
 	case "e":
 		m.toggleEvents()
+	case "s":
+		m.toggleSlowest()
 	case "up", "k":
 		m.moveUp()
 	case "down", "j":
@@ -245,6 +248,7 @@ func (m Model) toggleLogs() (tea.Model, tea.Cmd) {
 	m.showLogs = !m.showLogs
 	if m.showLogs {
 		m.showEvents = false
+		m.showSlowest = false
 		m.lowerScroll = 0
 		m.logLoading = true
 		return m, m.logTailCmd()
@@ -258,8 +262,57 @@ func (m *Model) toggleEvents() {
 	m.showEvents = !m.showEvents
 	if m.showEvents {
 		m.showLogs = false
+		m.showSlowest = false
 	}
 	m.lowerScroll = 0
+}
+
+// toggleSlowest switches the lower pane to the slowest-runs table. It is
+// mutually exclusive with the event table and log tail.
+func (m *Model) toggleSlowest() {
+	m.showSlowest = !m.showSlowest
+	if m.showSlowest {
+		m.showEvents = false
+		m.showLogs = false
+		m.logLoading = false
+	}
+	m.lowerScroll = 0
+}
+
+// slowestJobs returns the n terminal local jobs with the longest runtime,
+// longest first. Running/queued rows and remote shadows (no local timestamps)
+// are excluded. Ties fall back to most-recently-updated.
+func (m Model) slowestJobs(n int) []JobSummary {
+	type ranked struct {
+		job     JobSummary
+		seconds float64
+		updated string
+	}
+	rankedJobs := make([]ranked, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		if job.Shadow {
+			continue
+		}
+		seconds, ok := job.DurationSeconds()
+		if !ok {
+			continue
+		}
+		rankedJobs = append(rankedJobs, ranked{job: job, seconds: seconds, updated: job.UpdatedAt})
+	}
+	sort.SliceStable(rankedJobs, func(i, j int) bool {
+		if rankedJobs[i].seconds != rankedJobs[j].seconds {
+			return rankedJobs[i].seconds > rankedJobs[j].seconds
+		}
+		return rankedJobs[i].updated > rankedJobs[j].updated
+	})
+	if len(rankedJobs) > n {
+		rankedJobs = rankedJobs[:n]
+	}
+	out := make([]JobSummary, 0, len(rankedJobs))
+	for _, r := range rankedJobs {
+		out = append(out, r.job)
+	}
+	return out
 }
 
 func (m *Model) moveUp() {

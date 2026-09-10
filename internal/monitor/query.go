@@ -164,7 +164,8 @@ func (q *Querier) Refresh(ctx context.Context, req RefreshRequest) RefreshResult
 func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) error {
 	const query = `
 		SELECT j.job_id, j.name, j.command, j.status, j.pid, j.worker_pid, j.stop_requested_at,
-		       j.created_at, j.updated_at, j.exit_code, j.tags_json, j.notes, j.run_json,
+		       j.created_at, j.updated_at, j.exit_code, j.started_at, j.ended_at,
+		       j.tags_json, j.notes, j.run_json,
 		       j.stdout_path, j.stderr_path, j.events_path,
 		       (SELECT COUNT(*) FROM events e WHERE e.job_id = j.job_id) AS event_count
 		FROM jobs j
@@ -185,18 +186,22 @@ func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) 
 			workerPid sql.NullInt64
 			stopReq   sql.NullString
 			exitCode  sql.NullInt64
+			startedAt sql.NullString
+			endedAt   sql.NullString
 			tagsJSON  string
 			notes     sql.NullString
 			runJSON   sql.NullString
 		)
 		if err := rows.Scan(&j.JobID, &name, &j.Command, &j.Status, &pid, &workerPid, &stopReq,
-			&j.CreatedAt, &j.UpdatedAt, &exitCode, &tagsJSON, &notes, &runJSON,
+			&j.CreatedAt, &j.UpdatedAt, &exitCode, &startedAt, &endedAt, &tagsJSON, &notes, &runJSON,
 			&j.StdoutPath, &j.StderrPath, &j.EventsPath, &j.EventCount); err != nil {
 			return err
 		}
 		j.Name = name.String
 		j.Notes = notes.String
 		j.RunJSON = runJSON.String
+		j.StartedAt = startedAt.String
+		j.EndedAt = endedAt.String
 		if pid.Valid {
 			p := pid.Int64
 			j.Pid = &p

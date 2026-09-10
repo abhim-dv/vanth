@@ -899,6 +899,9 @@ func (m Model) renderLower(r rect) string {
 	if m.showLogs {
 		return m.renderLogs(r)
 	}
+	if m.showSlowest {
+		return m.renderSlowest(r)
+	}
 	title := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render("Activity")
 	innerW := r.w - 2
 	innerH := r.h - 2
@@ -908,9 +911,40 @@ func (m Model) renderLower(r rect) string {
 	// The event table is the default pane, so this neutral state only occurs
 	// after 'e' toggled events off; the hint advertises how to bring a pane
 	// back (and '?' opens the full key map).
-	hint := lipgloss.NewStyle().Faint(true).Render("press e: event table · l: log tail · ?: help")
+	hint := lipgloss.NewStyle().Faint(true).Render("press e: event table · l: log tail · s: slowest runs · ?: help")
 	content := lipgloss.Place(innerW, innerH, lipgloss.Center, lipgloss.Center, hint)
 	return m.panelBox(r, title, content)
+}
+
+// renderSlowest renders the top terminal runs by runtime (#6). Durations come
+// from started_at/ended_at, so running and remote-shadow rows are excluded.
+func (m Model) renderSlowest(r rect) string {
+	jobs := m.slowestJobs(20)
+	title := "Slowest runs · top 20 by runtime"
+	if len(jobs) == 0 {
+		return m.panelBox(r, title, lipgloss.NewStyle().Faint(true).Render("no completed runs yet"))
+	}
+	width := r.w - 2
+	if width < 24 {
+		width = 24
+	}
+	jobW, statusW, runtimeW := 20, 9, 9
+	nameW := width - jobW - statusW - runtimeW - 3
+	if nameW < 8 {
+		nameW = 8
+	}
+	header := lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf(
+		"%-*s %-*s %-*s %s", jobW, "JOB", statusW, "STATUS", runtimeW, "RUNTIME", "NAME"))
+	lines := []string{header}
+	for _, job := range jobs {
+		seconds, _ := job.DurationSeconds()
+		lines = append(lines, fmt.Sprintf("%-*s %-*s %-*s %s",
+			jobW, truncate(job.JobID, jobW),
+			statusW, truncate(job.Status, statusW),
+			runtimeW, formatAge(time.Duration(seconds*float64(time.Second))),
+			truncate(job.DisplayName(), nameW)))
+	}
+	return m.renderScrollPane(title, lines, r)
 }
 
 func (m Model) renderEvents(r rect) string {
@@ -1017,6 +1051,7 @@ func (m Model) renderHelp(r rect) string {
 		"t                return to live tail",
 		"l                toggle log tail",
 		"e                toggle event table",
+		"s                toggle slowest-runs table",
 		"mouse wheel      zoom chart under pointer",
 		"mouse click      select job / set crosshair",
 		"?                toggle this help",
