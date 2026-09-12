@@ -45,7 +45,17 @@ def start_daemon(tmp_path, max_request_bytes=1024 * 1024):
         except OSError:
             time.sleep(0.05)
     proc.terminate()
-    raise AssertionError("daemon did not start")
+    try:
+        _, err = proc.communicate(timeout=5)
+    except Exception:
+        err = b""
+    log_tail = ""
+    log_path = tmp_path / "state" / "logs" / "daemon.log"
+    if log_path.exists():
+        log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+    raise AssertionError(
+        f"daemon did not start (rc={proc.returncode}): stderr={err[-2000:]!r} log={log_tail!r}"
+    )
 
 
 def request(port, method, path, body=None, headers=None):

@@ -26,6 +26,12 @@ the fixes below.
   write, and `close()` shuts a socket down before closing it so a reader
   blocked in `recv()` wakes promptly on POSIX (previously it could add ~2s to a
   timed-out call).
+- **Failure-streak ordering.** The `on_failure` policy now persists the updated
+  `failure_streak` before emitting the `failure_threshold` event, so a waiter
+  that observes the event always sees the updated policy state.
+- **macOS artifact materialization.** Directory materialization uses the
+  dev/inode-checked plain-path fallback on macOS instead of `/dev/fd`, which is
+  unreliable for creating nested entries under a directory fd.
 - **Orphaned-MCP reaping is safer.** POSIX detection now matches the actual
   Vanth MCP entrypoint (`vanth` console script or `python -m vanth.server`)
   rather than any process whose command line merely mentions a Vanth path, so

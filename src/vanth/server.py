@@ -943,12 +943,18 @@ class JobManager:
             if state.get("last_failure_event_id") == last_terminal["event_id"]:
                 return  # already counted this failed run
             new_streak = streak + 1
-            if new_streak >= after_n and not (state.get("reacted_at_streak") == new_streak):
-                self._react_to_failure(row, on_failure, new_streak)
-                state["reacted_at_streak"] = new_streak
+            react = new_streak >= after_n and state.get("reacted_at_streak") != new_streak
             state["failure_streak"] = new_streak
             state["last_failure_event_id"] = last_terminal["event_id"]
+            if react:
+                state["reacted_at_streak"] = new_streak
+            # Persist the streak BEFORE reacting: _react_to_failure emits the
+            # failure_threshold event, and a waiter that observes that event must
+            # already see the updated policy state (reading between the event
+            # commit and the state save saw no failure_streak).
             self._save_policy_state(job_id, state)
+            if react:
+                self._react_to_failure(row, on_failure, new_streak)
         elif status in {"completed", "timeout", "cancelled", "orphaned"}:
             # A non-failure terminal outcome resets the run identity: the NEXT
             # failure is a fresh run. timeout keeps its existing semantics

@@ -113,6 +113,11 @@ def test_stop_after_restart_kills_runner_and_workload(tmp_path):
     recovered = JobManager(tmp_path)
     stopped = recovered.stop_sync(job_id, kill_after_seconds=0)
     assert stopped["status"] == "cancelled"
+    # Process teardown is asynchronous on Windows; give the OS a bounded window
+    # to reap the runner/workload before asserting they are gone.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (recovered._pid_alive(worker_pid) or recovered._pid_alive(pid)):
+        time.sleep(0.05)
     assert not recovered._pid_alive(worker_pid)
     assert not recovered._pid_alive(pid)
     recovered.close()
