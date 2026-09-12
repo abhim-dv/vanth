@@ -2038,17 +2038,17 @@ class JobManager:
             payload["level"] = "warning"
             data_json = json.dumps(payload["data"], separators=(",", ":"))
         with self.db_lock:
-            for attempt in range(4):
+            for attempt in range(10):
                 try:
                     event = self._emit_transactional(
                         job_id, payload, data_json, event_type, level, source, message
                     )
                     break
                 except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or attempt == 3:
+                    if "locked" not in str(exc).lower() or attempt == 9:
                         raise
                     self.logger.warning("event write contended, retrying job_id=%s attempt=%s", job_id, attempt + 1)
-                    time.sleep(0.05 * (attempt + 1))
+                    time.sleep(min(0.5, 0.05 * (attempt + 1)))
             else:  # pragma: no cover - loop always breaks
                 raise RuntimeError("event write failed")
         if event is not None and event.get("persisted") is not False:

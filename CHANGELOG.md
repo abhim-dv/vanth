@@ -41,6 +41,9 @@ the fixes below.
 - **Idle reaper.** A healthy Desktop wake relay whose activity cadence is
   coarser than the watchdog's sampling interval is no longer idle-reaped (the
   freshness window is the idle threshold, not the sampling interval).
+- **Event write resilience.** Structured-event writes retry further under lock
+  contention instead of being dropped (Windows CI lost reader events under a
+  concurrent job burst).
 - **Orphaned-MCP reaping is safer.** POSIX detection now matches the actual
   Vanth MCP entrypoint (`vanth` console script or `python -m vanth.server`)
   rather than any process whose command line merely mentions a Vanth path, so

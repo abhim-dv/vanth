@@ -106,7 +106,9 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
 
                     assert progress["event"]["type"] == "progress"
                     assert progress["event"]["data"]["current"] == 1
-                    assert progress["status"] == "running"
+                    # The status snapshot is taken when the wait returns; a short
+                    # job can finish first on a loaded runner, so accept either.
+                    assert progress["status"] in {"running", "completed"}
                     assert status["progress"]["current"] >= 1
                     assert status["origin_thread_id"] == "thread_origin"
                     assert status["wake_thread_id"] == "thread_test"
