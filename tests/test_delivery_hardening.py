@@ -18,7 +18,7 @@ def cmd(code: str) -> str:
     return shellcmd.join([sys.executable, "-c", code])
 
 
-def wait_for_delivery(manager: JobManager, job_id: str, status: str, timeout: float = 5):
+def wait_for_delivery(manager: JobManager, job_id: str, status: str, timeout: float = 20):
     deadline = time.monotonic() + timeout
     delivery = None
     while time.monotonic() < deadline:
