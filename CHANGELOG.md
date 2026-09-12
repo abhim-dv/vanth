@@ -32,6 +32,12 @@ the fixes below.
 - **macOS artifact materialization.** Directory materialization uses the
   dev/inode-checked plain-path fallback on macOS instead of `/dev/fd`, which is
   unreliable for creating nested entries under a directory fd.
+- **Daemon startup.** The HTTP server no longer calls `socket.getfqdn` at
+  bind time — a reverse-DNS lookup that can block for seconds (or hang) on
+  locked-down networks and stall startup past client timeouts.
+- **Launch claims.** A new launch claim clears the previous run's
+  `worker_pid`, so stale-claim recovery can no longer skip an abandoned claim
+  whose old runner pid is still momentarily visible.
 - **Orphaned-MCP reaping is safer.** POSIX detection now matches the actual
   Vanth MCP entrypoint (`vanth` console script or `python -m vanth.server`)
   rather than any process whose command line merely mentions a Vanth path, so

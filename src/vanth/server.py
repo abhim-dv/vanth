@@ -3256,7 +3256,7 @@ class JobManager:
                             state["pending_restart_after"] = value
                 token = "claim_" + uuid.uuid4().hex[:16]
                 changed = self.db.execute(
-                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=? "
+                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=?, worker_pid=NULL "
                     "WHERE job_id=? AND status IN ('queued','failed','orphaned') AND policy_disabled=0",
                     (token, json.dumps(state, separators=(",", ":")), now_iso(), job_id),
                 ).rowcount

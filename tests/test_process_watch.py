@@ -136,17 +136,18 @@ def test_watch_loop_activity_keeps_relay_alive():
     relay = threading.Thread(target=relay_poll, daemon=True)
     relay.start()
     try:
-        # Parent self (alive), idle threshold 0.05s, interval 0.005s. Without
-        # activity the process would exit in ~0.05s; the relay's continuous
-        # activity must hold it far past that.
+        # Parent self (alive), idle threshold 0.5s, interval 0.005s. Without
+        # activity the process would exit in ~0.5s; the relay's continuous
+        # activity must hold it far past that. (The threshold is kept well above
+        # runner scheduling jitter, which flaked a 50ms value on macOS.)
         thread = threading.Thread(
             target=_watch_loop,
-            args=(os.getpid(), 0.005, 0.0, 0.05, fake_exit, tracker),
+            args=(os.getpid(), 0.005, 0.0, 0.5, fake_exit, tracker),
             kwargs={"traffic": lambda: 0, "alive": lambda: parent_alive["value"]},
             daemon=True,
         )
         thread.start()
-        time.sleep(0.3)
+        time.sleep(1.2)
         assert not exited, "relay activity must prevent idle exit"
         # Stop the relay AND make the parent "die" so the daemon watchdog thread
         # terminates (a never-exiting daemon thread would keep calling
@@ -174,6 +175,7 @@ def test_watch_loop_blocking_relay_work_keeps_alive():
 
     tracker = _InFlight()
     stop = threading.Event()
+    parent_alive = {"value": True}
 
     def relay_poll():
         # A long-poll that blocks well past the idle threshold (0.05s).
@@ -187,24 +189,18 @@ def test_watch_loop_blocking_relay_work_keeps_alive():
     try:
         thread = threading.Thread(
             target=_watch_loop,
-            args=(os.getpid(), 0.005, 0.0, 0.05, fake_exit, tracker),
-            kwargs={"traffic": lambda: 0, "alive": lambda: True},
+            args=(os.getpid(), 0.005, 0.0, 0.5, fake_exit, tracker),
+            kwargs={"traffic": lambda: 0, "alive": lambda: parent_alive["value"]},
             daemon=True,
         )
         thread.start()
-        time.sleep(0.3)
+        time.sleep(1.2)
         assert not exited, "a blocking relay poll must keep the process alive past the idle timeout"
         stop.set()
         relay.join(timeout=0.5)
         # Flip parent death so the watchdog thread terminates.
-        import vanth.process_watch as pw
-
-        orig_alive = pw.process_alive
-        pw.process_alive = lambda pid: False
-        try:
-            thread.join(timeout=0.5)
-        finally:
-            pw.process_alive = orig_alive
+        parent_alive["value"] = False
+        thread.join(timeout=0.5)
         assert not thread.is_alive(), "watchdog must terminate once the parent dies"
     finally:
         stop.set()
