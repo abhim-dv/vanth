@@ -59,7 +59,9 @@ def start_daemon(tmp_path, max_request_bytes=1024 * 1024):
 
 
 def request(port, method, path, body=None, headers=None):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    # 20s: spawning a runner / DB work can exceed 5s on a loaded Windows runner;
+    # connection-refused is immediate, so the health-poll deadline still holds.
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
     connection.request(method, path, body=body, headers=headers or {})
     response = connection.getresponse()
     payload = json.loads(response.read())
