@@ -1520,6 +1520,13 @@ def test_webhook_redirect_does_not_leak_headers(tmp_path):
 
     class RedirectHandler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
+            # Drain the request body before responding: closing with unread data
+            # in the socket buffer makes the OS send an RST, which surfaces as a
+            # connection-aborted error (WinError 10053) before the client can
+            # read the 302 — masking the redirect-refusal path under test.
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length:
+                self.rfile.read(length)
             self.send_response(302)
             self.send_header("Location", f"http://127.0.0.1:{target_port}/dest")
             self.send_header("Content-Length", "0")
