@@ -935,14 +935,34 @@ class JobManager:
             # stored one so every execution (including restarts) advances the
             # streak exactly once.
             last_terminal = self.db.execute(
-                "SELECT event_id, created_at FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
+                "SELECT event_id, seq FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
                 (job_id,),
             ).fetchone()
             if last_terminal is None:
                 return
-            if state.get("last_failure_event_id") == last_terminal["event_id"]:
+            stored_failure_id = state.get("last_failure_event_id")
+            if stored_failure_id == last_terminal["event_id"]:
                 return  # already counted this failed run
-            new_streak = streak + 1
+            # Count EVERY failed execution since the last counted one, not just
+            # the latest: with a fast restart (backoff 0) two failures can land
+            # between watcher ticks, and incrementing by one per tick undercounts
+            # the streak (Windows CI observed a final streak of 2, not 3).
+            pending = 1
+            if stored_failure_id:
+                stored = self.db.execute(
+                    "SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, stored_failure_id)
+                ).fetchone()
+                if stored is not None:
+                    pending = max(
+                        1,
+                        int(
+                            self.db.execute(
+                                "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq > ?",
+                                (job_id, int(stored["seq"])),
+                            ).fetchone()[0]
+                        ),
+                    )
+            new_streak = streak + pending
             react = new_streak >= after_n and state.get("reacted_at_streak") != new_streak
             state["failure_streak"] = new_streak
             state["last_failure_event_id"] = last_terminal["event_id"]

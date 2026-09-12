@@ -26,9 +26,10 @@ the fixes below.
   write, and `close()` shuts a socket down before closing it so a reader
   blocked in `recv()` wakes promptly on POSIX (previously it could add ~2s to a
   timed-out call).
-- **Failure-streak ordering.** The `on_failure` policy now persists the updated
-  `failure_streak` before emitting the `failure_threshold` event, so a waiter
-  that observes the event always sees the updated policy state.
+- **Failure-streak ordering and counting.** The `on_failure` policy persists
+  the updated `failure_streak` before emitting the `failure_threshold` event,
+  and counts every failed execution since the last watcher tick (fast restarts
+  with backoff 0 no longer undercount the streak).
 - **macOS artifact materialization.** Directory materialization uses the
   dev/inode-checked plain-path fallback on macOS instead of `/dev/fd`, which is
   unreliable for creating nested entries under a directory fd.
