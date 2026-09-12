@@ -1363,8 +1363,16 @@ def test_stale_launch_claim_recovers_to_orphaned(tmp_path):
             manager._recover_stale_launch_claims()
             status = manager.status(job["job_id"])["status"]
             assert status == "orphaned", f"stale claim should be recovered, got {status}"
-            # The recovery emits an orphaned event so waits/wake targets fire.
-            events = manager.events(job["job_id"], types=["orphaned"], limit=10)["events"]
+            # The recovery emits an orphaned event so waits/wake targets fire;
+            # poll briefly since a concurrent dispatcher pass may have won the
+            # recovery and the event write can land a tick later under load.
+            deadline = time.monotonic() + 5
+            events = []
+            while time.monotonic() < deadline:
+                events = manager.events(job["job_id"], types=["orphaned"], limit=10)["events"]
+                if events:
+                    break
+                time.sleep(0.05)
             assert events, "stale-claim recovery must emit an orphaned event"
             # The recovered job is runnable again.
             assert manager.prepare_launch(job["job_id"]) is not None
