@@ -131,7 +131,11 @@ def test_slow_wake_adapter_does_not_delay_stream_parsing(tmp_path):
         start = time.monotonic()
         wait_completed(manager, job_id, timeout=10)
         elapsed = time.monotonic() - start
-        assert elapsed < 4, f"job completion waited on the slow adapter: {elapsed:.2f}s"
+        # The meaningful regression (completion waiting on the 5s adapters) would
+        # need ~15s (10 deliveries / 4 concurrent) and trip the 10s waiter above;
+        # a fast CPU-starved Windows runner can still take several seconds to
+        # spawn the adapter subprocesses, so keep the bound just under the waiter.
+        assert elapsed < 10, f"job completion waited on the slow adapter: {elapsed:.2f}s"
         assert event_counts(manager, job_id)["progress"] == 10
     finally:
         manager.close()
