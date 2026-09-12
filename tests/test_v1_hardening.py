@@ -198,6 +198,13 @@ def test_stop_failure_leaves_running_job_retryable(tmp_path, monkeypatch):
 
 def test_stop_intent_and_pid_publication_interleavings(tmp_path):
     manager = JobManager(tmp_path / "state")
+    # Stop the maintenance loop: it would otherwise reconcile the synthetic
+    # 'running' row (which has no live pid) to 'orphaned' between the
+    # interleavings, so the guarded publish/stop UPDATEs would see a non-running
+    # row and the test would flake.
+    manager.dispatcher_stop.set()
+    if manager.dispatcher_thread is not None:
+        manager.dispatcher_thread.join(timeout=5)
     stamp = "2026-01-01T00:00:00Z"
     with manager.db_lock:
         manager.db.execute(
