@@ -11,8 +11,11 @@ import pytest
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def test_malformed_event_does_not_kill_reader(tmp_path):

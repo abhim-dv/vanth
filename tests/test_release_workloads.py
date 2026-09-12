@@ -20,8 +20,11 @@ import time
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_completed(manager: JobManager, job_id: str, timeout: float = 120) -> None:
@@ -184,7 +187,10 @@ def test_cross_process_emits_keep_unique_seq_and_lose_no_events(tmp_path):
     ) % (str(tmp_path / "state"), job_id)
     procs = [subprocess.Popen([sys.executable, "-c", worker], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(6)]
     for proc in procs:
-        out, err = proc.communicate(timeout=60)
+        # 120s: six processes each commit 100 events; a WAL fsync per commit puts
+        # the contended total near 60s on slower disks/Python builds, so 60s
+        # flaked (matches wait_completed's load-adjusted budget).
+        out, err = proc.communicate(timeout=120)
         assert proc.returncode == 0, err
 
     restarted = JobManager(tmp_path / "state", recover=False)

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import subprocess
 import sys
 import time
 
@@ -9,8 +8,11 @@ import pytest
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def start_job(manager, code, **kwargs):

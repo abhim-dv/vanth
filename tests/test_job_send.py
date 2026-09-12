@@ -7,7 +7,6 @@ channel file, and rerun preserving interactivity.
 """
 
 import asyncio
-import subprocess
 import sys
 
 import pytest
@@ -15,8 +14,11 @@ import pytest
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:

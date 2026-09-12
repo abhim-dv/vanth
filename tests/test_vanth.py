@@ -2,7 +2,6 @@ import asyncio
 import datetime
 import json
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -13,8 +12,11 @@ import pytest
 from vanth.server import JobManager, normalize_event_payload, now_iso, parse_agent_event_line
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def run(coro):
@@ -911,7 +913,7 @@ def test_retention_policy_prunes_events_and_metrics(tmp_path, monkeypatch):
                 "print('AGENT_EVENT ' + json.dumps({'type': 'metric', 'metric': {'loss': 0.5}}), flush=True)\n"
             )
             job = await manager.start(
-                subprocess.list2cmdline([sys.executable, str(script)]),
+                shellcmd.join([sys.executable, str(script)]),
                 policy={"retention": {"events_seconds": 1, "metrics_seconds": 1}},
             )
             await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)

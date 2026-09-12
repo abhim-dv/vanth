@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -12,8 +11,11 @@ from vanth.opencode_bridge import OpenCodeSessionNotFound
 from vanth.server import JobManager, now_iso
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_for_delivery(manager: JobManager, job_id: str, status: str, timeout: float = 5):

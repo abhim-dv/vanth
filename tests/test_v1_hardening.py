@@ -15,8 +15,11 @@ from vanth.runner import _publish_workload
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
@@ -196,19 +199,44 @@ def test_stop_failure_leaves_running_job_retryable(tmp_path, monkeypatch):
 def test_stop_intent_and_pid_publication_interleavings(tmp_path):
     manager = JobManager(tmp_path / "state")
     stamp = "2026-01-01T00:00:00Z"
-    manager.db.execute(
-        "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path) VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
-        ("job_pid_race", "sleep 30", stamp, stamp, "out", "err", "events"),
-    )
-    manager.db.commit()
+    with manager.db_lock:
+        manager.db.execute(
+            "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path) VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
+            ("job_pid_race", "sleep 30", stamp, stamp, "out", "err", "events"),
+        )
+        manager.db.commit()
+
+    def guarded(fn):
+        # Surface worker-thread failures (e.g. a direct DB write racing the
+        # manager's background threads and raising "database is locked") instead
+        # of letting the thread die silently and the assertion see a stale row.
+        def wrapper():
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                errors.append(exc)
+
+        return wrapper
+
+    def join_all(threads):
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in threads), "worker threads did not finish"
+        if errors:
+            raise errors[0]
+
     try:
+        errors: list[BaseException] = []
         barrier = threading.Barrier(2)
         intent_done = threading.Event()
 
         def intent_wins():
             barrier.wait()
-            manager.db.execute("UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status='running'", (stamp, "job_pid_race"))
-            manager.db.commit()
+            with manager.db_lock:
+                manager.db.execute("UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status='running'", (stamp, "job_pid_race"))
+                manager.db.commit()
             intent_done.set()
 
         def publish_after_intent():
@@ -216,15 +244,13 @@ def test_stop_intent_and_pid_publication_interleavings(tmp_path):
             intent_done.wait(timeout=2)
             assert not _publish_workload(manager, "job_pid_race", 123)
 
-        threads = [threading.Thread(target=intent_wins), threading.Thread(target=publish_after_intent)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        join_all([threading.Thread(target=guarded(intent_wins)), threading.Thread(target=guarded(publish_after_intent))])
         assert manager._row("SELECT pid FROM jobs WHERE job_id=?", ("job_pid_race",))["pid"] is None
 
-        manager.db.execute("UPDATE jobs SET stop_requested_at=NULL WHERE job_id=?", ("job_pid_race",))
-        manager.db.commit()
+        with manager.db_lock:
+            manager.db.execute("UPDATE jobs SET stop_requested_at=NULL WHERE job_id=?", ("job_pid_race",))
+            manager.db.commit()
+
         barrier = threading.Barrier(2)
         published = threading.Event()
 
@@ -236,14 +262,11 @@ def test_stop_intent_and_pid_publication_interleavings(tmp_path):
         def intent_after_publish():
             barrier.wait()
             published.wait(timeout=2)
-            manager.db.execute("UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status='running'", (stamp, "job_pid_race"))
-            manager.db.commit()
+            with manager.db_lock:
+                manager.db.execute("UPDATE jobs SET stop_requested_at=? WHERE job_id=? AND status='running'", (stamp, "job_pid_race"))
+                manager.db.commit()
 
-        threads = [threading.Thread(target=publish_before_intent), threading.Thread(target=intent_after_publish)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        join_all([threading.Thread(target=guarded(publish_before_intent)), threading.Thread(target=guarded(intent_after_publish))])
         row = manager._row("SELECT pid, stop_requested_at FROM jobs WHERE job_id=?", ("job_pid_race",))
         assert row["pid"] == 456 and row["stop_requested_at"] == stamp
     finally:

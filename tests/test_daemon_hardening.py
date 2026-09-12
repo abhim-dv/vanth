@@ -13,6 +13,9 @@ import time
 import vanth.daemon as daemon
 
 
+import shellcmd
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -198,7 +201,7 @@ def test_shutdown_returns_controlled_result_to_active_wait(tmp_path):
     token = (tmp_path / "state" / "token").read_text(encoding="utf-8")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        command = subprocess.list2cmdline([sys.executable, "-c", "import time; time.sleep(30)"])
+        command = shellcmd.join([sys.executable, "-c", "import time; time.sleep(30)"])
         status, started = request(port, "POST", "/jobs", json.dumps({"command": command}).encode(), headers)
         assert status == 200
         result = []

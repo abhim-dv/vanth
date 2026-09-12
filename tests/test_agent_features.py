@@ -8,7 +8,6 @@ with its original command/env/targets, and daemon discovery metadata.
 import asyncio
 import json
 import os
-import subprocess
 import sys
 
 import pytest
@@ -16,8 +15,11 @@ import pytest
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
@@ -42,7 +44,7 @@ def test_status_exposes_command_cwd_env_and_timeout(tmp_path):
         )
         wait_event(manager, job_id, "completed")
         status = manager.status(job_id)
-        assert "print('hi')" in status["command"]
+        assert status["command"] == cmd("print('hi')")
         assert status["cwd"] == str(tmp_path)
         assert status["env"] == {"VANTH_TEST_ENV": "present", "SECOND": "two"}
         assert status["timeout_seconds"] == 30
@@ -58,7 +60,7 @@ def test_view_exposes_command_and_env(tmp_path):
         wait_event(manager, job_id, "completed")
         view = manager.agent_view()["jobs"]
         entry = next(j for j in view if j["job_id"] == job_id)
-        assert "print('view')" in entry["command"]
+        assert entry["command"] == cmd("print('view')")
         assert entry["env"] == {"K": "v"}
     finally:
         manager.close()

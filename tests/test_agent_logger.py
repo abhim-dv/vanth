@@ -3,13 +3,15 @@
 import asyncio
 import io
 import json
-import subprocess
 import sys
 
 import pytest
 
 from vanth.agent_logger import logger, log_with_context
 from vanth.server import JobManager, parse_agent_event_line
+
+
+import shellcmd
 
 
 def capture_log(method, *args, **kwargs):
@@ -57,7 +59,7 @@ def test_logger_events_persist_through_daemon(tmp_path):
             "logger.info('loguru line one', phase='train');"
             "logger.warning('loguru warn')"
         )
-        command = subprocess.list2cmdline([sys.executable, "-c", code])
+        command = shellcmd.join([sys.executable, "-c", code])
         job_id = asyncio.run(manager.start(command))["job_id"]
         asyncio.run(manager.wait(job_id, ["log"], timeout_seconds=10))
         asyncio.run(manager.wait(job_id, ["completed"], timeout_seconds=10))
