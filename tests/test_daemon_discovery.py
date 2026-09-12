@@ -29,7 +29,19 @@ def test_daemon_writes_and_removes_discovery_metadata(tmp_path):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and not meta_path.exists():
             time.sleep(0.1)
-        assert meta_path.exists(), "daemon.json not written"
+        if not meta_path.exists():
+            proc.terminate()
+            try:
+                _, err = proc.communicate(timeout=5)
+            except Exception:
+                err = b""
+            log_tail = ""
+            log_path = tmp_path / "logs" / "daemon.log"
+            if log_path.exists():
+                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+            raise AssertionError(
+                f"daemon.json not written (rc={proc.returncode}): stderr={err[-2000:]!r} log={log_tail!r}"
+            )
         payload = json.loads(meta_path.read_text(encoding="utf-8"))
         assert payload["url"] == f"http://127.0.0.1:{port}"
         assert payload["home"] == str(tmp_path.resolve())

@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import secrets
 import signal
+import socketserver
 import threading
 import time
 import urllib.parse
@@ -313,6 +314,16 @@ class TrackingHTTPServer(ThreadingHTTPServer):
         super().__init__(*args, **kwargs)
         self._active_condition = threading.Condition()
         self._active_requests = 0
+
+    def server_bind(self) -> None:
+        # Skip HTTPServer.server_bind's ``socket.getfqdn(host)``: that reverse
+        # DNS lookup can block for seconds (or hang) on locked-down networks,
+        # delaying daemon startup past every client timeout. ``server_name`` is
+        # only cosmetic metadata we do not depend on.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def _request_finished(self) -> None:
         with self._active_condition:

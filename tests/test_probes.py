@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -16,8 +15,11 @@ from vanth.probes import evaluate_probe, validate_probe
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 SLEEP = "import time; time.sleep(30)"

@@ -90,14 +90,19 @@ def test_portable_rename_noreplace(tmp_path):
     assert dst.read_bytes() == b"payload"
     src2.unlink()
 
-    # Directories take the checked-rename branch (link(2) refuses dirs).
+    # Directories are intentionally refused by the portable helper (link(2)
+    # refuses dirs and lstat+rename would reopen a clobber race). Linux and
+    # macOS use renameat2/renameatx_np for directories, so this fail-closed
+    # path is only reached on BSDs.
     if os.name == "nt":
         pytest.skip("directory rename fallback is POSIX-only; Windows never reaches it")
     src_dir = tmp_path / "src-dir"
     src_dir.mkdir()
     dst_dir = tmp_path / "out-dir"
-    ops._rename_noreplace_portable(str(src_dir), str(dst_dir))
-    assert dst_dir.is_dir()
+    with pytest.raises(OSError, match="unsupported"):
+        ops._rename_noreplace_portable(str(src_dir), str(dst_dir))
+    assert not dst_dir.exists()
+    assert src_dir.is_dir()
 
 
 def test_restore_temp_db_name_is_collision_free(tmp_path):

@@ -935,20 +935,46 @@ class JobManager:
             # stored one so every execution (including restarts) advances the
             # streak exactly once.
             last_terminal = self.db.execute(
-                "SELECT event_id, created_at FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
+                "SELECT event_id, seq FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
                 (job_id,),
             ).fetchone()
             if last_terminal is None:
                 return
-            if state.get("last_failure_event_id") == last_terminal["event_id"]:
+            stored_failure_id = state.get("last_failure_event_id")
+            if stored_failure_id == last_terminal["event_id"]:
                 return  # already counted this failed run
-            new_streak = streak + 1
-            if new_streak >= after_n and not (state.get("reacted_at_streak") == new_streak):
-                self._react_to_failure(row, on_failure, new_streak)
-                state["reacted_at_streak"] = new_streak
+            # Count EVERY failed execution since the last counted one, not just
+            # the latest: with a fast restart (backoff 0) two failures can land
+            # between watcher ticks, and incrementing by one per tick undercounts
+            # the streak (Windows CI observed a final streak of 2, not 3).
+            pending = 1
+            if stored_failure_id:
+                stored = self.db.execute(
+                    "SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, stored_failure_id)
+                ).fetchone()
+                if stored is not None:
+                    pending = max(
+                        1,
+                        int(
+                            self.db.execute(
+                                "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq > ?",
+                                (job_id, int(stored["seq"])),
+                            ).fetchone()[0]
+                        ),
+                    )
+            new_streak = streak + pending
+            react = new_streak >= after_n and state.get("reacted_at_streak") != new_streak
             state["failure_streak"] = new_streak
             state["last_failure_event_id"] = last_terminal["event_id"]
+            if react:
+                state["reacted_at_streak"] = new_streak
+            # Persist the streak BEFORE reacting: _react_to_failure emits the
+            # failure_threshold event, and a waiter that observes that event must
+            # already see the updated policy state (reading between the event
+            # commit and the state save saw no failure_streak).
             self._save_policy_state(job_id, state)
+            if react:
+                self._react_to_failure(row, on_failure, new_streak)
         elif status in {"completed", "timeout", "cancelled", "orphaned"}:
             # A non-failure terminal outcome resets the run identity: the NEXT
             # failure is a fresh run. timeout keeps its existing semantics
@@ -2032,17 +2058,17 @@ class JobManager:
             payload["level"] = "warning"
             data_json = json.dumps(payload["data"], separators=(",", ":"))
         with self.db_lock:
-            for attempt in range(4):
+            for attempt in range(10):
                 try:
                     event = self._emit_transactional(
                         job_id, payload, data_json, event_type, level, source, message
                     )
                     break
                 except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or attempt == 3:
+                    if "locked" not in str(exc).lower() or attempt == 9:
                         raise
                     self.logger.warning("event write contended, retrying job_id=%s attempt=%s", job_id, attempt + 1)
-                    time.sleep(0.05 * (attempt + 1))
+                    time.sleep(min(0.5, 0.05 * (attempt + 1)))
             else:  # pragma: no cover - loop always breaks
                 raise RuntimeError("event write failed")
         if event is not None and event.get("persisted") is not False:
@@ -3250,7 +3276,7 @@ class JobManager:
                             state["pending_restart_after"] = value
                 token = "claim_" + uuid.uuid4().hex[:16]
                 changed = self.db.execute(
-                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=? "
+                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=?, worker_pid=NULL "
                     "WHERE job_id=? AND status IN ('queued','failed','orphaned') AND policy_disabled=0",
                     (token, json.dumps(state, separators=(",", ":")), now_iso(), job_id),
                 ).rowcount
@@ -4040,22 +4066,35 @@ class JobManager:
                 events = self._event_query(job_id, filters, since_event_id, 1)
             except RuntimeError:
                 return {"result": "shutdown", "job_id": job_id, "message": "Vanth is shutting down"}
+            # Return the EARLIEST matching signal (terminal / metric threshold /
+            # progress), not a fixed precedence: with a streaming cursor the
+            # caller expects events in order, and a threshold crossed before the
+            # job finished must win over the terminal event that follows it.
+            candidates: list[tuple[int, dict[str, Any]]] = []
             if events:
-                return {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]}
+                candidates.append((
+                    int(events[0].get("seq") or 0),
+                    {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]},
+                ))
             if metric_ge:
                 try:
                     for metric, threshold in metric_ge.items():
                         value = self._latest_metric_value(job_id, metric)
                         if value is not None and value >= threshold:
-                            return {
-                                "result": "metric",
-                                "job_id": job_id,
-                                "status": self.status(job_id)["status"],
-                                "metric": metric,
-                                "threshold": threshold,
-                                "value": value,
-                                "event": self._latest_metric_event(job_id, metric),
-                            }
+                            metric_event = self._latest_metric_event(job_id, metric)
+                            candidates.append((
+                                int((metric_event or {}).get("seq") or 0),
+                                {
+                                    "result": "metric",
+                                    "job_id": job_id,
+                                    "status": self.status(job_id)["status"],
+                                    "metric": metric,
+                                    "threshold": threshold,
+                                    "value": value,
+                                    "event": metric_event,
+                                },
+                            ))
+                            break
                 except RuntimeError:
                     pass
             if return_progress and "progress" not in filters:
@@ -4064,14 +4103,19 @@ class JobManager:
                 except RuntimeError:
                     progress = []
                 if progress:
-                    event = progress[0]
-                    return {
-                        "result": "progress",
-                        "job_id": job_id,
-                        "event": event,
-                        "status": self.status(job_id)["status"],
-                        "progress": event.get("data"),
-                    }
+                    candidates.append((
+                        int(progress[0].get("seq") or 0),
+                        {
+                            "result": "progress",
+                            "job_id": job_id,
+                            "event": progress[0],
+                            "status": self.status(job_id)["status"],
+                            "progress": progress[0].get("data"),
+                        },
+                    ))
+            if candidates:
+                candidates.sort(key=lambda item: item[0])
+                return candidates[0][1]
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"result": "timeout", "job_id": job_id, "status": self.status(job_id)["status"], "message": "No matching event before timeout"}
@@ -5200,7 +5244,10 @@ class JobManager:
         running_jobs = self._running_count()
         # Optional agent adapters being absent is informational, not a health
         # problem: the daemon (and its jobs) are fully functional without them.
-        soft_warning_types = {"codex_unavailable", "opencode_unavailable"}
+        # Orphaned MCP servers are likewise a host-hygiene advisory (reap them
+        # explicitly with `vanth doctor --reap-orphans`), and depend on the
+        # ambient process table, so they must not flip the health exit code.
+        soft_warning_types = {"codex_unavailable", "opencode_unavailable", "orphaned_mcp_servers"}
         hard_warnings = [w for w in warnings if w.get("type") not in soft_warning_types]
         return {
             "ok": not hard_warnings and quick_check == "ok",
@@ -6526,6 +6573,36 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
     return get_client().get("/cleanup/preview", {"older_than_seconds": older_than_seconds})
 
 
+def _is_vanth_mcp_command(command_line: str) -> bool:
+    """Whether a POSIX command line is a Vanth MCP stdio server.
+
+    Matches only the supported launch shapes — the ``vanth`` console script
+    (executable basename ``vanth``) or ``python -m vanth.server`` — so an
+    unrelated process that merely mentions a Vanth path (for example another
+    ``pytest`` running inside the checkout, whose command line contains
+    ``.../vanth-ci/...``) is never mistaken for an MCP server and reaped.
+    """
+    tokens = command_line.split()
+    if not tokens:
+        return False
+
+    def _base(token: str) -> str:
+        return token.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+
+    for i in range(len(tokens) - 1):
+        if tokens[i] == "-m" and tokens[i + 1] in {"vanth.server", "vanth.mcp"}:
+            return True
+    names = {"vanth", "vanth.exe", "vanth-script.py"}
+    if _base(tokens[0]) in names:
+        return True
+    # Console script run through the interpreter: ``python .../vanth``. Require
+    # the interpreter as argv0 so a shell running ``vanth status`` (whose argv0
+    # is the shell) is not mistaken for the stdio server.
+    if len(tokens) >= 2 and _base(tokens[0]).startswith("python") and _base(tokens[1]) in names:
+        return True
+    return False
+
+
 def _orphaned_mcp_servers() -> list[dict[str, Any]]:
     """Find MCP stdio server processes whose launching client is gone.
 
@@ -6568,19 +6645,19 @@ def _orphaned_mcp_servers() -> list[dict[str, Any]]:
                     }
                 )
         else:
-            result = _sp.run(["ps", "-eo", "pid=,ppid=,etime=,comm="],
+            result = _sp.run(["ps", "-eo", "pid=,ppid=,etime=,args="],
                              stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True, timeout=10)
             for line in result.stdout.splitlines():
                 parts = line.split(None, 3)
                 if len(parts) < 4:
                     continue
-                pid, ppid, etime, comm = parts
-                if "vanth" not in comm.lower() and "python" not in comm.lower():
+                pid, ppid, etime, args = parts
+                if not _is_vanth_mcp_command(args):
                     continue
                 candidates.append(
                     {
                         "pid": int(pid),
-                        "name": comm,
+                        "name": args,
                         "started": etime,
                         "ppid": int(ppid) if ppid.isdigit() else None,
                     }

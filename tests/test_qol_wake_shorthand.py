@@ -5,7 +5,6 @@ tmp_path home and real jobs started via asyncio.run(manager.start(...)).
 """
 
 import asyncio
-import subprocess
 import sys
 import time
 
@@ -14,8 +13,11 @@ import pytest
 from vanth.server import JobManager, _build_wake_target
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:

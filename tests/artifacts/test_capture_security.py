@@ -116,6 +116,10 @@ def test_source_mutated_mid_capture_refused(tmp_path, ops, monkeypatch):
     monkeypatch.setattr(manifest_module, "_hash_file_streaming", shrinking_hasher)
     with pytest.raises(ValueError, match="source mutated during capture"):
         build_manifest_from_tree(root, "t")
+    # The first capture shrank the victim; restore the precondition so the
+    # second capture again detects a size change (a same-size rewrite is not
+    # guaranteed to move mtime_ns on POSIX).
+    victim.write_bytes(b"0123456789")
     with pytest.raises(ValueError, match="source mutated during capture"):
         ops.put_dir(root, "t", idempotency_key="mutate-1")
     assert version_count(ops) == 0

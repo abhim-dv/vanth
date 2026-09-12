@@ -10,6 +10,9 @@ import pytest
 from vanth.client import VanthClient
 
 
+import shellcmd
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -17,7 +20,7 @@ def free_port():
 
 
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 @pytest.fixture()
@@ -268,6 +271,28 @@ def test_doctor_reports_orphans_field(daemon):
     payload = json.loads(result.stdout)
     assert "orphaned_mcp_servers" in payload
     assert isinstance(payload["orphaned_mcp_servers"], list)
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # Real Vanth MCP stdio servers:
+        ("/usr/bin/python3 /opt/venv/bin/vanth", True),
+        (r"C:\venv\Scripts\python.exe C:\venv\Scripts\vanth.exe", True),
+        ("/usr/bin/python3 -m vanth.server", True),
+        ("/usr/bin/python3 -O -m vanth.mcp", True),
+        # Not MCP servers — must never be matched (and thus never reaped):
+        ("/home/user/vanth-ci/.venv/bin/python /home/user/vanth-ci/.venv/bin/pytest -q", False),
+        ("/bin/bash -lc cd /home/user/vanth-ci && uv run pytest", False),
+        ("/bin/bash -lc vanth doctor --json", False),
+        ("/usr/bin/python3 -m vanth.runner /home/user/state job_x claim.json", False),
+        ("/usr/bin/python3 -m vanth.daemon", False),
+    ],
+)
+def test_vanth_mcp_command_detection(command, expected):
+    from vanth.server import _is_vanth_mcp_command
+
+    assert _is_vanth_mcp_command(command) is expected
 
 
 def test_remote_list_empty(daemon):

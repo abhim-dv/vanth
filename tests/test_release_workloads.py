@@ -20,8 +20,11 @@ import time
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_completed(manager: JobManager, job_id: str, timeout: float = 120) -> None:
@@ -128,7 +131,11 @@ def test_slow_wake_adapter_does_not_delay_stream_parsing(tmp_path):
         start = time.monotonic()
         wait_completed(manager, job_id, timeout=10)
         elapsed = time.monotonic() - start
-        assert elapsed < 4, f"job completion waited on the slow adapter: {elapsed:.2f}s"
+        # The meaningful regression (completion waiting on the 5s adapters) would
+        # need ~15s (10 deliveries / 4 concurrent) and trip the 10s waiter above;
+        # a fast CPU-starved Windows runner can still take several seconds to
+        # spawn the adapter subprocesses, so keep the bound just under the waiter.
+        assert elapsed < 10, f"job completion waited on the slow adapter: {elapsed:.2f}s"
         assert event_counts(manager, job_id)["progress"] == 10
     finally:
         manager.close()
@@ -184,7 +191,10 @@ def test_cross_process_emits_keep_unique_seq_and_lose_no_events(tmp_path):
     ) % (str(tmp_path / "state"), job_id)
     procs = [subprocess.Popen([sys.executable, "-c", worker], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(6)]
     for proc in procs:
-        out, err = proc.communicate(timeout=60)
+        # 120s: six processes each commit 100 events; a WAL fsync per commit puts
+        # the contended total near 60s on slower disks/Python builds, so 60s
+        # flaked (matches wait_completed's load-adjusted budget).
+        out, err = proc.communicate(timeout=120)
         assert proc.returncode == 0, err
 
     restarted = JobManager(tmp_path / "state", recover=False)

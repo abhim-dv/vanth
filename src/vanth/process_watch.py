@@ -277,8 +277,11 @@ def _watch_loop(
             # Recent relay/tool activity resets the idle timer even though the
             # process is momentarily not busy (review rc38 P1): the Desktop wake
             # relay polls and delivers asynchronously without holding an MCP
-            # request context, and a healthy relay must not be idle-reaped.
-            if now - tracker.last_activity() < interval:
+            # request context, and a healthy relay must not be idle-reaped. The
+            # freshness window is the idle threshold itself — using the (tiny)
+            # sampling interval as the window mis-reaped a healthy relay whose
+            # notify cadence was coarser than the sampler (macOS runners).
+            if now - tracker.last_activity() < idle:
                 idle_since = None
             elif traffic():
                 idle_since = None

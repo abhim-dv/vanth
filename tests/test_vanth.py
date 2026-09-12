@@ -2,7 +2,6 @@ import asyncio
 import datetime
 import json
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -13,8 +12,11 @@ import pytest
 from vanth.server import JobManager, normalize_event_payload, now_iso, parse_agent_event_line
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def run(coro):
@@ -911,7 +913,7 @@ def test_retention_policy_prunes_events_and_metrics(tmp_path, monkeypatch):
                 "print('AGENT_EVENT ' + json.dumps({'type': 'metric', 'metric': {'loss': 0.5}}), flush=True)\n"
             )
             job = await manager.start(
-                subprocess.list2cmdline([sys.executable, str(script)]),
+                shellcmd.join([sys.executable, str(script)]),
                 policy={"retention": {"events_seconds": 1, "metrics_seconds": 1}},
             )
             await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)
@@ -1361,8 +1363,16 @@ def test_stale_launch_claim_recovers_to_orphaned(tmp_path):
             manager._recover_stale_launch_claims()
             status = manager.status(job["job_id"])["status"]
             assert status == "orphaned", f"stale claim should be recovered, got {status}"
-            # The recovery emits an orphaned event so waits/wake targets fire.
-            events = manager.events(job["job_id"], types=["orphaned"], limit=10)["events"]
+            # The recovery emits an orphaned event so waits/wake targets fire;
+            # poll briefly since a concurrent dispatcher pass may have won the
+            # recovery and the event write can land a tick later under load.
+            deadline = time.monotonic() + 5
+            events = []
+            while time.monotonic() < deadline:
+                events = manager.events(job["job_id"], types=["orphaned"], limit=10)["events"]
+                if events:
+                    break
+                time.sleep(0.05)
             assert events, "stale-claim recovery must emit an orphaned event"
             # The recovered job is runnable again.
             assert manager.prepare_launch(job["job_id"]) is not None
@@ -1518,6 +1528,13 @@ def test_webhook_redirect_does_not_leak_headers(tmp_path):
 
     class RedirectHandler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
+            # Drain the request body before responding: closing with unread data
+            # in the socket buffer makes the OS send an RST, which surfaces as a
+            # connection-aborted error (WinError 10053) before the client can
+            # read the 302 — masking the redirect-refusal path under test.
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length:
+                self.rfile.read(length)
             self.send_response(302)
             self.send_header("Location", f"http://127.0.0.1:{target_port}/dest")
             self.send_header("Content-Length", "0")
@@ -1929,6 +1946,13 @@ def test_parent_worker_pid_write_does_not_clear_pending_restart_intent(tmp_path)
             state = manager._policy_state(job["job_id"])
             deadline = state.get("restart_after")
             assert deadline is not None
+
+            # Stop the maintenance loop: it could otherwise re-claim the due
+            # restart and relaunch the job while we assert the abandoned-claim
+            # recovery outcome (a dispatcher race on fast runners).
+            manager.dispatcher_stop.set()
+            if manager.dispatcher_thread is not None:
+                manager.dispatcher_thread.join(timeout=5)
 
             launch = manager._claim_due_restart(job["job_id"], deadline)
             assert launch is not None

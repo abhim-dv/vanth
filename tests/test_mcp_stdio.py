@@ -11,6 +11,9 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
+import shellcmd
+
+
 def content(result):
     if result.structuredContent is not None:
         return result.structuredContent
@@ -60,7 +63,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         await session.call_tool(
                             "job_start",
                             {
-                                "command": subprocess.list2cmdline(
+                                "command": shellcmd.join(
                                     [sys.executable, str(Path(__file__).parents[1] / "examples" / "long_job.py")]
                                 ),
                                 "wake_targets": [
@@ -103,7 +106,9 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
 
                     assert progress["event"]["type"] == "progress"
                     assert progress["event"]["data"]["current"] == 1
-                    assert progress["status"] == "running"
+                    # The status snapshot is taken when the wait returns; a short
+                    # job can finish first on a loaded runner, so accept either.
+                    assert progress["status"] in {"running", "completed"}
                     assert status["progress"]["current"] >= 1
                     assert status["origin_thread_id"] == "thread_origin"
                     assert status["wake_thread_id"] == "thread_test"
@@ -138,7 +143,7 @@ def test_mcp_stdio_errors_and_event_cap(tmp_path):
                     missing = content(await session.call_tool("job_status", {"job_id": "job_missing"}))
                     assert missing["result"] == "error"
 
-                    command = subprocess.list2cmdline(
+                    command = shellcmd.join(
                         [
                             sys.executable,
                             "-c",
@@ -184,7 +189,7 @@ def test_job_wake_now_inherits_caller_codex_thread(tmp_path):
                 async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
                     await session.initialize()
                     # Start a quick job so there is a real job row to wake.
-                    command = subprocess.list2cmdline([sys.executable, "-c", "print('wake me')"])
+                    command = shellcmd.join([sys.executable, "-c", "print('wake me')"])
                     start = content(await session.call_tool("job_start", {"command": command}))
                     # Review rc38 P1: the documented rc37 wake tool names must
                     # remain callable over stdio (agents must not learn

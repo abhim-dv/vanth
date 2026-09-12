@@ -2,6 +2,59 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.9.1 - 2026-09-11
+
+### POSIX Python CI + portability fixes
+
+Enables the Python test matrix on `ubuntu-latest` and `macos-latest` alongside
+Windows (`.github/workflows/ci.yml`). Getting the suite green there surfaced
+the fixes below.
+
+- **Test command builders are POSIX-correct.** A shared `tests/shellcmd.py`
+  quotes workload command strings with `shlex.join` on POSIX and
+  `subprocess.list2cmdline` on Windows, so `python -c "print('x')"`-style jobs
+  run under `sh`/`bash` instead of failing with a shell syntax error. The dev
+  scripts follow the same rule.
+- **`job_wait` returns the earliest matching signal.** When several signals
+  match (terminal event, a `metric_ge` threshold crossed, or
+  `return_progress`), the earliest by event sequence wins instead of always
+  preferring the terminal event. A metric/progress signal that precedes
+  completion is returned first; a terminal event still wins once nothing
+  earlier is pending.
+- **Codex Desktop pipe hardening.** A peer that closes the connection is now
+  reported consistently ("closed the connection") whether detected on read or
+  write, and `close()` shuts a socket down before closing it so a reader
+  blocked in `recv()` wakes promptly on POSIX (previously it could add ~2s to a
+  timed-out call).
+- **Failure-streak ordering and counting.** The `on_failure` policy persists
+  the updated `failure_streak` before emitting the `failure_threshold` event,
+  and counts every failed execution since the last watcher tick (fast restarts
+  with backoff 0 no longer undercount the streak).
+- **macOS artifact materialization.** Directory materialization uses the
+  dev/inode-checked plain-path fallback on macOS instead of `/dev/fd`, which is
+  unreliable for creating nested entries under a directory fd.
+- **Daemon startup.** The HTTP server no longer calls `socket.getfqdn` at
+  bind time — a reverse-DNS lookup that can block for seconds (or hang) on
+  locked-down networks and stall startup past client timeouts.
+- **Launch claims.** A new launch claim clears the previous run's
+  `worker_pid`, so stale-claim recovery can no longer skip an abandoned claim
+  whose old runner pid is still momentarily visible.
+- **Idle reaper.** A healthy Desktop wake relay whose activity cadence is
+  coarser than the watchdog's sampling interval is no longer idle-reaped (the
+  freshness window is the idle threshold, not the sampling interval).
+- **Event write resilience.** Structured-event writes retry further under lock
+  contention instead of being dropped (Windows CI lost reader events under a
+  concurrent job burst).
+- **Orphaned-MCP reaping is safer.** POSIX detection now matches the actual
+  Vanth MCP entrypoint (`vanth` console script or `python -m vanth.server`)
+  rather than any process whose command line merely mentions a Vanth path, so
+  `vanth doctor --reap-orphans` can no longer terminate unrelated processes
+  (such as a `pytest` run inside the checkout). Orphan findings are reported as
+  an advisory warning and no longer flip `vanth doctor`'s exit code.
+
+Full suite: 783 passed, 6 skipped on Windows; 787 passed, 2 skipped on Linux
+(Python 3.12); `go test ./...` green.
+
 ## 1.9.0 - 2026-09-10
 
 ### Operational hardening (from the 2026-09 roadmap research)
