@@ -1932,6 +1932,13 @@ def test_parent_worker_pid_write_does_not_clear_pending_restart_intent(tmp_path)
             deadline = state.get("restart_after")
             assert deadline is not None
 
+            # Stop the maintenance loop: it could otherwise re-claim the due
+            # restart and relaunch the job while we assert the abandoned-claim
+            # recovery outcome (a dispatcher race on fast runners).
+            manager.dispatcher_stop.set()
+            if manager.dispatcher_thread is not None:
+                manager.dispatcher_thread.join(timeout=5)
+
             launch = manager._claim_due_restart(job["job_id"], deadline)
             assert launch is not None
             token = launch["claim_token"]

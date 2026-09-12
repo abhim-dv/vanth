@@ -38,6 +38,9 @@ the fixes below.
 - **Launch claims.** A new launch claim clears the previous run's
   `worker_pid`, so stale-claim recovery can no longer skip an abandoned claim
   whose old runner pid is still momentarily visible.
+- **Idle reaper.** A healthy Desktop wake relay whose activity cadence is
+  coarser than the watchdog's sampling interval is no longer idle-reaped (the
+  freshness window is the idle threshold, not the sampling interval).
 - **Orphaned-MCP reaping is safer.** POSIX detection now matches the actual
   Vanth MCP entrypoint (`vanth` console script or `python -m vanth.server`)
   rather than any process whose command line merely mentions a Vanth path, so
