@@ -942,6 +942,17 @@ class JobManager:
                 return
             last_seq = int(last_terminal["seq"])
             watermark = state.get("failure_streak_after_seq")
+            if watermark is None:
+                # Migration from the pre-1.9.1 marker: resolve the legacy event
+                # id to its job-local sequence so already-counted failures are
+                # not counted a second time after upgrading.
+                legacy_id = state.get("last_failure_event_id")
+                if legacy_id:
+                    legacy = self.db.execute(
+                        "SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, legacy_id)
+                    ).fetchone()
+                    if legacy is not None:
+                        watermark = int(legacy["seq"])
             if watermark is not None and last_seq <= int(watermark):
                 # Every failed execution up to here is already counted. A prior
                 # tick may have committed the streak but failed (or crashed)
@@ -980,6 +991,11 @@ class JobManager:
             # already see the updated policy state (reading between the event
             # commit and the state save saw no failure_streak). The reaction is
             # marked complete only AFTER it succeeds, so a crash/error retries it.
+            # ponytail: at-least-once reaction delivery — a crash between the side
+            # effect and the marker save can repeat it. Harmless in practice
+            # (disable is filtered out of the scan, run_job refuses a busy target,
+            # alerts are advisory); a durable outbox + idempotency key per streak
+            # is the upgrade path if a reaction becomes side-effect-heavy.
             self._save_policy_state(job_id, state)
             if react:
                 self._react_to_failure(row, on_failure, new_streak)
@@ -4104,17 +4120,10 @@ class JobManager:
             if metric_ge:
                 try:
                     for metric, threshold in metric_ge.items():
-                        value = self._latest_metric_value(job_id, metric)
-                        if value is None or value < threshold:
-                            continue
-                        # Cursor-aware: a threshold satisfied only by an event at
-                        # or before since_event_id must not be returned again, or
-                        # a caller that advances the cursor would be handed the
-                        # same metric forever and never reach the terminal event.
-                        # No early break: every satisfied threshold is a candidate
-                        # and the earliest event wins (dict order must not decide).
-                        metric_event = self._latest_metric_event_after(job_id, metric, since_seq)
-                        if metric_event is None:
+                        # Cursor-aware and sample-consistent: the threshold is
+                        # checked against the very sample whose event is returned.
+                        value, metric_event = self._latest_metric_sample_after(job_id, metric, since_seq)
+                        if metric_event is None or value is None or value < threshold:
                             continue
                         candidates.append((
                             int(metric_event.get("seq") or 0),
@@ -4519,21 +4528,29 @@ class JobManager:
             ).fetchone()
         return self._event_dict(row) if row else None
 
-    def _latest_metric_event_after(
+    def _latest_metric_sample_after(
         self, job_id: str, metric: str, after_seq: int
-    ) -> dict[str, Any] | None:
-        """Latest metric event strictly after ``after_seq`` (events.seq)."""
+    ) -> tuple[float | None, dict[str, Any] | None]:
+        """Latest metric sample strictly after ``after_seq``, read atomically.
+
+        Returns ``(value, event)`` for the SAME sample so the threshold check and
+        the returned event cannot disagree: reading the value and the event in
+        separate queries could pair a stale satisfying value with a newer event
+        that no longer satisfies the threshold.
+        """
         with self.db_lock:
             row = self.db.execute(
                 """
-                SELECT e.* FROM events e
+                SELECT e.*, m.y AS metric_value FROM events e
                 JOIN metric_series m ON m.event_id = e.event_id
                 WHERE e.job_id=? AND m.metric=? AND e.seq > ?
                 ORDER BY e.seq DESC LIMIT 1
                 """,
                 (job_id, metric, int(after_seq)),
             ).fetchone()
-        return self._event_dict(row) if row else None
+        if row is None:
+            return None, None
+        return float(row["metric_value"]), self._event_dict(row)
 
     def metric_ingest(self, job_id: str, metrics: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
         """Record scalar metric points for a job programmatically.
@@ -6630,6 +6647,15 @@ _VANTH_CLI_SUBCOMMANDS = {
 
 _VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw"}
 
+# Interpreter options the MCP launch shape may carry. Valueless options are
+# skipped; value-taking options consume the next token; ANYTHING else that
+# starts with "-" (unknown option, long option, or an attached ``-c<payload>``)
+# refuses the match — the reaper kills what it accepts, so ambiguity loses.
+_PY_VALUELESS_OPTIONS = {
+    "-O", "-OO", "-B", "-b", "-d", "-E", "-I", "-q", "-R", "-s", "-S", "-u", "-v",
+}
+_PY_VALUED_OPTIONS = {"-X", "-W"}
+
 
 def _is_vanth_mcp_command(command_line: str) -> bool:
     """Whether a command line is a Vanth MCP stdio server (not a CLI command).
@@ -6638,13 +6664,25 @@ def _is_vanth_mcp_command(command_line: str) -> bool:
     reported process, so the matcher accepts only the exact supported launch
     shapes and rejects anything ambiguous:
 
-    - ``<python> -m vanth.server`` / ``-m vanth.mcp`` (the ``-m`` must be the
-      interpreter's first argument; ``python unrelated.py -m vanth.server`` and
-      ``bash -lc 'python -m vanth.server'`` are rejected), and
+    - ``<python> -m vanth.server`` / ``-m vanth.mcp`` (``-m`` must be the
+      interpreter's launching argument; ``python unrelated.py -m vanth.server``,
+      ``bash -lc 'python -m vanth.server'`` and ``python -c<payload>`` are
+      rejected), and
     - the ``vanth`` console script (``vanth`` / ``python .../vanth``) run with
       no CLI subcommand — ``vanth logs --follow`` is the CLI, not MCP.
+
+    A quoted ``argv0`` (Windows ``"C:\\Program Files\\Python\\python.exe" ...``)
+    is split off before tokenizing; arguments after it are whitespace-split, so
+    a quoting trick later in the line can only cause a REJECTION, never a false
+    match. Missing a genuine exotic launch is the safe failure mode.
     """
-    tokens = command_line.split()
+    if command_line.startswith('"'):
+        end = command_line.find('"', 1)
+        if end == -1:
+            return False
+        tokens = [command_line[1:end]] + command_line[end + 1:].split()
+    else:
+        tokens = command_line.split()
     if not tokens:
         return False
 
@@ -6654,26 +6692,29 @@ def _is_vanth_mcp_command(command_line: str) -> bool:
 
     def _is_cli_script(script_index: int) -> bool:
         rest = tokens[script_index + 1:]
-        return bool(rest) and rest[0] in _VANTH_CLI_SUBCOMMANDS
+        # Quoted subcommand (``vanth "logs"``) is still a CLI invocation.
+        return bool(rest) and rest[0].strip("\"'") in _VANTH_CLI_SUBCOMMANDS
 
     if _base(tokens[0]).startswith("python"):
-        # Walk the interpreter's own options to where the launching argument is:
-        # ``-m module`` (the supported MCP shape), ``-c payload`` (never us), or
-        # the first non-option token (a script path — matched only when it is the
+        # Walk the interpreter's own options to the launching argument:
+        # ``-m module`` (the supported MCP shape), ``-c`` (never us), or the
+        # first non-option token (a script path — matched only when it is the
         # ``vanth`` console script with no CLI subcommand).
         i = 1
         while i < len(tokens):
             tok = tokens[i]
             if tok == "-m":
                 return i + 1 < len(tokens) and tokens[i + 1] in {"vanth.server", "vanth.mcp"}
-            if tok == "-c":
+            if tok == "-c" or tok.startswith("-c"):
                 return False
-            if tok in ("-X", "-W"):  # options that consume a following value
+            if tok in _PY_VALUED_OPTIONS:
                 i += 2
                 continue
-            if tok.startswith("-"):
+            if tok in _PY_VALUELESS_OPTIONS:
                 i += 1
                 continue
+            if tok.startswith("-"):
+                return False
             if _base(tok) in _VANTH_SCRIPT_NAMES:
                 return not _is_cli_script(i)
             return False

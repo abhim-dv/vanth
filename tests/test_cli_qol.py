@@ -281,12 +281,19 @@ def test_doctor_reports_orphans_field(daemon):
         (r"C:\venv\Scripts\python.exe C:\venv\Scripts\vanth.exe", True),
         ("/usr/bin/python3 -m vanth.server", True),
         ("/usr/bin/python3 -O -m vanth.mcp", True),
+        ('"C:\\Program Files\\Python\\python.exe" -m vanth.server', True),
+        ("/usr/bin/python3 -X dev -m vanth.server", True),
         # Not MCP servers — must never be matched (and thus never reaped):
         ("/home/user/vanth-ci/.venv/bin/python /home/user/vanth-ci/.venv/bin/pytest -q", False),
         ("/bin/bash -lc cd /home/user/vanth-ci && uv run pytest", False),
         ("/bin/bash -lc vanth doctor --json", False),
         ("/usr/bin/python3 -m vanth.runner /home/user/state job_x claim.json", False),
         ("/usr/bin/python3 -m vanth.daemon", False),
+        # Lookalikes the reaper must refuse to kill:
+        ('vanth "logs" --follow', False),
+        ("/usr/bin/python -c__import__('time').sleep(600) vanth", False),
+        ("/usr/bin/python3 unrelated.py -m vanth.server", False),
+        ("/usr/bin/python3 -O vanth status", False),
     ],
 )
 def test_vanth_mcp_command_detection(command, expected):

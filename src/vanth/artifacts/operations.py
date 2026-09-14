@@ -1196,8 +1196,12 @@ class ArtifactOperations:
                     # macOS fallback builds through the plain path (no /proc fd
                     # symlink). Re-verify the destination parent AND the staging
                     # directory still resolve to the descriptors we opened, so a
-                    # racing ancestor swap cannot publish a redirected or empty
-                    # tree — fail closed instead.
+                    # PERSISTENT ancestor swap cannot publish a redirected or
+                    # empty tree — fail closed instead.
+                    # ponytail: residual race remains — a swap restored before
+                    # this check, or a staging-name replacement under an
+                    # unchanged parent, is not caught; closing that needs
+                    # descriptor-relative tree construction on macOS.
                     try:
                         path_parent = os.stat(dest.parent)
                         fd_parent = os.fstat(parent_fd)

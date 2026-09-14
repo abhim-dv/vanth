@@ -34,13 +34,21 @@ the fixes below.
   and counts every failed execution in the interval between two event-sequence
   watermarks (bounded at the latest failure read, so a concurrent failure is
   neither skipped nor double-counted; a fast restart with backoff 0 no longer
-  undercounts). The reaction is marked complete only after it succeeds, so a
-  daemon crash or action error retries it instead of dropping it.
+  undercounts; state written by 1.9.0 is migrated, so an upgrade does not
+  recount old failures). The reaction is marked complete only after it
+  succeeds, so a daemon crash or action error retries it instead of dropping
+  it — at-least-once delivery: a crash between the side effect and the marker
+  save can repeat it, which is harmless for the built-in actions (disable
+  excludes the job from the scan, run_job refuses a busy target, alerts are
+  advisory).
 - **macOS artifact materialization.** Directory materialization uses the
   dev/inode-checked plain-path fallback on macOS instead of `/dev/fd`, which is
-  unreliable for creating nested entries under a directory fd; the parent and
-  staging descriptors are re-verified immediately before publication and the
-  operation fails closed if an ancestor was swapped mid-write.
+  unreliable for creating nested entries under a directory fd; the destination
+  parent and staging descriptors are re-verified immediately before publication
+  and the operation fails closed if the parent was persistently swapped
+  mid-write. A transient swap restored before the check, or a staging-directory
+  replacement under an unchanged parent, is still not caught — closing that
+  requires descriptor-relative tree construction on macOS.
 - **Daemon startup.** The HTTP server no longer calls `socket.getfqdn` at
   bind time — a reverse-DNS lookup that can block for seconds (or hang) on
   locked-down networks and stall startup past client timeouts.

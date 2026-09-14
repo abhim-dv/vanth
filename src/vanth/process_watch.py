@@ -258,6 +258,11 @@ def _watch_loop(
     alive = alive or (lambda: process_alive(parent))
     dead_since: float | None = None
     idle_since: float | None = None
+    # Most recent activity from EITHER source, retained across iterations: a
+    # one-shot stdin traffic sample must be remembered, not just for the single
+    # iteration that observed it (the tracker's own timestamp can already be
+    # stale by the next sample, which would reap ~two intervals after traffic).
+    last_seen_activity = tracker.last_activity()
     while True:
         time.sleep(interval)
         now = time.monotonic()
@@ -281,16 +286,18 @@ def _watch_loop(
             # freshness window is the idle threshold itself — using the (tiny)
             # sampling interval as the window mis-reaped a healthy relay whose
             # notify cadence was coarser than the sampler (macOS runners).
-            # Measure from the last observed activity and seed ``idle_since``
-            # with it, so the effective timeout is ``idle`` (not ~2x from
-            # starting a second window once the freshness window expires).
-            last_activity = tracker.last_activity()
+            # ``idle_since`` is seeded from the activity timestamp itself, so
+            # the effective timeout is ``idle`` (not ~2x from starting a second
+            # window once the freshness window expires).
             if traffic():
-                last_activity = now
-            if now - last_activity < idle:
+                last_seen_activity = now
+            tracker_activity = tracker.last_activity()
+            if tracker_activity > last_seen_activity:
+                last_seen_activity = tracker_activity
+            if now - last_seen_activity < idle:
                 idle_since = None
             elif idle_since is None:
-                idle_since = last_activity
+                idle_since = last_seen_activity
             elif now - idle_since >= idle:
                 on_exit()
                 return
