@@ -156,7 +156,10 @@ def test_retry_due_after_manager_restart_is_dispatched(tmp_path):
         )
     )
     retrying = wait_for_delivery(manager, started["job_id"], "retrying")
-    assert retrying is not None
+    # Assert the transient retry state was actually observed BEFORE the manager
+    # is closed: otherwise the helper can return an already-delivered row and the
+    # test would never exercise recovery across a restart.
+    assert retrying is not None and retrying["status"] == "retrying"
     manager.close()
 
     restarted = JobManager(home)

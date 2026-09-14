@@ -1162,6 +1162,7 @@ class ArtifactOperations:
 
         staging_name = f".{dest.name}.materializing-{uuid.uuid4().hex}"
         parent_fd = None
+        path_anchored = False
         if os.name == "nt":
             staging = dest.parent / staging_name
             staging.mkdir()
@@ -1187,9 +1188,35 @@ class ArtifactOperations:
                         f"destination parent changed during materialization; refusing: {dest.parent}"
                     )
                 staging = dest.parent / staging_name
+                path_anchored = True
         try:
             try:
                 self._build_tree_into_staging(staging, entries, heartbeat)
+                if path_anchored and parent_fd is not None:
+                    # macOS fallback builds through the plain path (no /proc fd
+                    # symlink). Re-verify the destination parent AND the staging
+                    # directory still resolve to the descriptors we opened, so a
+                    # racing ancestor swap cannot publish a redirected or empty
+                    # tree — fail closed instead.
+                    try:
+                        path_parent = os.stat(dest.parent)
+                        fd_parent = os.fstat(parent_fd)
+                        path_staging = os.stat(staging)
+                        fd_staging = os.stat(staging_name, dir_fd=parent_fd)
+                    except OSError as exc:
+                        raise ValueError(
+                            f"staging path changed during materialization; refusing: {dest} ({exc})"
+                        ) from None
+                    if (path_parent.st_dev, path_parent.st_ino) != (
+                        fd_parent.st_dev,
+                        fd_parent.st_ino,
+                    ) or (path_staging.st_dev, path_staging.st_ino) != (
+                        fd_staging.st_dev,
+                        fd_staging.st_ino,
+                    ):
+                        raise ValueError(
+                            f"destination parent changed during materialization; refusing: {dest}"
+                        )
                 # Atomic swap into place: rename fails rather than merges if
                 # a destination raced into existence.
                 if parent_fd is None:

@@ -281,12 +281,16 @@ def _watch_loop(
             # freshness window is the idle threshold itself — using the (tiny)
             # sampling interval as the window mis-reaped a healthy relay whose
             # notify cadence was coarser than the sampler (macOS runners).
-            if now - tracker.last_activity() < idle:
-                idle_since = None
-            elif traffic():
+            # Measure from the last observed activity and seed ``idle_since``
+            # with it, so the effective timeout is ``idle`` (not ~2x from
+            # starting a second window once the freshness window expires).
+            last_activity = tracker.last_activity()
+            if traffic():
+                last_activity = now
+            if now - last_activity < idle:
                 idle_since = None
             elif idle_since is None:
-                idle_since = now
+                idle_since = last_activity
             elif now - idle_since >= idle:
                 on_exit()
                 return

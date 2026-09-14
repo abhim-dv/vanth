@@ -178,10 +178,12 @@ def test_watch_loop_blocking_relay_work_keeps_alive():
     parent_alive = {"value": True}
 
     def relay_poll():
-        # A long-poll that blocks well past the idle threshold (0.05s).
+        # A long-poll that blocks well past the 0.1s idle threshold: if the
+        # watchdog ignored the in-flight tracker the process would be reaped
+        # during the poll.
         while not stop.is_set():
             with tracker:
-                time.sleep(0.2)
+                time.sleep(0.5)
             time.sleep(0.01)
 
     relay = threading.Thread(target=relay_poll, daemon=True)
@@ -189,7 +191,7 @@ def test_watch_loop_blocking_relay_work_keeps_alive():
     try:
         thread = threading.Thread(
             target=_watch_loop,
-            args=(os.getpid(), 0.005, 0.0, 0.5, fake_exit, tracker),
+            args=(os.getpid(), 0.005, 0.0, 0.1, fake_exit, tracker),
             kwargs={"traffic": lambda: 0, "alive": lambda: parent_alive["value"]},
             daemon=True,
         )

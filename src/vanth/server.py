@@ -927,54 +927,64 @@ class JobManager:
         streak = int(state.get("failure_streak", 0))
         status = row["status"]
         if status == "failed":
-            # Count each failed EXECUTION exactly once (review P1-2 / P2):
-            # the failure event is the unit, identified by its event_id. A failed
-            # row that stays failed across many watcher ticks is not re-counted,
-            # but an automatic RESTART that reuses the same job row emits a NEW
-            # failed event with a new id — compare the latest failed event to the
-            # stored one so every execution (including restarts) advances the
-            # streak exactly once.
+            # Count each failed EXECUTION exactly once (review P1-2 / P2): the
+            # failure event is the unit. A failed row that stays failed across
+            # many watcher ticks is not re-counted, but an automatic RESTART that
+            # reuses the same job row emits a NEW failed event, so the streak is
+            # measured between two event-sequence watermarks. The upper bound is
+            # the row we just read: a failure committed between the two queries
+            # must not be counted here AND again on the next tick.
             last_terminal = self.db.execute(
                 "SELECT event_id, seq FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
                 (job_id,),
             ).fetchone()
             if last_terminal is None:
                 return
-            stored_failure_id = state.get("last_failure_event_id")
-            if stored_failure_id == last_terminal["event_id"]:
-                return  # already counted this failed run
-            # Count EVERY failed execution since the last counted one, not just
-            # the latest: with a fast restart (backoff 0) two failures can land
-            # between watcher ticks, and incrementing by one per tick undercounts
-            # the streak (Windows CI observed a final streak of 2, not 3).
-            pending = 1
-            if stored_failure_id:
-                stored = self.db.execute(
-                    "SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, stored_failure_id)
-                ).fetchone()
-                if stored is not None:
-                    pending = max(
-                        1,
-                        int(
-                            self.db.execute(
-                                "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq > ?",
-                                (job_id, int(stored["seq"])),
-                            ).fetchone()[0]
-                        ),
-                    )
-            new_streak = streak + pending
+            last_seq = int(last_terminal["seq"])
+            watermark = state.get("failure_streak_after_seq")
+            if watermark is not None and last_seq <= int(watermark):
+                # Every failed execution up to here is already counted. A prior
+                # tick may have committed the streak but failed (or crashed)
+                # before completing the reaction: retry it instead of dropping it.
+                if streak >= after_n and state.get("reacted_at_streak") != streak:
+                    self._react_to_failure(row, on_failure, streak)
+                    state["reacted_at_streak"] = streak
+                    self._save_policy_state(job_id, state)
+                return
+            # Count EVERY failed execution in the interval, not just the latest:
+            # with a fast restart two failures can land between watcher ticks and
+            # incrementing by one per tick undercounts (Windows CI saw a final
+            # streak of 2, not 3). With no watermark (fresh streak / first-ever
+            # failure) count from the beginning so a pre-existing backlog is not
+            # collapsed to one.
+            if watermark is None:
+                pending = int(
+                    self.db.execute(
+                        "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq<=?",
+                        (job_id, last_seq),
+                    ).fetchone()[0]
+                )
+            else:
+                pending = int(
+                    self.db.execute(
+                        "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq>? AND seq<=?",
+                        (job_id, int(watermark), last_seq),
+                    ).fetchone()[0]
+                )
+            new_streak = streak + max(1, pending)
             react = new_streak >= after_n and state.get("reacted_at_streak") != new_streak
             state["failure_streak"] = new_streak
-            state["last_failure_event_id"] = last_terminal["event_id"]
-            if react:
-                state["reacted_at_streak"] = new_streak
+            state["failure_streak_after_seq"] = last_seq
             # Persist the streak BEFORE reacting: _react_to_failure emits the
             # failure_threshold event, and a waiter that observes that event must
             # already see the updated policy state (reading between the event
-            # commit and the state save saw no failure_streak).
+            # commit and the state save saw no failure_streak). The reaction is
+            # marked complete only AFTER it succeeds, so a crash/error retries it.
             self._save_policy_state(job_id, state)
             if react:
                 self._react_to_failure(row, on_failure, new_streak)
+                state["reacted_at_streak"] = new_streak
+                self._save_policy_state(job_id, state)
         elif status in {"completed", "timeout", "cancelled", "orphaned"}:
             # A non-failure terminal outcome resets the run identity: the NEXT
             # failure is a fresh run. timeout keeps its existing semantics
@@ -982,10 +992,16 @@ class JobManager:
             # otherwise it continues the streak as before). Only reset when we
             # actually have a streak to clear, so the watcher stays a no-op for
             # jobs that never failed.
-            if state.get("failure_streak") or state.get("last_failure_event_id"):
+            if state.get("failure_streak") or state.get("failure_streak_after_seq") is not None:
                 state["failure_streak"] = 0
                 state.pop("reacted_at_streak", None)
-                state.pop("last_failure_event_id", None)
+                # Move the watermark past the failures that preceded this success
+                # so the next streak counts only failures after the reset.
+                latest_failed = self.db.execute(
+                    "SELECT seq FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                state["failure_streak_after_seq"] = int(latest_failed["seq"]) if latest_failed else 0
                 self._save_policy_state(job_id, state)
 
     def _watch_restart(self, row: sqlite3.Row, restart: dict[str, Any]) -> None:
@@ -3722,7 +3738,9 @@ class JobManager:
         if prior_state and json.loads(row["policy_json"] or "null"):
             # Carry ONLY the failure streak: reacted_* dedup markers belong to
             # the previous runner instance and must not suppress the next
-            # failure's reaction.
+            # failure's reaction. The counting watermark is NOT carried — event
+            # ``seq`` is per-job, so the rerun's fresh sequence counts its own
+            # failures from the start (carrying the old seq would suppress them).
             self._save_policy_state(result["job_id"], {"failure_streak": int(prior_state.get("failure_streak", 0))})
         return result
 
@@ -4071,6 +4089,13 @@ class JobManager:
             # caller expects events in order, and a threshold crossed before the
             # job finished must win over the terminal event that follows it.
             candidates: list[tuple[int, dict[str, Any]]] = []
+            since_seq = 0
+            if since_event_id:
+                since_row = self._row(
+                    "SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, since_event_id)
+                )
+                if since_row is not None:
+                    since_seq = int(since_row["seq"])
             if events:
                 candidates.append((
                     int(events[0].get("seq") or 0),
@@ -4080,21 +4105,29 @@ class JobManager:
                 try:
                     for metric, threshold in metric_ge.items():
                         value = self._latest_metric_value(job_id, metric)
-                        if value is not None and value >= threshold:
-                            metric_event = self._latest_metric_event(job_id, metric)
-                            candidates.append((
-                                int((metric_event or {}).get("seq") or 0),
-                                {
-                                    "result": "metric",
-                                    "job_id": job_id,
-                                    "status": self.status(job_id)["status"],
-                                    "metric": metric,
-                                    "threshold": threshold,
-                                    "value": value,
-                                    "event": metric_event,
-                                },
-                            ))
-                            break
+                        if value is None or value < threshold:
+                            continue
+                        # Cursor-aware: a threshold satisfied only by an event at
+                        # or before since_event_id must not be returned again, or
+                        # a caller that advances the cursor would be handed the
+                        # same metric forever and never reach the terminal event.
+                        # No early break: every satisfied threshold is a candidate
+                        # and the earliest event wins (dict order must not decide).
+                        metric_event = self._latest_metric_event_after(job_id, metric, since_seq)
+                        if metric_event is None:
+                            continue
+                        candidates.append((
+                            int(metric_event.get("seq") or 0),
+                            {
+                                "result": "metric",
+                                "job_id": job_id,
+                                "status": self.status(job_id)["status"],
+                                "metric": metric,
+                                "threshold": threshold,
+                                "value": value,
+                                "event": metric_event,
+                            },
+                        ))
                 except RuntimeError:
                     pass
             if return_progress and "progress" not in filters:
@@ -4483,6 +4516,22 @@ class JobManager:
                 ORDER BY m.seq DESC LIMIT 1
                 """,
                 (job_id, metric),
+            ).fetchone()
+        return self._event_dict(row) if row else None
+
+    def _latest_metric_event_after(
+        self, job_id: str, metric: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """Latest metric event strictly after ``after_seq`` (events.seq)."""
+        with self.db_lock:
+            row = self.db.execute(
+                """
+                SELECT e.* FROM events e
+                JOIN metric_series m ON m.event_id = e.event_id
+                WHERE e.job_id=? AND m.metric=? AND e.seq > ?
+                ORDER BY e.seq DESC LIMIT 1
+                """,
+                (job_id, metric, int(after_seq)),
             ).fetchone()
         return self._event_dict(row) if row else None
 
@@ -6573,33 +6622,64 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
     return get_client().get("/cleanup/preview", {"older_than_seconds": older_than_seconds})
 
 
-def _is_vanth_mcp_command(command_line: str) -> bool:
-    """Whether a POSIX command line is a Vanth MCP stdio server.
+_VANTH_CLI_SUBCOMMANDS = {
+    "status", "doctor", "restart", "setup", "--help", "-h", "help",
+    "list", "ps", "logs", "tail", "stop", "artifacts", "prune",
+    "autostart", "--version", "version", "remote",
+}
 
-    Matches only the supported launch shapes — the ``vanth`` console script
-    (executable basename ``vanth``) or ``python -m vanth.server`` — so an
-    unrelated process that merely mentions a Vanth path (for example another
-    ``pytest`` running inside the checkout, whose command line contains
-    ``.../vanth-ci/...``) is never mistaken for an MCP server and reaped.
+_VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw"}
+
+
+def _is_vanth_mcp_command(command_line: str) -> bool:
+    """Whether a command line is a Vanth MCP stdio server (not a CLI command).
+
+    A false positive here is not cosmetic: the orphan reaper terminates every
+    reported process, so the matcher accepts only the exact supported launch
+    shapes and rejects anything ambiguous:
+
+    - ``<python> -m vanth.server`` / ``-m vanth.mcp`` (the ``-m`` must be the
+      interpreter's first argument; ``python unrelated.py -m vanth.server`` and
+      ``bash -lc 'python -m vanth.server'`` are rejected), and
+    - the ``vanth`` console script (``vanth`` / ``python .../vanth``) run with
+      no CLI subcommand — ``vanth logs --follow`` is the CLI, not MCP.
     """
     tokens = command_line.split()
     if not tokens:
         return False
 
     def _base(token: str) -> str:
+        token = token.strip("\"'")
         return token.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
 
-    for i in range(len(tokens) - 1):
-        if tokens[i] == "-m" and tokens[i + 1] in {"vanth.server", "vanth.mcp"}:
-            return True
-    names = {"vanth", "vanth.exe", "vanth-script.py"}
-    if _base(tokens[0]) in names:
-        return True
-    # Console script run through the interpreter: ``python .../vanth``. Require
-    # the interpreter as argv0 so a shell running ``vanth status`` (whose argv0
-    # is the shell) is not mistaken for the stdio server.
-    if len(tokens) >= 2 and _base(tokens[0]).startswith("python") and _base(tokens[1]) in names:
-        return True
+    def _is_cli_script(script_index: int) -> bool:
+        rest = tokens[script_index + 1:]
+        return bool(rest) and rest[0] in _VANTH_CLI_SUBCOMMANDS
+
+    if _base(tokens[0]).startswith("python"):
+        # Walk the interpreter's own options to where the launching argument is:
+        # ``-m module`` (the supported MCP shape), ``-c payload`` (never us), or
+        # the first non-option token (a script path — matched only when it is the
+        # ``vanth`` console script with no CLI subcommand).
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "-m":
+                return i + 1 < len(tokens) and tokens[i + 1] in {"vanth.server", "vanth.mcp"}
+            if tok == "-c":
+                return False
+            if tok in ("-X", "-W"):  # options that consume a following value
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            if _base(tok) in _VANTH_SCRIPT_NAMES:
+                return not _is_cli_script(i)
+            return False
+        return False
+    if _base(tokens[0]) in _VANTH_SCRIPT_NAMES:
+        return not _is_cli_script(0)
     return False
 
 
@@ -6619,29 +6699,37 @@ def _orphaned_mcp_servers() -> list[dict[str, Any]]:
     candidates = []
     try:
         if sys.platform == "win32":
+            # Get-CimInstance provides the COMMAND LINE (WMIC CSV does not, and
+            # its columns are ordered alphabetically, so the old positional parse
+            # both misread the fields and could not establish MCP identity).
+            # JSON output avoids comma-splitting a command line containing commas.
             result = _sp.run(
-                ["wmic", "process", "get", "name,processid,parentprocessid,creationdate", "/format:csv"],
-                stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True, timeout=10,
+                [
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_Process | "
+                    "Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine | "
+                    "ConvertTo-Json -Compress",
+                ],
+                stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True, timeout=15,
             )
-            for line in result.stdout.splitlines()[1:]:
-                if not line.strip():
+            raw = (result.stdout or "").strip()
+            records = json.loads(raw) if raw else []
+            if isinstance(records, dict):
+                records = [records]
+            for rec in records:
+                cmdline = rec.get("CommandLine") or ""
+                if not _is_vanth_mcp_command(cmdline):
                     continue
-                parts = line.split(",")
-                if len(parts) < 5:
+                pid = rec.get("ProcessId")
+                if isinstance(pid, bool) or not isinstance(pid, int):
                     continue
-                _, name, pid, ppid, created = parts[:5]
-                name = (name or "").strip()
-                pid_s = (pid or "").strip()
-                if not name or not pid_s.isdigit():
-                    continue
-                if "vanth" not in name.lower() and "python" not in name.lower():
-                    continue
+                ppid = rec.get("ParentProcessId")
                 candidates.append(
                     {
-                        "pid": int(pid_s),
-                        "name": name,
-                        "started": created.strip(),
-                        "ppid": int(ppid.strip()) if (ppid or "").strip().isdigit() else None,
+                        "pid": pid,
+                        "name": cmdline,
+                        "started": str(rec.get("CreationDate") or ""),
+                        "ppid": ppid if isinstance(ppid, int) and not isinstance(ppid, bool) else None,
                     }
                 )
         else:
@@ -6711,11 +6799,7 @@ def main(argv: list[str] | None = None) -> None:
     # Human-facing subcommands are dispatched to the CLI; anything else
     # (including no args) runs the MCP stdio server, which is what MCP
     # clients expect from `vanth` (bare).
-    if args and args[0] in {
-        "status", "doctor", "restart", "setup", "--help", "-h", "help",
-        "list", "ps", "logs", "tail", "stop", "artifacts", "prune",
-        "autostart", "--version", "version", "remote",
-    }:
+    if args and args[0] in _VANTH_CLI_SUBCOMMANDS:
         raise SystemExit(cli_main(args))
     # Interactive misuse guard (user report): bare `vanth` typed in a real
     # terminal would otherwise start the MCP stdio server and appear to
