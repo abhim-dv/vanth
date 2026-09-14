@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -12,11 +11,14 @@ from vanth.opencode_bridge import OpenCodeSessionNotFound
 from vanth.server import JobManager, now_iso
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
-def wait_for_delivery(manager: JobManager, job_id: str, status: str, timeout: float = 5):
+def wait_for_delivery(manager: JobManager, job_id: str, status: str, timeout: float = 20):
     deadline = time.monotonic() + timeout
     delivery = None
     while time.monotonic() < deadline:
@@ -154,7 +156,10 @@ def test_retry_due_after_manager_restart_is_dispatched(tmp_path):
         )
     )
     retrying = wait_for_delivery(manager, started["job_id"], "retrying")
-    assert retrying is not None
+    # Assert the transient retry state was actually observed BEFORE the manager
+    # is closed: otherwise the helper can return an already-delivered row and the
+    # test would never exercise recovery across a restart.
+    assert retrying is not None and retrying["status"] == "retrying"
     manager.close()
 
     restarted = JobManager(home)

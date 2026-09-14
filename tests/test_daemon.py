@@ -6,6 +6,9 @@ import time
 from vanth.client import VanthClient
 
 
+import shellcmd
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -39,7 +42,7 @@ def test_daemon_http_job_flow(tmp_path):
         job = client.post(
             "/jobs",
             {
-                "command": subprocess.list2cmdline(
+                "command": shellcmd.join(
                     [
                         sys.executable,
                         "-c",

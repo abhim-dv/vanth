@@ -13,6 +13,9 @@ import time
 import vanth.daemon as daemon
 
 
+import shellcmd
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -42,11 +45,23 @@ def start_daemon(tmp_path, max_request_bytes=1024 * 1024):
         except OSError:
             time.sleep(0.05)
     proc.terminate()
-    raise AssertionError("daemon did not start")
+    try:
+        _, err = proc.communicate(timeout=5)
+    except Exception:
+        err = b""
+    log_tail = ""
+    log_path = tmp_path / "state" / "logs" / "daemon.log"
+    if log_path.exists():
+        log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+    raise AssertionError(
+        f"daemon did not start (rc={proc.returncode}): stderr={err[-2000:]!r} log={log_tail!r}"
+    )
 
 
 def request(port, method, path, body=None, headers=None):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    # 20s: spawning a runner / DB work can exceed 5s on a loaded Windows runner;
+    # connection-refused is immediate, so the health-poll deadline still holds.
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
     connection.request(method, path, body=body, headers=headers or {})
     response = connection.getresponse()
     payload = json.loads(response.read())
@@ -198,7 +213,7 @@ def test_shutdown_returns_controlled_result_to_active_wait(tmp_path):
     token = (tmp_path / "state" / "token").read_text(encoding="utf-8")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        command = subprocess.list2cmdline([sys.executable, "-c", "import time; time.sleep(30)"])
+        command = shellcmd.join([sys.executable, "-c", "import time; time.sleep(30)"])
         status, started = request(port, "POST", "/jobs", json.dumps({"command": command}).encode(), headers)
         assert status == 200
         result = []

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,8 +13,11 @@ import pytest
 from vanth.server import JobManager, mask_secrets
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def _wait_status(manager: JobManager, job_id: str, want: set[str], timeout: float = 15.0) -> str:

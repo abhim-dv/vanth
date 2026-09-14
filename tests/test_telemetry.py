@@ -11,8 +11,11 @@ from vanth.client import VanthClient
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def free_port():
@@ -151,7 +154,7 @@ def test_daemon_telemetry_http_routes(tmp_path):
             "from vanth.agent_events import agent_event; "
             "[agent_event('metric', _step=i, loss=1.0/i+1) for i in range(1, 4)]"
         )
-        job = client.post("/jobs", {"command": subprocess.list2cmdline([sys.executable, "-c", code])})
+        job = client.post("/jobs", {"command": shellcmd.join([sys.executable, "-c", code])})
         job_id = job["job_id"]
         client.post(f"/jobs/{job_id}/wait", {"filters": ["completed"], "timeout_seconds": 20})
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import socket
 import struct
 import subprocess
 import sys
@@ -136,6 +137,11 @@ def _write_all(handle, data: bytes) -> None:
             else:
                 written = handle.write(view)
         except OSError as exc:
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                # A peer that has gone away surfaces as EPIPE/ECONNRESET on
+                # write on POSIX and ECONNRESET on Windows; report it the same
+                # way as a read-side close so callers see one consistent error.
+                raise CodexPipeError("Codex Desktop app-tools host closed the connection") from exc
             raise CodexPipeError("lost connection to Codex Desktop app-tools host (write)") from exc
         if written is None or written <= 0:
             raise CodexPipeError("Codex Desktop app-tools host closed the connection (write)")
@@ -178,9 +184,21 @@ class CodexPipeClient:
         self._request_id = 0
 
     def close(self) -> None:
+        handle = getattr(self, "handle", None)
+        if handle is None:
+            return
+        # Shutting down a socket before closing it reliably wakes a recv()
+        # blocked on another thread on POSIX; closing alone does not. Named
+        # pipe/file handles have no shutdown() and are unaffected.
+        shutdown = getattr(handle, "shutdown", None)
+        if shutdown is not None:
+            try:
+                shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         try:
-            if hasattr(self.handle, "close"):
-                self.handle.close()
+            if hasattr(handle, "close"):
+                handle.close()
         except Exception:
             pass
 

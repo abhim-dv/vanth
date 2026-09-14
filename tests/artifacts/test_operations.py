@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +14,9 @@ from vanth.artifacts.catalog import open_catalog
 from vanth.artifacts.local_store import LocalBlobStore, default_store_root
 from vanth.artifacts.operations import ArtifactOperations
 from vanth.server import JobManager
+
+
+import shellcmd
 
 
 @pytest.fixture()
@@ -310,7 +312,7 @@ def test_verify_detects_tampered_blob_as_result(home):
 
 
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def test_job_cleanup_preserves_managed_content(home):

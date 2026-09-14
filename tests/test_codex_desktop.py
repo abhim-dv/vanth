@@ -42,6 +42,9 @@ from vanth.codex_pipe import (
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 class FakePipeServer:
     """A fake Desktop app-tools host speaking the length-prefixed JSON-RPC
     protocol over a socketpair.
@@ -936,7 +939,7 @@ class TestRelay:
     def _start_delivery(self, manager, thread_id="thread_dest"):
         async def main():
             job = await manager.start(
-                subprocess.list2cmdline([sys.executable, "-c", "import sys; sys.exit(0)"]),
+                shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
                 wake_targets=[{"type": "codex_desktop", "events": ["completed"], "thread_id": thread_id}],
             )
             await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)
@@ -1098,7 +1101,7 @@ class TestRelay:
 
             async def main():
                 job = await manager.start(
-                    subprocess.list2cmdline([sys.executable, "-c", "import sys; sys.exit(0)"]),
+                    shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
                     wake_targets=[{"type": "codex_desktop", "events": ["completed"], "threadId": "thread_legacy"}],
                 )
                 await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)

@@ -1,6 +1,6 @@
 [project]
 name = "vanth"
-version = "1.9.0"
+version = "1.9.1"
 description = "Event-driven background jobs for agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -72,3 +72,6 @@ path = "build-hooks/bundle_monitor.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Makes the tests/shellcmd.py helper importable from every test module,
+# including the tests/artifacts and tests/remote subdirectories.
+pythonpath = ["tests"]

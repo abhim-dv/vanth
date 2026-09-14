@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import sqlite3
-import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -19,8 +18,11 @@ from vanth.migrations import LATEST_SCHEMA_VERSION
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def _seed(home: Path) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,8 +19,11 @@ from vanth.schedules import (
 )
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def _utc(text: str) -> datetime:

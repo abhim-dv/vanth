@@ -1162,21 +1162,19 @@ class ArtifactOperations:
 
         staging_name = f".{dest.name}.materializing-{uuid.uuid4().hex}"
         parent_fd = None
+        path_anchored = False
         if os.name == "nt":
             staging = dest.parent / staging_name
             staging.mkdir()
         else:
             parent_fd = self._open_parent_fd(dest.parent)
             os.mkdir(staging_name, dir_fd=parent_fd)
-            # Keep construction DESCRIPTOR-RELATIVE wherever the OS exposes a
-            # descriptor path: /proc/self/fd on Linux, /dev/fd on macOS
-            # (rc17 review F7). Otherwise fall back to the plain path with a
-            # dev/inode cross-check of the opened parent.
-            proc_root = None
-            if sys.platform.startswith("linux"):
-                proc_root = "/proc/self/fd"
-            elif sys.platform == "darwin":
-                proc_root = "/dev/fd"
+            # Keep construction DESCRIPTOR-RELATIVE where the OS exposes a
+            # descriptor path: /proc/self/fd on Linux (rc17 review F7). On macOS
+            # /dev/fd is not reliable for creating nested entries under a
+            # directory fd, so use the plain path with a dev/inode cross-check of
+            # the opened parent instead.
+            proc_root = "/proc/self/fd" if sys.platform.startswith("linux") else None
             fd_dir = Path(proc_root, str(parent_fd)) if proc_root else None
             if fd_dir is not None and fd_dir.exists():
                 staging = fd_dir / staging_name
@@ -1190,9 +1188,39 @@ class ArtifactOperations:
                         f"destination parent changed during materialization; refusing: {dest.parent}"
                     )
                 staging = dest.parent / staging_name
+                path_anchored = True
         try:
             try:
                 self._build_tree_into_staging(staging, entries, heartbeat)
+                if path_anchored and parent_fd is not None:
+                    # macOS fallback builds through the plain path (no /proc fd
+                    # symlink). Re-verify the destination parent AND the staging
+                    # directory still resolve to the descriptors we opened, so a
+                    # PERSISTENT ancestor swap cannot publish a redirected or
+                    # empty tree — fail closed instead.
+                    # ponytail: residual race remains — a swap restored before
+                    # this check, or a staging-name replacement under an
+                    # unchanged parent, is not caught; closing that needs
+                    # descriptor-relative tree construction on macOS.
+                    try:
+                        path_parent = os.stat(dest.parent)
+                        fd_parent = os.fstat(parent_fd)
+                        path_staging = os.stat(staging)
+                        fd_staging = os.stat(staging_name, dir_fd=parent_fd)
+                    except OSError as exc:
+                        raise ValueError(
+                            f"staging path changed during materialization; refusing: {dest} ({exc})"
+                        ) from None
+                    if (path_parent.st_dev, path_parent.st_ino) != (
+                        fd_parent.st_dev,
+                        fd_parent.st_ino,
+                    ) or (path_staging.st_dev, path_staging.st_ino) != (
+                        fd_staging.st_dev,
+                        fd_staging.st_ino,
+                    ):
+                        raise ValueError(
+                            f"destination parent changed during materialization; refusing: {dest}"
+                        )
                 # Atomic swap into place: rename fails rather than merges if
                 # a destination raced into existence.
                 if parent_fd is None:

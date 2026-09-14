@@ -11,6 +11,7 @@ Prints the home and daemon URL.
 import http.client
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -24,7 +25,10 @@ PORT = 8765
 
 
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    argv = [sys.executable, "-c", code]
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
 
 
 def request(method, path, body=None, token=None):

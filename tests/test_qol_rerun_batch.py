@@ -1,7 +1,6 @@
 """Tests for rerun-with-overrides and status_batch QoL features."""
 
 import asyncio
-import subprocess
 import sys
 
 import pytest
@@ -9,8 +8,11 @@ import pytest
 from vanth.server import JobManager
 
 
+import shellcmd
+
+
 def cmd(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
+    return shellcmd.join([sys.executable, "-c", code])
 
 
 def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
@@ -33,8 +35,8 @@ def test_rerun_overrides_command_and_env(tmp_path):
         wait_event(manager, new_id, "completed")
 
         status = manager.status(new_id)
-        assert "print('new')" in status["command"]
-        assert "print('orig')" not in status["command"]
+        assert status["command"] == cmd("print('new')")
+        assert status["command"] != cmd("print('orig')")
         assert status["env"] == {"K": "2"}
     finally:
         manager.close()
@@ -79,7 +81,7 @@ def test_rerun_async_with_overrides(tmp_path):
         reran = asyncio.run(manager.rerun(job_id, command=cmd("print('async')"), env={"K": "9"}))
         wait_event(manager, reran["job_id"], "completed")
         status = manager.status(reran["job_id"])
-        assert "print('async')" in status["command"]
+        assert status["command"] == cmd("print('async')")
         assert status["env"] == {"K": "9"}
     finally:
         manager.close()
