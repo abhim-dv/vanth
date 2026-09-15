@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 15
+LATEST_SCHEMA_VERSION = 16
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -125,7 +125,14 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_fire_at);
         CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON jobs(schedule_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_pool_status ON jobs(pool, status);
-        PRAGMA user_version=15;
+        CREATE TABLE IF NOT EXISTS decisions (
+          decision_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, prompt TEXT NOT NULL,
+          options_json TEXT NOT NULL, choice TEXT, status TEXT NOT NULL,
+          resolved_by TEXT, created_at TEXT NOT NULL, expires_at TEXT, resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_decisions_job ON decisions(job_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_decisions_pending ON decisions(status, expires_at);
+        PRAGMA user_version=16;
         """
     )
 
@@ -313,6 +320,24 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pool_status ON jobs(pool, status)")
                 db.execute("PRAGMA user_version=15")
                 version = 15
+            if version < 16:
+                # Durable approval/decision requests: a job's "needs a human"
+                # state machine, kept in its own table so it never overloads
+                # jobs.status. Lifecycle events (decision_requested/resolved/
+                # withdrawn/expired) live in `events` for the audit trail.
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS decisions (
+                      decision_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, prompt TEXT NOT NULL,
+                      options_json TEXT NOT NULL, choice TEXT, status TEXT NOT NULL,
+                      resolved_by TEXT, created_at TEXT NOT NULL, expires_at TEXT, resolved_at TEXT
+                    )
+                    """
+                )
+                db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_job ON decisions(job_id, created_at)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_pending ON decisions(status, expires_at)")
+                db.execute("PRAGMA user_version=16")
+                version = 16
             db.commit()
         except Exception:
             db.rollback()

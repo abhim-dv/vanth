@@ -2,6 +2,32 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased
+
+### Durable approval / decision requests
+
+Jobs can now ask a human a question and wait for the answer durably, without
+holding a thread or killing the job.
+
+- `job_request_decision(job_id, prompt, options=["approve","deny"],
+  timeout_seconds=None)` records a decision (status `pending`) and emits
+  `decision_requested`, which reuses the wake-target delivery path so the
+  job's owning thread is notified. The job keeps running — its status is
+  untouched.
+- `job_resolve(job_id, token, choice)` records one of the offered options
+  (idempotent for the same choice, an error for a different one);
+  `job_withdraw_decision(job_id, token)` cancels a pending request;
+  `job_decisions(...)` lists them. `job_wait(job_id, ["decision_resolved"])`
+  waits for the answer like any other event.
+- An optional `timeout_seconds` expires the request; the maintenance loop
+  marks it `expired` and emits `decision_expired`, after which it can no
+  longer be resolved.
+- Lifecycle events (`decision_requested` / `decision_resolved` /
+  `decision_withdrawn` / `decision_expired`) are the audit trail;
+  `decision_requested` also ranks as an attention event in `job_view`.
+- Schema v16 adds the `decisions` table (additive; existing databases
+  migrate in place with the usual pre-migration backup).
+
 ## 1.9.1 - 2026-09-11
 
 ### POSIX Python CI + portability fixes

@@ -587,6 +587,12 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None, query.get("follow", ["false"])[0] == "true", float(query.get("timeout_seconds", ["5"])[0]), query.get("grep", [None])[0]))
             elif parsed.path == "/deliveries":
                 ok(self, get_manager().deliveries(query.get("job_id", [None])[0], query.get("status", [None])[0], int(query.get("limit", ["20"])[0])))
+            elif parsed.path == "/decisions":
+                ok(self, get_manager().list_decisions(
+                    query.get("job_id", [None])[0],
+                    query.get("status", [None])[0],
+                    int(query.get("limit", ["50"])[0]),
+                ))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/attempts"):
                 ok(self, get_manager().delivery_attempts(parsed.path.split("/")[2], int(query.get("limit", ["20"])[0])))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
@@ -748,6 +754,13 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().job_pause(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/resume"):
                 ok(self, get_manager().job_resume(parsed.path.split("/")[2]))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/decision"):
+                ok(self, get_manager().request_decision(parsed.path.split("/")[2], **payload))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/resolve"):
+                ok(self, get_manager().resolve_decision(
+                    parsed.path.split("/")[2], parsed.path.split("/")[4], payload.get("choice", "")))
+            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/withdraw"):
+                ok(self, get_manager().withdraw_decision(parsed.path.split("/")[2], parsed.path.split("/")[4]))
             elif parsed.path == "/schedules":
                 ok(self, get_manager().create_schedule(**payload))
             elif parsed.path.startswith("/schedules/") and parsed.path.endswith("/update"):

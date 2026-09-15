@@ -435,6 +435,9 @@ events.
 | `job_delivery_attempts` | Attempt/lease history for one delivery |
 | `job_stop` | Stop a running job (terminate process tree) |
 | `job_pause` / `job_resume` | Hold / release a queued (pool or trigger) job |
+| `job_request_decision` | Ask a human to decide something about a job; notifies its wake targets and returns a durable `decision_id` |
+| `job_resolve` / `job_withdraw_decision` | Answer a pending decision with one of its options, or withdraw it |
+| `job_decisions` | List decisions, filterable by `job_id` / `status` |
 | `pool_configure` / `pool_list` | Per-pool `max_parallel` + pause state, and live queue depths |
 | `schedule_create` | Create a cron or interval schedule that launches a job per fire |
 | `schedule_list` / `schedule_update` / `schedule_delete` | Manage schedules in place |
@@ -514,6 +517,22 @@ first. `eof=True` closes the job's stdin (the child sees EOF). Non-blocking:
 returns immediately; the input is queued to the runner. Rejects jobs that are
 not interactive, not running, or unknown. `job_rerun` preserves the
 `interactive` flag.
+
+### job_request_decision — ask a human and wait durably
+
+```text
+job_request_decision(job_id="job_...", prompt="Ship the release?",
+                     options=["approve", "deny"], timeout_seconds=3600)
+job_wait(job_id="job_...", filters=["decision_resolved"])   # await the answer
+job_resolve(job_id="job_...", token="dec_...", choice="approve")
+```
+
+Records a durable "needs a decision" request against a non-terminal job and
+notifies the job's wake targets, so the owning thread learns a human is needed.
+The job keeps running (its `status` is untouched) — the answer arrives as a
+`decision_resolved` event. `timeout_seconds` expires the request (emitting
+`decision_expired`); `job_withdraw_decision` cancels it; `job_decisions` lists
+pending/answered requests.
 
 ### job_status — see what a job is running
 
