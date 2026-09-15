@@ -479,6 +479,24 @@ def error(handler: BaseHTTPRequestHandler, message: str, status: int = 400) -> N
     ok(handler, {"result": "error", "error": message[:4096]}, status)
 
 
+def _decision_route(path: str) -> tuple[str, str, str] | None:
+    """Match the exact decision routes, or None.
+
+    Exact segment matching (rather than a loose endswith suffix) so malformed
+    paths like ``/jobs/x/resolve`` or ``/jobs/x/not-a-decision/t/resolve`` are
+    a clean 404 instead of an IndexError 500 or an unintended resolve.
+    """
+    parts = path.split("/")
+    if len(parts) == 4 and parts[1] == "jobs" and parts[3] == "decision" and parts[2]:
+        return ("request", parts[2], "")
+    if len(parts) == 6 and parts[1] == "jobs" and parts[3] == "decision" and parts[2] and parts[4]:
+        if parts[5] == "resolve":
+            return ("resolve", parts[2], parts[4])
+        if parts[5] == "withdraw":
+            return ("withdraw", parts[2], parts[4])
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "vanthd/1"
 
@@ -587,6 +605,12 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().tail(parsed.path.split("/")[2], query.get("stream", ["stdout"])[0], int(query.get("max_bytes", ["8192"])[0]), int(query["offset"][0]) if "offset" in query else None, query.get("follow", ["false"])[0] == "true", float(query.get("timeout_seconds", ["5"])[0]), query.get("grep", [None])[0]))
             elif parsed.path == "/deliveries":
                 ok(self, get_manager().deliveries(query.get("job_id", [None])[0], query.get("status", [None])[0], int(query.get("limit", ["20"])[0])))
+            elif parsed.path == "/decisions":
+                ok(self, get_manager().list_decisions(
+                    query.get("job_id", [None])[0],
+                    query.get("status", [None])[0],
+                    int(query.get("limit", ["50"])[0]),
+                ))
             elif parsed.path.startswith("/deliveries/") and parsed.path.endswith("/attempts"):
                 ok(self, get_manager().delivery_attempts(parsed.path.split("/")[2], int(query.get("limit", ["20"])[0])))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
@@ -702,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
                 error(self, "Unauthorized", 401)
                 return
             parsed = urllib.parse.urlparse(self.path)
+            decision_route = _decision_route(parsed.path)
             if parsed.path == "/jobs":
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:
@@ -709,6 +734,19 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     payload.pop("idempotency_key", None)
                     ok(self, asyncio.run(get_manager().start(**payload)))
+            elif decision_route is not None:
+                action, decision_job, token = decision_route
+                if action == "request":
+                    ok(self, get_manager().request_decision(decision_job, **payload))
+                elif action == "resolve":
+                    ok(self, get_manager().resolve_decision(decision_job, token, payload.get("choice", "")))
+                else:
+                    ok(self, get_manager().withdraw_decision(decision_job, token))
+            elif "decision" in parsed.path.split("/"):
+                # A decision-looking path that did not match one of the exact
+                # shapes must not fall through to another job operation (e.g.
+                # .../decision/<token>/pause must not pause the job).
+                error(self, "Not found", 404)
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/rerun"):
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:

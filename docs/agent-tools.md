@@ -23,6 +23,7 @@ The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_metric_compare`, `job_duration_stats`, `job_run_summary`,
 `job_artifact_add`, `job_artifacts`, `job_dashboard`, `job_metric_ingest`,
 `job_artifact_read`, `job_add_wake_target`, `job_wake_now`, `job_cleanup_preview`,
+`job_request_decision`, `job_resolve`, `job_withdraw_decision`, `job_decisions`,
 `pool_configure`, `pool_list`, `schedule_create`, `schedule_list`,
 `schedule_update`, `schedule_delete`, `schedule_next`. The wake tools (`job_add_wake_target` / `job_wake_now` /
 `daemon_wake`) and their `daemon_wake` / `job_wake_now` / `job_add_wake_target`
@@ -498,6 +499,61 @@ or terminal job returns an error.
 | `job_id` | `string` | required | The queued job |
 
 Response: `{ "result": "ok", "job_id": "...", "paused": true|false }`.
+
+---
+
+## `job_request_decision` / `job_resolve` / `job_withdraw_decision` / `job_decisions`
+
+Ask a human to decide something about a **non-terminal** job and wait durably
+for the answer. The request is its own state machine keyed by `decision_id`
+(`dec_<hex>`); the job's `status` is not changed, so a running job keeps
+running while it waits.
+
+`job_request_decision` parameters:
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `job_id` | `string` | required | A queued/running (non-terminal) job |
+| `prompt` | `string` | required | The question shown to the human |
+| `options` | `string[]` | `["approve", "deny"]` | Allowed choices (deduplicated; max 50, 200 chars each) |
+| `timeout_seconds` | `int` | none | Expire the request after N seconds |
+
+`prompt` is limited to 10000 characters. The request, its `decision_requested`
+event and any wake deliveries commit in one transaction; the serialized
+payload is checked against the event byte limit, and authoritative decision
+transitions are exempt from the per-job structured-event cap.
+
+Requesting emits a `decision_requested` event, which reuses the wake-target
+delivery path — the job's wake targets are notified, so the owning thread
+learns a human is needed. Only targets whose `events` list includes
+`decision_requested` are woken. Response: the decision object
+(`status: "pending"`).
+
+```json
+{ "result": "ok", "decision_id": "dec_1f2e...", "job_id": "job_ab12...",
+  "prompt": "Ship the release?", "options": ["approve", "deny"],
+  "choice": null, "status": "pending", "resolved_by": null,
+  "created_at": "2026-09-15T10:00:00Z", "expires_at": null, "resolved_at": null }
+```
+
+Wait for the answer with
+`job_wait(job_id, ["decision_resolved"])`, or poll `job_decisions`.
+
+- `job_resolve(job_id, token, choice)` records one of the request's `options`
+  and emits `decision_resolved`. Resolving the same choice twice is
+  idempotent; a different choice is an error; a resolved/withdrawn/expired
+  decision cannot be resolved.
+- `job_withdraw_decision(job_id, token)` cancels a pending request (emits
+  `decision_withdrawn`).
+- When `timeout_seconds` elapses the daemon marks the decision `expired`
+  (emits `decision_expired`) and it can no longer be resolved.
+- `job_decisions(job_id=None, status=None, limit=50)` lists decisions newest
+  first; `status` is one of `pending`, `resolved`, `withdrawn`, `expired`.
+
+```json
+{ "decisions": [ { "decision_id": "dec_1f2e...", "status": "resolved",
+                   "choice": "approve", "resolved_by": "user" } ], "count": 1 }
+```
 
 ---
 

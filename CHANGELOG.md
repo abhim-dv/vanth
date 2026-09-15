@@ -2,6 +2,53 @@
 
 All notable changes to Vanth are documented here.
 
+## Unreleased
+
+### Durable approval / decision requests
+
+Jobs can now ask a human a question and wait for the answer durably, without
+holding a thread or killing the job.
+
+- `job_request_decision(job_id, prompt, options=["approve","deny"],
+  timeout_seconds=None)` records a decision (status `pending`) and emits
+  `decision_requested`, which reuses the wake-target delivery path so the
+  job's owning thread is notified. The job keeps running — its status is
+  untouched.
+- `job_resolve(job_id, token, choice)` records one of the offered options
+  (idempotent for the same choice, an error for a different one);
+  `job_withdraw_decision(job_id, token)` cancels a pending request;
+  `job_decisions(...)` lists them. `job_wait(job_id, ["decision_resolved"])`
+  waits for the answer like any other event.
+- An optional `timeout_seconds` expires the request; the maintenance loop
+  marks it `expired` and emits `decision_expired`, after which it can no
+  longer be resolved. Deadline, status and choice are all validated **inside**
+  the write transaction that performs the resolution, so the deadline is
+  enforced at the authoritative transition rather than on a stale read.
+- Each decision state change commits together with its lifecycle event and
+  wake deliveries in one transaction: a crash can never leave a resolved
+  decision with no `decision_resolved` event for a `job_wait` caller (a retry
+  could not repair that). Authoritative decision transitions are also exempt
+  from the per-job structured-event cap, so a busy job at the cap still gets
+  its wake. The exemption is per-call rather than per event type, because job
+  stdout can emit any event type via `AGENT_EVENT` — keying on the type would
+  let a job forge `decision_requested` lines and bypass the cap.
+- `prompt`/`options` are bounded (10000 chars, 50 options, 200 chars each) and
+  the *serialized* lifecycle payload is checked against `max_event_bytes`
+  before commit, so the payload can never be truncated (truncation replaces
+  the whole data object, dropping the `decision_id` and breaking the wake and
+  wait paths).
+- Decision routes match exact segment shapes, and an unmatched
+  decision-looking path is a 404 rather than falling through to another job
+  operation (e.g. `.../decision/<token>/pause` cannot pause the job).
+- `job_cleanup` deletes a job's decisions with the rest of its state, so a
+  removed job leaves no actionable pending request behind.
+- Lifecycle events (`decision_requested` / `decision_resolved` /
+  `decision_withdrawn` / `decision_expired`) are the audit trail;
+  `decision_requested` also ranks as an attention event in `job_view`.
+- Schema v16 adds the `decisions` table (additive; existing databases
+  migrate in place with the usual pre-migration backup); the Go mirrored
+  `LatestSchemaVersion` and cross-language fixture move to 16 with it.
+
 ## 1.9.1 - 2026-09-11
 
 ### POSIX Python CI + portability fixes
