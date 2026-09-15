@@ -519,8 +519,9 @@ running while it waits.
 | `timeout_seconds` | `int` | none | Expire the request after N seconds |
 
 `prompt` is limited to 10000 characters. The request, its `decision_requested`
-event and any wake deliveries commit in one transaction; decision lifecycle
-events are exempt from the per-job structured-event cap.
+event and any wake deliveries commit in one transaction; the serialized
+payload is checked against the event byte limit, and authoritative decision
+transitions are exempt from the per-job structured-event cap.
 
 Requesting emits a `decision_requested` event, which reuses the wake-target
 delivery path — the job's wake targets are notified, so the owning thread

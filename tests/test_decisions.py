@@ -387,6 +387,52 @@ def test_cleanup_removes_decisions(tmp_path):
         manager.close()
 
 
+def test_request_decision_rejects_payload_over_event_bytes(tmp_path):
+    """Character limits do not bound serialized bytes: an over-budget payload
+    must be rejected, never committed and then silently truncated (which would
+    drop decision_id/choice and break the wake and wait paths)."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        # 10000 astral chars serialize to ~120KB (json.dumps is ASCII-only),
+        # over the default 64KB limit despite passing the char check.
+        with pytest.raises(ValueError, match="too large"):
+            manager.request_decision(job_id, "\U0001f600" * 10000)
+        manager.max_event_bytes = 64
+        with pytest.raises(ValueError, match="too large"):
+            manager.request_decision(job_id, "x" * 50)
+        assert manager.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+    finally:
+        manager.close()
+
+
+def test_forged_decision_events_do_not_bypass_cap(tmp_path):
+    """The cap exemption is per-call, not per event type: job stdout can emit
+    AGENT_EVENT lines of any type, so a forged decision_requested must still be
+    capped."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        manager.max_events_per_job = 1
+        assert manager._emit(job_id, "decision_requested", data={"spam": True})["persisted"] is False
+    finally:
+        manager.close()
+
+
+def test_resolve_rejects_bad_actor(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        decision = manager.request_decision(job_id, "Deploy?")
+        with pytest.raises(ValueError, match="actor"):
+            manager.resolve_decision(job_id, decision["decision_id"], "approve", actor="x" * 201)
+        with pytest.raises(ValueError, match="actor"):
+            manager.resolve_decision(job_id, decision["decision_id"], "approve", actor="")
+        assert decision_row(manager, decision["decision_id"])["status"] == "pending"
+    finally:
+        manager.close()
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -437,6 +483,9 @@ def test_decisions_over_http(tmp_path):
         assert client.post(
             f"/jobs/{job['job_id']}/not-a-decision/{third['decision_id']}/resolve", {"choice": "yes"}
         )["result"] == "error"
+        assert client.get("/decisions", {"status": "pending"})["count"] == 1
+        # A decision-namespace path must not fall through to another job op.
+        assert client.post(f"/jobs/{job['job_id']}/decision/{third['decision_id']}/pause")["error"] == "Not found"
         assert client.get("/decisions", {"status": "pending"})["count"] == 1
     finally:
         proc.terminate()

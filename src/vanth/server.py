@@ -336,15 +336,17 @@ WAKE_TARGET_TYPES = {"local_command", "codex_cli_thread", "codex_thread", "codex
 DECISION_PENDING = "pending"
 DECISION_STATUSES = {DECISION_PENDING, "resolved", "withdrawn", "expired"}
 DEFAULT_DECISION_OPTIONS = ["approve", "deny"]
-# Control events for the decision state machine. They are exempt from the
-# per-job structured-event cap (like terminal events): the cap exists to bound
-# telemetry, and dropping a decision event would break the durability contract
-# (no wake, no waitable signal) with no way for a retry to repair it.
-DECISION_EVENT_TYPES = {"decision_requested", "decision_resolved", "decision_withdrawn", "decision_expired"}
-# Bound decision input so the lifecycle event payload can never hit
-# ``max_event_bytes`` (which would strip decision_id/choice and break wake
+# Authoritative decision transitions are exempt from the per-job structured
+# event cap: the cap bounds telemetry, and dropping a decision event would
+# break the durability contract (no wake, no waitable signal) with no way for
+# a retry to repair it. The exemption is per-CALL (`exempt_from_cap`), NOT per
+# event type: job stdout can emit any event type via AGENT_EVENT, so keying on
+# the type would let a job forge `decision_requested` lines and bypass the cap.
+# Bound decision input so the lifecycle event payload cannot be truncated by
+# `max_event_bytes` (which would strip decision_id/choice and break wake
 # delivery and `job_wait`). Human-paced, so the limits are generous.
 MAX_DECISION_PROMPT_CHARS = 10000
+MAX_DECISION_ACTOR_CHARS = 200
 MAX_DECISION_OPTIONS = 50
 MAX_DECISION_OPTION_CHARS = 200
 
@@ -2103,6 +2105,7 @@ class JobManager:
         level: str = "info",
         source: str = "server",
         mutate: Callable[[sqlite3.Connection], None] | None = None,
+        exempt_from_cap: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
         payload = normalize_event_payload({"type": event_type, "message": message, "data": data or {}, "level": level})
@@ -2116,7 +2119,7 @@ class JobManager:
             for attempt in range(10):
                 try:
                     event = self._emit_transactional(
-                        job_id, payload, data_json, event_type, level, source, message, mutate
+                        job_id, payload, data_json, event_type, level, source, message, mutate, exempt_from_cap
                     )
                     break
                 except sqlite3.OperationalError as exc:
@@ -2142,6 +2145,7 @@ class JobManager:
         source: str,
         message: str | None,
         mutate: Callable[[sqlite3.Connection], None] | None = None,
+        exempt_from_cap: bool = False,
     ) -> dict[str, Any]:
         """Persist a state mutation and its event + deliveries in ONE transaction.
 
@@ -2150,10 +2154,11 @@ class JobManager:
         event/wake it owes either both land or neither does (a crash can never
         leave a resolved decision with no event, which a retry could not
         repair). ``mutate`` may raise ``_DecisionNoOp`` to abort cleanly.
+        ``exempt_from_cap`` is set only by authoritative decision transitions.
         """
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            if event_type not in TERMINAL_STATUSES and event_type not in DECISION_EVENT_TYPES:
+            if event_type not in TERMINAL_STATUSES and not exempt_from_cap:
                 count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
                 if count >= self.max_events_per_job:
                     self.db.rollback()
@@ -5917,14 +5922,30 @@ class JobManager:
                 (decision_id, job_id, prompt, json.dumps(normalized, separators=(",", ":")), DECISION_PENDING, created_at, expires_at),
             )
 
+        event_data = {"decision_id": decision_id, "prompt": prompt, "options": normalized, "expires_at": expires_at}
+        if not self._decision_event_fits(event_data):
+            raise ValueError("prompt/options are too large for the decision event payload; shorten them")
+
         self._emit(
             job_id,
             "decision_requested",
             message=prompt,
-            data={"decision_id": decision_id, "prompt": prompt, "options": normalized, "expires_at": expires_at},
+            data=event_data,
             mutate=mutate,
+            exempt_from_cap=True,
         )
         return self._reload_decision(decision_id)
+
+    def _decision_event_fits(self, data: dict[str, Any]) -> bool:
+        """Whether a decision lifecycle payload survives ``max_event_bytes``.
+
+        Character limits do not bound the *serialized* size (``json.dumps`` is
+        ASCII-only, so one astral char is 12 bytes). Truncation would replace the
+        whole data object, dropping ``decision_id``/``choice`` and breaking the
+        wake and wait paths, so an oversized payload is rejected up front.
+        """
+        payload = normalize_event_payload({"type": "decision_event", "message": None, "data": data, "level": "info"})
+        return len(json.dumps(payload["data"], separators=(",", ":")).encode()) <= self.max_event_bytes
 
     def _decision_for(self, job_id: str, token: str) -> sqlite3.Row:
         if not isinstance(token, str) or not token:
@@ -5946,6 +5967,10 @@ class JobManager:
             raise ValueError("choice must be a non-empty string")
         if not isinstance(token, str) or not token:
             raise ValueError("token must be a non-empty string")
+        actor = _normalize_decision_actor(actor)
+        event_data = {"decision_id": token, "choice": choice, "actor": actor}
+        if not self._decision_event_fits(event_data):
+            raise ValueError("decision payload is too large for the event; shorten the choice")
 
         def mutate(db: sqlite3.Connection) -> None:
             row = db.execute("SELECT * FROM decisions WHERE decision_id=?", (token,)).fetchone()
@@ -5973,8 +5998,9 @@ class JobManager:
             job_id,
             "decision_resolved",
             message=choice,
-            data={"decision_id": token, "choice": choice, "actor": actor},
+            data=event_data,
             mutate=mutate,
+            exempt_from_cap=True,
         )
         if event is not None and event.get("noop"):
             row = self._decision_for(job_id, token)
@@ -5988,6 +6014,10 @@ class JobManager:
         self._ensure_open()
         if not isinstance(token, str) or not token:
             raise ValueError("token must be a non-empty string")
+        actor = _normalize_decision_actor(actor)
+        event_data = {"decision_id": token, "actor": actor}
+        if not self._decision_event_fits(event_data):
+            raise ValueError("decision payload is too large for the event")
 
         def mutate(db: sqlite3.Connection) -> None:
             row = db.execute("SELECT * FROM decisions WHERE decision_id=?", (token,)).fetchone()
@@ -6008,8 +6038,9 @@ class JobManager:
             job_id,
             "decision_withdrawn",
             message="decision withdrawn",
-            data={"decision_id": token, "actor": actor},
+            data=event_data,
             mutate=mutate,
+            exempt_from_cap=True,
         )
         return self._reload_decision(token)
 
@@ -6066,6 +6097,7 @@ class JobManager:
                 message="decision timed out",
                 data={"decision_id": row["decision_id"]},
                 mutate=mutate,
+                exempt_from_cap=True,
             )
 
 
@@ -6079,6 +6111,14 @@ def _row_isdue(expires_at: Any, status: Any, now: datetime | None = None) -> boo
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed <= (now or datetime.now(timezone.utc))
+
+
+def _normalize_decision_actor(actor: Any) -> str:
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("actor must be a non-empty string")
+    if len(actor) > MAX_DECISION_ACTOR_CHARS:
+        raise ValueError(f"actor must be at most {MAX_DECISION_ACTOR_CHARS} characters")
+    return actor
 
 
 def _normalize_decision_options(options: list[str] | None) -> list[str]:

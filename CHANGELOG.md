@@ -27,11 +27,19 @@ holding a thread or killing the job.
 - Each decision state change commits together with its lifecycle event and
   wake deliveries in one transaction: a crash can never leave a resolved
   decision with no `decision_resolved` event for a `job_wait` caller (a retry
-  could not repair that). Decision lifecycle events are also exempt from the
-  per-job structured-event cap, so a busy job at the cap still gets its wake.
-- `prompt`/`options` are bounded (10000 chars, 50 options, 200 chars each) so
-  the lifecycle payload can never be truncated (which would drop the
-  `decision_id` and break the wake and wait paths).
+  could not repair that). Authoritative decision transitions are also exempt
+  from the per-job structured-event cap, so a busy job at the cap still gets
+  its wake. The exemption is per-call rather than per event type, because job
+  stdout can emit any event type via `AGENT_EVENT` — keying on the type would
+  let a job forge `decision_requested` lines and bypass the cap.
+- `prompt`/`options` are bounded (10000 chars, 50 options, 200 chars each) and
+  the *serialized* lifecycle payload is checked against `max_event_bytes`
+  before commit, so the payload can never be truncated (truncation replaces
+  the whole data object, dropping the `decision_id` and breaking the wake and
+  wait paths).
+- Decision routes match exact segment shapes, and an unmatched
+  decision-looking path is a 404 rather than falling through to another job
+  operation (e.g. `.../decision/<token>/pause` cannot pause the job).
 - `job_cleanup` deletes a job's decisions with the rest of its state, so a
   removed job leaves no actionable pending request behind.
 - Lifecycle events (`decision_requested` / `decision_resolved` /

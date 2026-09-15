@@ -726,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
                 error(self, "Unauthorized", 401)
                 return
             parsed = urllib.parse.urlparse(self.path)
+            decision_route = _decision_route(parsed.path)
             if parsed.path == "/jobs":
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:
@@ -733,6 +734,19 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     payload.pop("idempotency_key", None)
                     ok(self, asyncio.run(get_manager().start(**payload)))
+            elif decision_route is not None:
+                action, decision_job, token = decision_route
+                if action == "request":
+                    ok(self, get_manager().request_decision(decision_job, **payload))
+                elif action == "resolve":
+                    ok(self, get_manager().resolve_decision(decision_job, token, payload.get("choice", "")))
+                else:
+                    ok(self, get_manager().withdraw_decision(decision_job, token))
+            elif "decision" in parsed.path.split("/"):
+                # A decision-looking path that did not match one of the exact
+                # shapes must not fall through to another job operation (e.g.
+                # .../decision/<token>/pause must not pause the job).
+                error(self, "Not found", 404)
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/rerun"):
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:
@@ -772,14 +786,6 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().job_pause(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/resume"):
                 ok(self, get_manager().job_resume(parsed.path.split("/")[2]))
-            elif (decision_route := _decision_route(parsed.path)) is not None:
-                action, decision_job, token = decision_route
-                if action == "request":
-                    ok(self, get_manager().request_decision(decision_job, **payload))
-                elif action == "resolve":
-                    ok(self, get_manager().resolve_decision(decision_job, token, payload.get("choice", "")))
-                else:
-                    ok(self, get_manager().withdraw_decision(decision_job, token))
             elif parsed.path == "/schedules":
                 ok(self, get_manager().create_schedule(**payload))
             elif parsed.path.startswith("/schedules/") and parsed.path.endswith("/update"):
