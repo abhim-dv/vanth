@@ -479,6 +479,24 @@ def error(handler: BaseHTTPRequestHandler, message: str, status: int = 400) -> N
     ok(handler, {"result": "error", "error": message[:4096]}, status)
 
 
+def _decision_route(path: str) -> tuple[str, str, str] | None:
+    """Match the exact decision routes, or None.
+
+    Exact segment matching (rather than a loose endswith suffix) so malformed
+    paths like ``/jobs/x/resolve`` or ``/jobs/x/not-a-decision/t/resolve`` are
+    a clean 404 instead of an IndexError 500 or an unintended resolve.
+    """
+    parts = path.split("/")
+    if len(parts) == 4 and parts[1] == "jobs" and parts[3] == "decision" and parts[2]:
+        return ("request", parts[2], "")
+    if len(parts) == 6 and parts[1] == "jobs" and parts[3] == "decision" and parts[2] and parts[4]:
+        if parts[5] == "resolve":
+            return ("resolve", parts[2], parts[4])
+        if parts[5] == "withdraw":
+            return ("withdraw", parts[2], parts[4])
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "vanthd/1"
 
@@ -754,13 +772,14 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, get_manager().job_pause(parsed.path.split("/")[2]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/resume"):
                 ok(self, get_manager().job_resume(parsed.path.split("/")[2]))
-            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/decision"):
-                ok(self, get_manager().request_decision(parsed.path.split("/")[2], **payload))
-            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/resolve"):
-                ok(self, get_manager().resolve_decision(
-                    parsed.path.split("/")[2], parsed.path.split("/")[4], payload.get("choice", "")))
-            elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/withdraw"):
-                ok(self, get_manager().withdraw_decision(parsed.path.split("/")[2], parsed.path.split("/")[4]))
+            elif (decision_route := _decision_route(parsed.path)) is not None:
+                action, decision_job, token = decision_route
+                if action == "request":
+                    ok(self, get_manager().request_decision(decision_job, **payload))
+                elif action == "resolve":
+                    ok(self, get_manager().resolve_decision(decision_job, token, payload.get("choice", "")))
+                else:
+                    ok(self, get_manager().withdraw_decision(decision_job, token))
             elif parsed.path == "/schedules":
                 ok(self, get_manager().create_schedule(**payload))
             elif parsed.path.startswith("/schedules/") and parsed.path.endswith("/update"):

@@ -20,7 +20,7 @@ import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from logging.handlers import RotatingFileHandler
 
 # mcp's FastMCP has a Settings model with a `lifespan` field whose annotation
@@ -336,6 +336,21 @@ WAKE_TARGET_TYPES = {"local_command", "codex_cli_thread", "codex_thread", "codex
 DECISION_PENDING = "pending"
 DECISION_STATUSES = {DECISION_PENDING, "resolved", "withdrawn", "expired"}
 DEFAULT_DECISION_OPTIONS = ["approve", "deny"]
+# Control events for the decision state machine. They are exempt from the
+# per-job structured-event cap (like terminal events): the cap exists to bound
+# telemetry, and dropping a decision event would break the durability contract
+# (no wake, no waitable signal) with no way for a retry to repair it.
+DECISION_EVENT_TYPES = {"decision_requested", "decision_resolved", "decision_withdrawn", "decision_expired"}
+# Bound decision input so the lifecycle event payload can never hit
+# ``max_event_bytes`` (which would strip decision_id/choice and break wake
+# delivery and `job_wait`). Human-paced, so the limits are generous.
+MAX_DECISION_PROMPT_CHARS = 10000
+MAX_DECISION_OPTIONS = 50
+MAX_DECISION_OPTION_CHARS = 200
+
+
+class _DecisionNoOp(Exception):
+    """Internal: a decision mutation found nothing to change (idempotent retry)."""
 
 
 def resolve_wake_target_identity(
@@ -2087,6 +2102,7 @@ class JobManager:
         data: dict[str, Any] | None = None,
         level: str = "info",
         source: str = "server",
+        mutate: Callable[[sqlite3.Connection], None] | None = None,
     ) -> dict[str, Any]:
         self._ensure_open()
         payload = normalize_event_payload({"type": event_type, "message": message, "data": data or {}, "level": level})
@@ -2100,7 +2116,7 @@ class JobManager:
             for attempt in range(10):
                 try:
                     event = self._emit_transactional(
-                        job_id, payload, data_json, event_type, level, source, message
+                        job_id, payload, data_json, event_type, level, source, message, mutate
                     )
                     break
                 except sqlite3.OperationalError as exc:
@@ -2125,10 +2141,19 @@ class JobManager:
         level: str,
         source: str,
         message: str | None,
+        mutate: Callable[[sqlite3.Connection], None] | None = None,
     ) -> dict[str, Any]:
+        """Persist a state mutation and its event + deliveries in ONE transaction.
+
+        ``mutate`` runs inside the write transaction, after the event-cap check
+        and before the event row is inserted, so a decision state change and the
+        event/wake it owes either both land or neither does (a crash can never
+        leave a resolved decision with no event, which a retry could not
+        repair). ``mutate`` may raise ``_DecisionNoOp`` to abort cleanly.
+        """
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            if event_type not in TERMINAL_STATUSES:
+            if event_type not in TERMINAL_STATUSES and event_type not in DECISION_EVENT_TYPES:
                 count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
                 if count >= self.max_events_per_job:
                     self.db.rollback()
@@ -2146,6 +2171,24 @@ class JobManager:
                         "source": source,
                         "created_at": now_iso(),
                         "persisted": False,
+                    }
+            if mutate is not None:
+                try:
+                    mutate(self.db)
+                except _DecisionNoOp:
+                    self.db.rollback()
+                    return {
+                        "event_id": None,
+                        "job_id": job_id,
+                        "seq": 0,
+                        "type": event_type,
+                        "level": level,
+                        "message": message,
+                        "data": payload["data"],
+                        "source": source,
+                        "created_at": now_iso(),
+                        "persisted": False,
+                        "noop": True,
                     }
             row = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,)).fetchone()
             seq = int(row["seq"])
@@ -5393,6 +5436,7 @@ class JobManager:
                 self.db.execute(f"DELETE FROM delivery_attempts WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE job_id IN ({placeholders}))", job_ids)
                 self.db.execute(f"DELETE FROM deliveries WHERE job_id IN ({placeholders})", job_ids)
                 self.db.execute(f"DELETE FROM wake_targets WHERE job_id IN ({placeholders})", job_ids)
+                self.db.execute(f"DELETE FROM decisions WHERE job_id IN ({placeholders})", job_ids)
                 self.db.execute(f"DELETE FROM events WHERE job_id IN ({placeholders})", job_ids)
                 self.db.execute(f"DELETE FROM jobs WHERE job_id IN ({placeholders}) AND status!='running'", job_ids)
                 self.db.commit()
@@ -5821,11 +5865,13 @@ class JobManager:
         }
 
     def _decision_isdue(self, decision: dict[str, Any], now: datetime | None = None) -> bool:
-        expires_at = decision.get("expires_at")
-        if not expires_at or decision["status"] != DECISION_PENDING:
-            return False
-        parsed = _parse_iso(str(expires_at))
-        return parsed is not None and parsed <= (now or datetime.now(timezone.utc))
+        return _row_isdue(decision.get("expires_at"), decision.get("status"), now)
+
+    def _reload_decision(self, decision_id: str) -> dict[str, Any]:
+        row = self._row("SELECT * FROM decisions WHERE decision_id=?", (decision_id,))
+        if row is None:  # pragma: no cover - the row was just written/committed
+            raise ValueError(f"Unknown decision: {decision_id}")
+        return self._decision_dict(row)
 
     def request_decision(
         self,
@@ -5836,51 +5882,49 @@ class JobManager:
     ) -> dict[str, Any]:
         """Persist a durable "needs a decision" request and wake the owner.
 
-        Emitting ``decision_requested`` reuses the wake-target delivery path, so
-        whichever thread owns the job (``wake_targets``) is notified. The job
-        itself keeps running; nothing about its status changes.
+        The job-status eligibility check, the row insert, the
+        ``decision_requested`` event and its wake deliveries all commit in one
+        transaction, so a crash can never leave a pending decision with no wake
+        (which a retry could not repair). The job keeps running; nothing about
+        its status changes.
         """
         self._ensure_open()
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
-        choices = DEFAULT_DECISION_OPTIONS if options is None else options
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("options must be a non-empty list of strings")
-        normalized: list[str] = []
-        for option in choices:
-            if not isinstance(option, str) or not option.strip():
-                raise ValueError("options must be non-empty strings")
-            if option not in normalized:
-                normalized.append(option)
-        if timeout_seconds is not None:
-            if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
-                raise ValueError("timeout_seconds must be an integer >= 1")
-        row = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))
-        if not row:
-            raise ValueError(f"Unknown job_id: {job_id}")
-        if row["status"] in TERMINAL_STATUSES:
-            raise ValueError(f"job is already terminal: {row['status']}")
+        if len(prompt) > MAX_DECISION_PROMPT_CHARS:
+            raise ValueError(f"prompt must be at most {MAX_DECISION_PROMPT_CHARS} characters")
+        normalized = _normalize_decision_options(options)
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1
+        ):
+            raise ValueError("timeout_seconds must be an integer >= 1")
         now = datetime.now(timezone.utc)
         decision_id = "dec_" + uuid.uuid4().hex[:16]
         created_at = now_iso()
         expires_at = (now + timedelta(seconds=timeout_seconds)).isoformat().replace("+00:00", "Z") if timeout_seconds else None
-        with self.db_lock:
-            self.db.execute(
+
+        def mutate(db: sqlite3.Connection) -> None:
+            job = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if job is None:
+                raise ValueError(f"Unknown job_id: {job_id}")
+            if job["status"] in TERMINAL_STATUSES:
+                raise ValueError(f"job is already terminal: {job['status']}")
+            db.execute(
                 """
                 INSERT INTO decisions(decision_id, job_id, prompt, options_json, choice, status, resolved_by, created_at, expires_at, resolved_at)
                 VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL)
                 """,
                 (decision_id, job_id, prompt, json.dumps(normalized, separators=(",", ":")), DECISION_PENDING, created_at, expires_at),
             )
-            self.db.commit()
+
         self._emit(
             job_id,
             "decision_requested",
             message=prompt,
             data={"decision_id": decision_id, "prompt": prompt, "options": normalized, "expires_at": expires_at},
+            mutate=mutate,
         )
-        decision = self._row("SELECT * FROM decisions WHERE decision_id=?", (decision_id,))
-        return self._decision_dict(decision)
+        return self._reload_decision(decision_id)
 
     def _decision_for(self, job_id: str, token: str) -> sqlite3.Row:
         if not isinstance(token, str) or not token:
@@ -5890,73 +5934,84 @@ class JobManager:
             raise ValueError(f"Unknown decision for job {job_id}: {token}")
         return row
 
-    def _expire_decision(self, row: sqlite3.Row) -> bool:
-        """CAS pending->expired; True when this call performed the transition."""
-        with self.db_lock:
-            cursor = self.db.execute(
-                "UPDATE decisions SET status='expired', resolved_at=? WHERE decision_id=? AND status=?",
-                (now_iso(), row["decision_id"], DECISION_PENDING),
-            )
-            self.db.commit()
-            return cursor.rowcount == 1
-
     def resolve_decision(self, job_id: str, token: str, choice: str, actor: str = "user") -> dict[str, Any]:
-        """Record a human choice for a pending decision (idempotent per choice)."""
+        """Record a human choice for a pending decision (idempotent per choice).
+
+        Validation (deadline, status, choice) and the pending->resolved CAS all
+        run inside the write transaction, so the deadline is enforced at the
+        authoritative transition rather than on a stale read.
+        """
         self._ensure_open()
-        row = self._decision_for(job_id, token)
-        if row["status"] == "resolved":
-            if row["choice"] == choice:
-                return self._decision_dict(row)
-            raise ValueError(f"decision already resolved as {row['choice']!r}")
-        if row["status"] == "expired" or self._decision_isdue(self._decision_dict(row)):
-            if row["status"] == DECISION_PENDING and self._expire_decision(row):
-                self._emit(job_id, "decision_expired", message="decision timed out", data={"decision_id": row["decision_id"]})
-            raise ValueError("decision expired")
-        if row["status"] != DECISION_PENDING:
-            raise ValueError(f"decision is {row['status']}")
-        allowed = json.loads(row["options_json"] or "[]")
-        if choice not in allowed:
-            raise ValueError(f"choice must be one of {allowed}")
-        with self.db_lock:
-            cursor = self.db.execute(
+        if not isinstance(choice, str) or not choice:
+            raise ValueError("choice must be a non-empty string")
+        if not isinstance(token, str) or not token:
+            raise ValueError("token must be a non-empty string")
+
+        def mutate(db: sqlite3.Connection) -> None:
+            row = db.execute("SELECT * FROM decisions WHERE decision_id=?", (token,)).fetchone()
+            if row is None or row["job_id"] != job_id:
+                raise ValueError(f"Unknown decision for job {job_id}: {token}")
+            if row["status"] == "resolved":
+                if row["choice"] == choice:
+                    raise _DecisionNoOp()
+                raise ValueError(f"decision already resolved as {row['choice']!r}")
+            if row["status"] != DECISION_PENDING:
+                raise ValueError(f"decision is {row['status']}")
+            if _row_isdue(row["expires_at"], row["status"], datetime.now(timezone.utc)):
+                raise ValueError("decision expired")
+            allowed = json.loads(row["options_json"] or "[]")
+            if choice not in allowed:
+                raise ValueError(f"choice must be one of {allowed}")
+            cursor = db.execute(
                 "UPDATE decisions SET status='resolved', choice=?, resolved_by=?, resolved_at=? WHERE decision_id=? AND status=?",
-                (choice, actor, now_iso(), row["decision_id"], DECISION_PENDING),
+                (choice, actor, now_iso(), token, DECISION_PENDING),
             )
-            self.db.commit()
-        if cursor.rowcount != 1:
-            current = self._row("SELECT * FROM decisions WHERE decision_id=?", (row["decision_id"],))
-            if current is not None and current["status"] == "resolved" and current["choice"] == choice:
-                return self._decision_dict(current)
-            raise ValueError("decision was resolved concurrently")
-        self._emit(
+            if cursor.rowcount != 1:
+                raise ValueError("decision changed concurrently")
+
+        event = self._emit(
             job_id,
             "decision_resolved",
             message=choice,
-            data={"decision_id": row["decision_id"], "choice": choice, "actor": actor, "prompt": row["prompt"]},
+            data={"decision_id": token, "choice": choice, "actor": actor},
+            mutate=mutate,
         )
-        return self._decision_dict(self._row("SELECT * FROM decisions WHERE decision_id=?", (row["decision_id"],)))
+        if event is not None and event.get("noop"):
+            row = self._decision_for(job_id, token)
+            if row["choice"] != choice:  # pragma: no cover - noop only for equal choice
+                raise ValueError(f"decision already resolved as {row['choice']!r}")
+            return self._decision_dict(row)
+        return self._reload_decision(token)
 
     def withdraw_decision(self, job_id: str, token: str, actor: str = "user") -> dict[str, Any]:
         """Cancel a pending decision (the requester no longer needs an answer)."""
         self._ensure_open()
-        row = self._decision_for(job_id, token)
-        if row["status"] != DECISION_PENDING:
-            raise ValueError(f"decision is {row['status']}")
-        with self.db_lock:
-            cursor = self.db.execute(
+        if not isinstance(token, str) or not token:
+            raise ValueError("token must be a non-empty string")
+
+        def mutate(db: sqlite3.Connection) -> None:
+            row = db.execute("SELECT * FROM decisions WHERE decision_id=?", (token,)).fetchone()
+            if row is None or row["job_id"] != job_id:
+                raise ValueError(f"Unknown decision for job {job_id}: {token}")
+            if row["status"] != DECISION_PENDING:
+                raise ValueError(f"decision is {row['status']}")
+            if _row_isdue(row["expires_at"], row["status"], datetime.now(timezone.utc)):
+                raise ValueError("decision expired")
+            cursor = db.execute(
                 "UPDATE decisions SET status='withdrawn', resolved_by=?, resolved_at=? WHERE decision_id=? AND status=?",
-                (actor, now_iso(), row["decision_id"], DECISION_PENDING),
+                (actor, now_iso(), token, DECISION_PENDING),
             )
-            self.db.commit()
-        if cursor.rowcount != 1:
-            raise ValueError("decision was resolved concurrently")
+            if cursor.rowcount != 1:
+                raise ValueError("decision changed concurrently")
+
         self._emit(
             job_id,
             "decision_withdrawn",
             message="decision withdrawn",
-            data={"decision_id": row["decision_id"], "actor": actor, "prompt": row["prompt"]},
+            data={"decision_id": token, "actor": actor},
+            mutate=mutate,
         )
-        return self._decision_dict(self._row("SELECT * FROM decisions WHERE decision_id=?", (row["decision_id"],)))
+        return self._reload_decision(token)
 
     def list_decisions(self, job_id: str | None = None, status: str | None = None, limit: int = 50) -> dict[str, Any]:
         self._ensure_open()
@@ -5971,25 +6026,78 @@ class JobManager:
             sql += " AND status=?"
             args.append(status)
         sql += " ORDER BY created_at DESC, decision_id DESC LIMIT ?"
-        args.append(max(1, min(int(limit), 500)))
+        args.append(validate_limit(limit, "limit", maximum=500))
         with self.db_lock:
             rows = self.db.execute(sql, tuple(args)).fetchall()
         return {"decisions": [self._decision_dict(row) for row in rows], "count": len(rows)}
 
     def _expire_decisions(self) -> None:
-        """Expire overdue pending decisions (maintenance loop; edge-triggered)."""
+        """Expire overdue pending decisions (maintenance loop; edge-triggered).
+
+        Each expiry's state change and ``decision_expired`` event commit
+        together, so an expiry is never recorded without its event.
+        """
         now = datetime.now(timezone.utc)
         with self.db_lock:
             rows = self.db.execute(
-                "SELECT * FROM decisions WHERE status=? AND expires_at IS NOT NULL",
+                "SELECT decision_id, job_id, expires_at FROM decisions WHERE status=? AND expires_at IS NOT NULL",
                 (DECISION_PENDING,),
             ).fetchall()
         for row in rows:
-            if not self._decision_isdue(self._decision_dict(row), now):
+            if not _row_isdue(row["expires_at"], DECISION_PENDING, now):
                 continue
-            if self._expire_decision(row):
-                self._emit(row["job_id"], "decision_expired", message="decision timed out",
-                           data={"decision_id": row["decision_id"], "prompt": row["prompt"]})
+
+            def mutate(db: sqlite3.Connection, decision_id: str = row["decision_id"], expires_at: str = row["expires_at"]) -> None:
+                # Re-check under the write lock: a concurrent resolve/withdraw
+                # (or a resolver that beat the deadline by a hair) wins.
+                current = db.execute("SELECT expires_at, status FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
+                if current is None or not _row_isdue(current["expires_at"], current["status"], datetime.now(timezone.utc)):
+                    raise _DecisionNoOp()
+                cursor = db.execute(
+                    "UPDATE decisions SET status='expired', resolved_at=? WHERE decision_id=? AND status=?",
+                    (now_iso(), decision_id, DECISION_PENDING),
+                )
+                if cursor.rowcount != 1:
+                    raise _DecisionNoOp()
+
+            self._emit(
+                row["job_id"],
+                "decision_expired",
+                message="decision timed out",
+                data={"decision_id": row["decision_id"]},
+                mutate=mutate,
+            )
+
+
+def _row_isdue(expires_at: Any, status: Any, now: datetime | None = None) -> bool:
+    """Whether a stored deadline has passed. Malformed/non-pending -> False."""
+    if status != DECISION_PENDING or not expires_at:
+        return False
+    parsed = _parse_iso(str(expires_at))
+    if parsed is None:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= (now or datetime.now(timezone.utc))
+
+
+def _normalize_decision_options(options: list[str] | None) -> list[str]:
+    choices = DEFAULT_DECISION_OPTIONS if options is None else options
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("options must be a non-empty list of strings")
+    if len(choices) > MAX_DECISION_OPTIONS:
+        raise ValueError(f"options must contain at most {MAX_DECISION_OPTIONS} entries")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for option in choices:
+        if not isinstance(option, str) or not option.strip():
+            raise ValueError("options must be non-empty strings")
+        if len(option) > MAX_DECISION_OPTION_CHARS:
+            raise ValueError(f"each option must be at most {MAX_DECISION_OPTION_CHARS} characters")
+        if option not in seen:
+            seen.add(option)
+            normalized.append(option)
+    return normalized
 
 
 client: VanthClient | None = None

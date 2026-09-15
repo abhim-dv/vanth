@@ -10,10 +10,12 @@ migration.
 """
 
 import asyncio
+import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -45,6 +47,13 @@ def decision_row(manager: JobManager, decision_id: str):
     return manager.db.execute("SELECT * FROM decisions WHERE decision_id=?", (decision_id,)).fetchone()
 
 
+def event_rows(manager: JobManager, job_id: str, event_type: str) -> list[dict]:
+    rows = manager.db.execute(
+        "SELECT data_json FROM events WHERE job_id=? AND type=? ORDER BY seq", (job_id, event_type)
+    ).fetchall()
+    return [json.loads(row["data_json"]) for row in rows]
+
+
 def test_request_decision_is_pending_and_wakes_owner(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
@@ -60,12 +69,24 @@ def test_request_decision_is_pending_and_wakes_owner(tmp_path):
         assert decision["options"] == ["approve", "deny"]
         assert decision["choice"] is None
         assert decision["expires_at"] is None
-        assert "decision_requested" in event_types(manager, job_id)
-        # The owner is notified through the ordinary delivery queue.
+        # The lifecycle event carries the identifiers a woken agent needs.
+        payload = event_rows(manager, job_id, "decision_requested")
+        assert len(payload) == 1
+        assert payload[0] == {
+            "decision_id": decision["decision_id"],
+            "prompt": "Ship the release?",
+            "options": ["approve", "deny"],
+            "expires_at": None,
+        }
+        # The owner is notified through the ordinary delivery queue, linked to
+        # that event.
         deliveries = manager.db.execute(
-            "SELECT target_type, status FROM deliveries WHERE job_id=?", (job_id,)
+            "SELECT d.target_type, d.status, e.type FROM deliveries d JOIN events e ON e.event_id=d.event_id WHERE d.job_id=?",
+            (job_id,),
         ).fetchall()
-        assert [row["target_type"] for row in deliveries] == ["local_command"]
+        assert [(row["target_type"], row["status"], row["type"]) for row in deliveries] == [
+            ("local_command", "pending", "decision_requested")
+        ]
         # The job itself is untouched.
         assert manager.status(job_id)["status"] == "running"
     finally:
@@ -146,6 +167,9 @@ def test_expired_decision_cannot_be_resolved_and_sweep_emits(tmp_path):
         manager._expire_decisions()
         assert decision_row(manager, decision["decision_id"])["status"] == "expired"
         assert "decision_expired" in event_types(manager, job_id)
+        # A second sweep must not emit a duplicate expiry event.
+        manager._expire_decisions()
+        assert event_types(manager, job_id).count("decision_expired") == 1
         with pytest.raises(ValueError, match="expired"):
             manager.resolve_decision(job_id, decision["decision_id"], "approve")
     finally:
@@ -248,6 +272,121 @@ def test_v15_database_upgrades_to_decisions_table(tmp_path):
         reopened.close()
 
 
+def test_decision_mutation_and_event_commit_together(tmp_path, monkeypatch):
+    """A failure after the state change must roll the state change back too."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+
+        def boom(event):
+            raise RuntimeError("injected failure after mutation")
+
+        monkeypatch.setattr(manager, "_enqueue_deliveries_uncommitted", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            manager.request_decision(job_id, "Deploy?")
+        # Neither half of the transaction survives.
+        assert manager.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+        assert event_rows(manager, job_id, "decision_requested") == []
+    finally:
+        manager.close()
+
+
+def test_decision_events_survive_event_cap(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        manager.max_events_per_job = 1  # the job is already far past the cap
+        decision = manager.request_decision(job_id, "Deploy?")
+        assert decision["status"] == "pending"
+        assert len(event_rows(manager, job_id, "decision_requested")) == 1
+        manager.resolve_decision(job_id, decision["decision_id"], "approve")
+        assert len(event_rows(manager, job_id, "decision_resolved")) == 1
+        # Ordinary telemetry is still capped.
+        assert manager._emit(job_id, "progress", data={"current": 1})["persisted"] is False
+    finally:
+        manager.close()
+
+
+def test_concurrent_resolve_has_single_winner(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        decision = manager.request_decision(job_id, "Deploy?", options=["approve", "deny"])
+        results: list[str] = []
+        errors: list[str] = []
+
+        def worker(choice: str) -> None:
+            try:
+                results.append(manager.resolve_decision(job_id, decision["decision_id"], choice)["choice"])
+            except ValueError as exc:
+                errors.append(str(exc))
+
+        threads = [threading.Thread(target=worker, args=(choice,)) for choice in ("approve", "deny")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(results) == 1, results
+        assert len(errors) == 1, errors
+        assert decision_row(manager, decision["decision_id"])["choice"] == results[0]
+        assert len(event_rows(manager, job_id, "decision_resolved")) == 1
+    finally:
+        manager.close()
+
+
+def test_withdraw_rejects_overdue_decision(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        decision = manager.request_decision(job_id, "Deploy?", timeout_seconds=3600)
+        manager.db.execute(
+            "UPDATE decisions SET expires_at=? WHERE decision_id=?",
+            ("2000-01-01T00:00:00Z", decision["decision_id"]),
+        )
+        manager.db.commit()
+        with pytest.raises(ValueError, match="expired"):
+            manager.withdraw_decision(job_id, decision["decision_id"])
+        assert decision_row(manager, decision["decision_id"])["status"] == "pending"
+    finally:
+        manager.close()
+
+
+def test_request_decision_bounds(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_id = running_job(manager)
+        with pytest.raises(ValueError, match="at most 10000"):
+            manager.request_decision(job_id, "x" * 10001)
+        with pytest.raises(ValueError, match="at most 50"):
+            manager.request_decision(job_id, "Deploy?", options=[f"opt{i}" for i in range(51)])
+        with pytest.raises(ValueError, match="at most 200"):
+            manager.request_decision(job_id, "Deploy?", options=["y" * 201])
+        # Duplicates are collapsed in order, not rejected.
+        assert manager.request_decision(job_id, "Deploy?", options=["a", "b", "a"])["options"] == ["a", "b"]
+    finally:
+        manager.close()
+
+
+def test_cleanup_removes_decisions(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        started = asyncio.run(manager.start(cmd("print('done')")))
+        job_id = started["job_id"]
+        asyncio.run(manager.wait(job_id, ["completed"], timeout_seconds=10))
+        # Decisions can only be requested while non-terminal, so model a
+        # pending row left behind by inserting one directly.
+        manager.db.execute(
+            "INSERT INTO decisions(decision_id, job_id, prompt, options_json, choice, status, resolved_by, created_at, expires_at, resolved_at) "
+            "VALUES ('dec_left', ?, 'Deploy?', '[\"approve\"]', NULL, 'pending', NULL, ?, NULL, NULL)",
+            (job_id, "2026-09-15T00:00:00Z"),
+        )
+        manager.db.commit()
+        manager.cleanup(0, dry_run=False)
+        assert manager.db.execute("SELECT COUNT(*) FROM decisions WHERE job_id=?", (job_id,)).fetchone()[0] == 0
+    finally:
+        manager.close()
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -291,6 +430,14 @@ def test_decisions_over_http(tmp_path):
         withdrawn = client.post(f"/jobs/{job['job_id']}/decision/{second['decision_id']}/withdraw")
         assert withdrawn["status"] == "withdrawn"
         assert client.get("/decisions", {"status": "withdrawn"})["count"] == 1
+
+        # Malformed paths are a clean error, never an unintended resolve/500.
+        third = client.post(f"/jobs/{job['job_id']}/decision", {"prompt": "Malformed?", "options": ["yes"]})
+        assert client.post(f"/jobs/{job['job_id']}/resolve", {"choice": "yes"})["result"] == "error"
+        assert client.post(
+            f"/jobs/{job['job_id']}/not-a-decision/{third['decision_id']}/resolve", {"choice": "yes"}
+        )["result"] == "error"
+        assert client.get("/decisions", {"status": "pending"})["count"] == 1
     finally:
         proc.terminate()
         proc.wait(timeout=5)

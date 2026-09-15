@@ -515,8 +515,12 @@ running while it waits.
 |---|---|---|---|
 | `job_id` | `string` | required | A queued/running (non-terminal) job |
 | `prompt` | `string` | required | The question shown to the human |
-| `options` | `string[]` | `["approve", "deny"]` | Allowed choices (deduplicated) |
+| `options` | `string[]` | `["approve", "deny"]` | Allowed choices (deduplicated; max 50, 200 chars each) |
 | `timeout_seconds` | `int` | none | Expire the request after N seconds |
+
+`prompt` is limited to 10000 characters. The request, its `decision_requested`
+event and any wake deliveries commit in one transaction; decision lifecycle
+events are exempt from the per-job structured-event cap.
 
 Requesting emits a `decision_requested` event, which reuses the wake-target
 delivery path — the job's wake targets are notified, so the owning thread

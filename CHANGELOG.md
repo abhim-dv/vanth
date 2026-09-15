@@ -21,12 +21,25 @@ holding a thread or killing the job.
   waits for the answer like any other event.
 - An optional `timeout_seconds` expires the request; the maintenance loop
   marks it `expired` and emits `decision_expired`, after which it can no
-  longer be resolved.
+  longer be resolved. Deadline, status and choice are all validated **inside**
+  the write transaction that performs the resolution, so the deadline is
+  enforced at the authoritative transition rather than on a stale read.
+- Each decision state change commits together with its lifecycle event and
+  wake deliveries in one transaction: a crash can never leave a resolved
+  decision with no `decision_resolved` event for a `job_wait` caller (a retry
+  could not repair that). Decision lifecycle events are also exempt from the
+  per-job structured-event cap, so a busy job at the cap still gets its wake.
+- `prompt`/`options` are bounded (10000 chars, 50 options, 200 chars each) so
+  the lifecycle payload can never be truncated (which would drop the
+  `decision_id` and break the wake and wait paths).
+- `job_cleanup` deletes a job's decisions with the rest of its state, so a
+  removed job leaves no actionable pending request behind.
 - Lifecycle events (`decision_requested` / `decision_resolved` /
   `decision_withdrawn` / `decision_expired`) are the audit trail;
   `decision_requested` also ranks as an attention event in `job_view`.
 - Schema v16 adds the `decisions` table (additive; existing databases
-  migrate in place with the usual pre-migration backup).
+  migrate in place with the usual pre-migration backup); the Go mirrored
+  `LatestSchemaVersion` and cross-language fixture move to 16 with it.
 
 ## 1.9.1 - 2026-09-11
 
