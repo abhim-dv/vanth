@@ -43,8 +43,8 @@ jobs:
             goos: windows
             goarch: amd64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
       - name: Cross-compile ${{ matrix.target }}
@@ -57,7 +57,7 @@ jobs:
           exe=""
           [ "$GOOS" = "windows" ] && exe=".exe"
           go build -trimpath -ldflags "-X vanth/internal/config.Version=${{ github.ref_name }}" -o "dist/vanth-monitor-${{ matrix.target }}${exe}" ./cmd/vanth
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: monitor-${{ matrix.target }}
           path: dist/vanth-monitor-${{ matrix.target }}*
@@ -101,11 +101,11 @@ jobs:
             tag: win_amd64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: monitor-${{ matrix.bin }}
           path: dist
@@ -131,7 +131,7 @@ jobs:
           VANTH_MONITOR_GOARCH: ${{ matrix.goarch }}
           VANTH_MONITOR_TAG: ${{ matrix.tag }}
         run: uv build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -140,14 +140,14 @@ jobs:
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: '3.12'
       - name: Build sdist
         shell: bash
         run: uv build --sdist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -158,16 +158,16 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: 'wheels-*'
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist

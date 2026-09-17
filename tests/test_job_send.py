@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from vanth.server import JobManager
+from vanth.server import TERMINAL_STATUSES, JobManager
 
 
 import shellcmd
@@ -141,13 +141,29 @@ def test_rerun_preserves_interactive(tmp_path):
             )
         )
         job_id = started["job_id"]
+        # An interactive job reads until EOF, so it must be closed before it can
+        # complete. Waiting for "completed" without this silently timed out AND
+        # left the job's runner alive after pytest exited (one leaked process per
+        # run): the job was still `running`, and only the runner's own cleanup on
+        # a terminal state stops it.
+        wait_event(manager, job_id, "started")
+        manager.send_sync(job_id, "", eof=True)
         wait_event(manager, job_id, "completed")
+        assert manager.status(job_id)["status"] == "completed"
+
         reran = manager.rerun_sync(job_id)
         rerun_id = reran["job_id"]
         wait_event(manager, rerun_id, "started")
         assert manager.send_sync(rerun_id, "again")["sent"] == 5
         manager.send_sync(rerun_id, "", eof=True)
         wait_event(manager, rerun_id, "completed")
+        assert manager.status(rerun_id)["status"] == "completed"
         assert "GOT:again" in tail(manager, rerun_id, "stdout")
+        # Nothing may be left running: an in-flight job keeps its runner process
+        # alive after pytest exits (the leak this test used to cause).
+        in_flight = [
+            job["job_id"] for job in manager.list()["jobs"] if job["status"] not in TERMINAL_STATUSES
+        ]
+        assert not in_flight, f"jobs left running: {in_flight}"
     finally:
         manager.close()
