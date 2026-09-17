@@ -11,6 +11,13 @@ from vanth import setup
 from vanth.paths import canonical_home
 
 
+@pytest.fixture(autouse=True)
+def _isolate_opencode_plugin_dir(tmp_path, monkeypatch):
+    """`run_setup` installs/removes the OpenCode wake plugin: a test must never
+    touch the developer's real ~/.config/opencode/plugins."""
+    monkeypatch.setenv("VANTH_OPENCODE_PLUGIN_DIR", str(tmp_path / "opencode-plugins"))
+
+
 def _scratch_configs(tmp_path):
     """Create fake opencode/codex/claude configs in tmp_path and point setup
     discovery at them. Returns the three paths."""

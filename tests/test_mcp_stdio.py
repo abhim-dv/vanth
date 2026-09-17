@@ -58,6 +58,9 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                     await session.initialize()
                     tools = {tool.name for tool in (await session.list_tools()).tools}
                     assert {"job_start", "job_wait", "job_tail", "job_view", "job_doctor", "job_retry_delivery"} <= tools
+                    # Remote execution must be discoverable from MCP alone, not
+                    # only by hand-writing HTTP against the daemon.
+                    assert {"remote_list", "remote_doctor"} <= tools
 
                     start = content(
                         await session.call_tool(

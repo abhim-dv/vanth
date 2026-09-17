@@ -44,10 +44,15 @@ def client_config_paths(home: Path | None = None) -> dict[str, list[Path]]:
     """Return the config file paths for each known client that exists."""
     home = home or canonical_home()
     found: dict[str, list[Path]] = {}
-    # opencode: also check the app data location on Windows.
+    # opencode loads and MERGES several files, later ones winning on conflicts:
+    # config.json -> opencode.json -> opencode.jsonc. List them so setup/status
+    # can see the whole effective picture instead of reporting "not configured"
+    # for a client whose entry lives in a file we did not look at.
     candidates: dict[str, list[str]] = {
         "opencode": [
+            "~/.config/opencode/config.json",
             "~/.config/opencode/opencode.json",
+            "~/.config/opencode/opencode.jsonc",
             "~/.opencode.json",
         ],
         "codex": ["~/.codex/config.toml"],
@@ -59,6 +64,47 @@ def client_config_paths(home: Path | None = None) -> dict[str, list[Path]]:
             if path.is_file():
                 found.setdefault(client, []).append(path)
     return found
+
+
+OPENCODE_PLUGIN_FILENAME = "vanth.ts"
+
+
+def plugin_source() -> Path:
+    """The wake plugin shipped with this package."""
+    return Path(__file__).resolve().parent / "opencode_plugin" / OPENCODE_PLUGIN_FILENAME
+
+
+def plugin_target() -> Path:
+    """Where OpenCode loads plugins from (``VANTH_OPENCODE_PLUGIN_DIR`` overrides)."""
+    directory = os.environ.get("VANTH_OPENCODE_PLUGIN_DIR") or "~/.config/opencode/plugins"
+    return Path(directory).expanduser() / OPENCODE_PLUGIN_FILENAME
+
+
+def install_opencode_plugin() -> tuple[bool, str]:
+    """Install the OpenCode wake relay plugin; idempotent.
+
+    A plain TUI session exposes no ``attach`` URL and injects no session id, so
+    without this in-process plugin an ``opencode_thread`` wake can never reach
+    the session the user is watching.
+    """
+    source = plugin_source()
+    if not source.is_file():
+        raise FileNotFoundError(f"plugin source not found: {source}")
+    text = source.read_text(encoding="utf-8")
+    target = plugin_target()
+    if target.is_file() and target.read_text(encoding="utf-8") == text:
+        return False, "already installed"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(target, text)
+    return True, f"installed {target}"
+
+
+def remove_opencode_plugin() -> tuple[bool, str]:
+    target = plugin_target()
+    if not target.is_file():
+        return False, "not configured"
+    target.unlink()
+    return True, f"removed {target}"
 
 
 def _backup(path: Path) -> Path:
@@ -313,27 +359,242 @@ def detect_status(home: Path | None = None) -> dict[str, list[dict[str, Any]]]:
     for client, paths in found.items():
         entries = []
         for path in paths:
-            configured = _is_configured(client, path)
-            entries.append({"path": str(path), "configured": configured})
+            state = config_state(client, path)
+            entries.append({"path": str(path), "state": state, "configured": state == "configured"})
         result[client] = entries
     return result
 
 
-def _is_configured(client: str, path: Path) -> bool:
+#: Config key holding the vanth entry, per client.
+_CLIENT_KEYS = {"opencode": "mcp", "claude": "mcpServers", "codex": "mcp_servers"}
+
+
+def _strip_jsonc(text: str) -> str:
+    """Remove ``//`` and ``/* */`` comments from JSONC text.
+
+    A scanner, not a regex, so a ``//`` inside a string literal is preserved.
+    READ-ONLY: this lets us detect keys in a commented config without ever
+    rewriting the user's file.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "/" and index + 1 < length and text[index + 1] == "/":
+            index += 2
+            while index < length and text[index] not in "\r\n":
+                index += 1
+            continue
+        elif char == "/" and index + 1 < length and text[index + 1] == "*":
+            index += 2
+            while index + 1 < length and not (text[index] == "*" and text[index + 1] == "/"):
+                index += 1
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _remove_trailing_commas(text: str) -> str:
+    """Drop commas immediately before a closing brace/bracket (string-aware)."""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == ",":
+            look = index + 1
+            while look < length and text[look] in " \t\r\n":
+                look += 1
+            if look < length and text[look] in "}]":
+                index += 1
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _jsonc_is_plain_json(path: Path) -> bool:
+    """True when a ``.jsonc`` file carries no comments or trailing commas, so a
+    normal JSON round-trip loses nothing and it can be edited safely."""
     try:
-        if client in {"opencode", "claude"}:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if client == "opencode":
-                return bool((data.get("mcp") or {}).get(SETUP_KEY))
-            return bool((data.get("mcpServers") or {}).get(SETUP_KEY))
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return _strip_jsonc(text) == text and _remove_trailing_commas(text) == text
+
+
+def _load_client_config(client: str, path: Path) -> dict[str, Any] | None:
+    """Parse a client config (JSON, JSONC, or TOML). ``None`` means unreadable."""
+    try:
+        text = path.read_text(encoding="utf-8")
         if client == "codex":
             import tomllib
 
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-            return bool((data.get("mcp_servers") or {}).get(SETUP_KEY))
+            return tomllib.loads(text)
+        if path.suffix.lower() == ".jsonc":
+            text = _remove_trailing_commas(_strip_jsonc(text))
+        return json.loads(text)
     except (OSError, ValueError):
-        return False
-    return False
+        return None
+
+
+def config_state(client: str, path: Path) -> str:
+    """Classify a client config file: ``configured`` / ``disabled`` /
+    ``not-configured`` / ``unreadable`` / ``missing``.
+
+    ``unreadable`` is deliberately distinct from ``not-configured``: a file we
+    could not parse is unknown, and reporting it as unconfigured would be wrong
+    (and is exactly the case where we refuse to write a shadowed entry).
+    """
+    if not path.is_file():
+        return "missing"
+    data = _load_client_config(client, path)
+    if not isinstance(data, dict):
+        return "unreadable"
+    entry = (data.get(_CLIENT_KEYS[client]) or {}).get(SETUP_KEY)
+    if not entry:
+        return "not-configured"
+    # An entry that is explicitly disabled is present but not effective.
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        return "disabled"
+    return "configured"
+
+
+def _is_configured(client: str, path: Path) -> bool:
+    return config_state(client, path) == "configured"
+
+
+#: opencode merges these global files in order; later entries override earlier
+#: ones for conflicting keys (config.json -> opencode.json -> opencode.jsonc).
+_OPENCODE_PRECEDENCE = ["config.json", "opencode.json", "opencode.jsonc"]
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _shadowing_opencode_file(paths: list[Path], target: Path) -> Path | None:
+    """Return a higher-precedence opencode file that defines (or may define)
+    ``mcp.vanth``, i.e. one that would shadow an entry written to ``target``."""
+    rank = {name: index for index, name in enumerate(_OPENCODE_PRECEDENCE)}
+    target_rank = rank.get(target.name, -1)
+    for path in paths:
+        if path == target or rank.get(path.name, -1) <= target_rank:
+            continue
+        if config_state("opencode", path) in {"configured", "disabled", "unreadable"}:
+            return path
+    return None
+
+
+def effective_state(client: str, paths: list[Path]) -> str:
+    """The state that actually applies to a client.
+
+    opencode DEEP-MERGES its config files, so the outcome is the merge of the
+    ``mcp.vanth`` entries in precedence order — not "the first file that has
+    one". A lower file's ``enabled: false`` survives a higher file that only
+    adds a ``command``, and reporting "configured" there would claim a server is
+    connected when it is not.
+    """
+    if client != "opencode":
+        return config_state(client, paths[0]) if paths else "missing"
+    if not paths:
+        return "missing"
+    rank = {name: index for index, name in enumerate(_OPENCODE_PRECEDENCE)}
+    merged: dict[str, Any] = {}
+    present = False
+    for path in sorted(paths, key=lambda item: rank.get(item.name, -1)):
+        data = _load_client_config(client, path)
+        if data is None:
+            # An unparseable file could override anything; report uncertainty.
+            return "unreadable"
+        entry = (data.get("mcp") or {}).get(SETUP_KEY)
+        if isinstance(entry, dict):
+            merged = _deep_merge(merged, entry)
+            present = True
+        elif entry:
+            present = True
+    if not present:
+        return "not-configured"
+    return "disabled" if merged.get("enabled") is False else "configured"
+
+
+def _select_write_target(client: str, paths: list[Path]) -> tuple[Path | None, str]:
+    """Pick the ONE config file `vanth setup` should edit.
+
+    For opencode, prefer a plain-JSON file we can safely round-trip
+    (``opencode.json``, then ``config.json``). A JSONC-only install is reported
+    instead of edited: comment/trailing-comma preservation is not implemented,
+    so rewriting it would destroy the user's comments. A plain-JSON target is
+    also refused when a HIGHER-precedence file may define ``mcp.vanth`` — writing
+    the lower file there would be shadowed and the registration would silently
+    not take effect.
+    """
+    if client != "opencode":
+        return (paths[0] if paths else None), ""
+    by_name = {path.name: path for path in paths}
+    target = None
+    for name in ("opencode.json", "config.json"):
+        if name in by_name:
+            target = by_name[name]
+            break
+    if target is None:
+        jsonc = [path for path in paths if path.suffix.lower() == ".jsonc"]
+        plain = [path for path in jsonc if _jsonc_is_plain_json(path)]
+        if plain:
+            # No comments to lose, so it round-trips like a normal JSON config.
+            return plain[0], ""
+        if jsonc:
+            return None, (
+                f"only a commented JSONC config is present ({jsonc[0]}); add `mcp.{SETUP_KEY}` "
+                "manually — vanth will not rewrite a commented file"
+            )
+        return (paths[0] if paths else None), ""
+
+    shadow = _shadowing_opencode_file(paths, target)
+    if shadow is not None:
+        return None, (
+            f"{shadow.name} overrides {target.name} and defines (or cannot be ruled out as "
+            f"defining) `mcp.{SETUP_KEY}`; refusing to write a shadowed duplicate — edit "
+            f"{shadow.name} directly instead"
+        )
+    return target, ""
 
 
 _REGISTRARS = {
@@ -377,25 +638,68 @@ def run_setup(
 
     verb = "remove" if remove else "register"
     targets: list[tuple[str, Path]] = []
+    skipped: list[tuple[str, str]] = []
     for client in requested:
-        for path in found.get(client, []):
-            targets.append((client, path))
+        paths = found.get(client, [])
+        if not paths:
+            # A requested client with no config file cannot be registered; for
+            # removal there is simply nothing to do.
+            if not remove:
+                skipped.append((client, "no config file found"))
+            continue
+        if remove:
+            # Removal must clean EVERY safe registration: selecting a single
+            # file would leave an entry behind in another one. Only a file we
+            # cannot parse is skipped (with a warning) because we cannot tell
+            # whether it holds a registration.
+            for path in paths:
+                if (
+                    client == "opencode"
+                    and path.suffix.lower() == ".jsonc"
+                    and not _jsonc_is_plain_json(path)
+                ):
+                    skipped.append(
+                        (client, f"{path} has comments; remove `mcp.{SETUP_KEY}` manually if present")
+                    )
+                    continue
+                targets.append((client, path))
+            continue
+        path, note = _select_write_target(client, paths)
+        if path is None:
+            if note:
+                skipped.append((client, note))
+            continue
+        targets.append((client, path))
+
+    if skipped and not json_out:
+        for client, note in skipped:
+            print(f"vanth setup: {client}: {note}", file=sys.stderr)
 
     if not targets:
+        if remove and not skipped:
+            # Nothing is registered in any discovered file: removal is complete.
+            if json_out:
+                print(json.dumps({"ok": True, "verb": verb, "results": [], "skipped": []}, indent=2))
+            else:
+                print("vanth setup: nothing to remove")
+            return 0
         if json_out:
-            print(json.dumps({"ok": False, "error": "no known client configs found"}))
+            print(json.dumps({
+                "ok": False,
+                "error": "no writable client config found",
+                "skipped": [{"client": client, "reason": note} for client, note in skipped],
+            }))
         else:
-            print("vanth setup: no known client configs found.", file=sys.stderr)
-            print("  searched: ~/.config/opencode/opencode.json, ~/.codex/config.toml, ~/.claude.json", file=sys.stderr)
+            print("vanth setup: no writable client config found.", file=sys.stderr)
+            print("  searched: ~/.config/opencode/{config.json,opencode.json,opencode.jsonc},", file=sys.stderr)
+            print("            ~/.codex/config.toml, ~/.claude.json", file=sys.stderr)
             print("  pass an explicit client, e.g. `vanth setup opencode`", file=sys.stderr)
         return 1
 
     if not json_out:
         print(f"vanth setup: {verb} MCP server in {len(targets)} config file(s):")
         for client, path in targets:
-            already = _is_configured(client, path)
-            state = "already configured" if already else "not configured"
-            print(f"  - {client}: {path} ({state})")
+            print(f"  - {client}: {path} ({config_state(client, path)})")
 
     if not assume_yes:
         if not sys.stdin.isatty():
@@ -418,21 +722,51 @@ def run_setup(
                 print(f"  FAILED {client}: {exc}")
             failures += 1
             continue
-        ok = changed or summary in {"already configured"}
+        # "not configured" is a successful no-op for removal.
+        ok = changed or summary in {"already configured", "not configured"}
         results.append({"client": client, "path": str(path), "changed": changed, "ok": ok, "summary": summary})
         if not json_out:
             action = "configured" if changed else "skipped"
             print(f"  {client}: {action} ({summary})")
         if not ok:
             failures += 1
-    if failures:
-        if json_out:
-            print(json.dumps({"ok": False, "error": f"{failures} file(s) failed", "results": results}, indent=2))
+    # The OpenCode wake plugin is part of onboarding OpenCode: TUI sessions have
+    # no attach URL, so opencode_thread wakes are undeliverable without it.
+    if "opencode" in requested and found.get("opencode"):
+        try:
+            changed, summary = remove_opencode_plugin() if remove else install_opencode_plugin()
+        except Exception as exc:
+            results.append({"client": "opencode-plugin", "changed": False, "ok": False, "error": str(exc)})
+            if not json_out:
+                print(f"  FAILED opencode-plugin: {exc}")
+            failures += 1
         else:
-            print(f"vanth setup: {failures} file(s) failed", file=sys.stderr)
+            # "not configured" is a successful no-op for removal.
+            ok = changed or summary in {"already installed", "not configured"}
+            results.append({"client": "opencode-plugin", "changed": changed, "ok": ok, "summary": summary})
+            if not json_out:
+                action = "installed" if changed else "skipped"
+                print(f"  opencode-plugin: {action} ({summary})")
+            if not ok:
+                failures += 1
+
+    skipped_payload = [{"client": client, "reason": note} for client, note in skipped]
+    if failures or skipped:
+        # A skipped client (e.g. a JSONC-only install) means the requested
+        # onboarding is INCOMPLETE: report it as a failure, not silent success.
+        detail = f"{failures} file(s) failed" if failures else "some clients were skipped"
+        if json_out:
+            print(json.dumps({
+                "ok": False, "error": detail, "verb": verb,
+                "results": results, "skipped": skipped_payload,
+            }, indent=2))
+        else:
+            print(f"vanth setup: {detail}", file=sys.stderr)
+            for client, note in skipped:
+                print(f"  {client}: {note}", file=sys.stderr)
         return 1
     if json_out:
-        print(json.dumps({"ok": True, "verb": verb, "results": results}, indent=2))
+        print(json.dumps({"ok": True, "verb": verb, "results": results, "skipped": []}, indent=2))
     else:
         print("vanth setup: done")
     return 0

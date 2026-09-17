@@ -25,7 +25,8 @@ The current tool set is `job_start`, `job_rerun`, `job_status`,
 `job_artifact_read`, `job_add_wake_target`, `job_wake_now`, `job_cleanup_preview`,
 `job_request_decision`, `job_resolve`, `job_withdraw_decision`, `job_decisions`,
 `pool_configure`, `pool_list`, `schedule_create`, `schedule_list`,
-`schedule_update`, `schedule_delete`, `schedule_next`. The wake tools (`job_add_wake_target` / `job_wake_now` /
+`schedule_update`, `schedule_delete`, `schedule_next`, `remote_list`, `remote_doctor`.
+The wake tools (`job_add_wake_target` / `job_wake_now` /
 `daemon_wake`) and their `daemon_wake` / `job_wake_now` / `job_add_wake_target`
 Python counterparts, plus `job_wait` `return_progress` and `job_tail` `follow` /
 `timeout_seconds`, are documented below. The MCP tools are registered under
@@ -884,6 +885,32 @@ job) plus the job list — the same data the Go terminal monitor charts.
   "series": { "job_abc123": { "loss": [ {"x": 0, "y": 0.5, "..."} ] } },
   "series_count": 3 }
 ```
+
+---
+
+## Remote execution
+
+Jobs can run on a paired remote host. Discover hosts with `remote_list` (or
+`vanth remote list`); pairing is interactive and lives in the CLI
+(`vanth remote pair user@host`). Pass the returned `remote_id` to the tool that
+acts on that host:
+
+| Tool | Remote behaviour |
+|---|---|
+| `job_start(remote_id=...)` | Run the job on the host instead of locally |
+| `job_list(remote_id=...)` | That host's jobs, from the controller's shadow; only `limit` is supported (other filters are rejected rather than silently dropped) |
+| `job_status(job_id, remote_id=...)` | Live status from the host |
+| `job_tail(job_id, remote_id=...)` | A single byte range of the host's log; `follow` and `grep` are rejected |
+| `job_wait` / `job_stop` / `job_rerun` | Bounded wait / stop / rerun on the host |
+| `remote_doctor(remote_id=...)` | SSH availability and per-host state |
+
+**Remote mutations require a caller-supplied `idempotency_key`** (8-128 chars of
+`[A-Za-z0-9_-]`) so a lost response is safe to retry; the daemon rejects a
+missing one. Local starts are the opposite: they must NOT pass a key.
+`artifact_push_remote` / `artifact_pull_remote` move artifact versions the same
+way. Over HTTP the equivalents are `POST /jobs` with `remote_id`,
+`GET /remotes/{id}/jobs`, `GET /remotes/{id}/status/{job}`, and
+`GET /remotes/{id}/jobs/{job}/tail` (`vanth api` lists them).
 
 ---
 

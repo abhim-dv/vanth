@@ -143,7 +143,9 @@ def validate_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
         if isinstance(after_n, bool) or not isinstance(after_n, int) or after_n < 1:
             raise ValueError("policy.on_failure.after_n must be an integer >= 1")
         action = on_failure.get("action")
-        if action not in {"alert", "disable", "run_job"}:
+        # isinstance first: an unhashable value (list/dict) in a set membership
+        # test raises TypeError and would surface as an internal 500.
+        if not isinstance(action, str) or action not in {"alert", "disable", "run_job"}:
             raise ValueError("policy.on_failure.action must be one of: alert, disable, run_job")
         entry: dict[str, Any] = {"after_n": after_n, "action": action}
         if action == "run_job":
@@ -330,6 +332,16 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked", "decision_requested"}
 WAKE_TARGET_TYPES = {"local_command", "codex_cli_thread", "codex_thread", "codex_desktop", "opencode_thread", "webhook"}
+# Wake target types delivered by a CLIENT-side relay long-polling ``/relay/poll``
+# (the daemon never spawns a transport for these): Codex Desktop via the host
+# pipe, OpenCode via its in-process plugin. ``_RELAY_IDENTITY_KEYS`` maps each to
+# the payload field(s) holding the destination identity, because the relay SQL
+# eligibility filter reads the identity straight out of ``payload_json``.
+RELAY_CLIENT_TYPES = {"codex_desktop", "opencode_thread"}
+RELAY_IDENTITY_KEYS = {
+    "codex_desktop": ("thread_id", "threadId"),
+    "opencode_thread": ("session_id", "sessionId"),
+}
 # Durable approval/decision requests (roadmap Tier-1). A decision is its own
 # small state machine keyed by ``decision_id``; the job row is untouched, so a
 # job can keep running (or stay queued) while a human decides.
@@ -426,7 +438,9 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
         if not isinstance(target, dict):
             raise ValueError("each wake target must be an object")
         target_type = target.get("type")
-        if target_type not in WAKE_TARGET_TYPES:
+        # isinstance first: an unhashable value (list/dict) in a set membership
+        # test raises TypeError and would surface as an internal 500.
+        if not isinstance(target_type, str) or target_type not in WAKE_TARGET_TYPES:
             raise ValueError(f"unsupported wake target type: {target_type!r}")
         events = target.get("events", target.get("notify_on", []))
         if not isinstance(events, list) or not events or not all(isinstance(event, str) for event in events):
@@ -469,16 +483,18 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             # thread_id/threadId is accepted as a legacy alias for session_id.
             session_id = target.get("session_id") or target.get("sessionId") or target.get("thread_id") or target.get("threadId")
             if not isinstance(session_id, str) or not session_id:
-                raise ValueError("opencode_thread target requires explicit session_id")
-            # Review P0-3: without --attach, `opencode run --session` uses an
-            # isolated backend and never wakes the visible TUI. Require the
-            # shared server URL so the wake reaches the running client's server.
-            attach = target.get("attach")
-            if not isinstance(attach, str) or not attach:
                 raise ValueError(
-                    "opencode_thread target requires attach (the opencode server URL, e.g. "
-                    "http://127.0.0.1:PORT) so the wake hits the visible client's server"
+                    "opencode_thread target requires session_id (or a live vanth OpenCode plugin "
+                    "registered for this directory — check `vanth doctor`); pass an id from "
+                    "`opencode session list` when the plugin is not loaded"
                 )
+            # ``attach`` is OPTIONAL: a plain TUI session exposes no server URL
+            # (review P0-3), so without it the wake is delivered by the
+            # in-process OpenCode plugin relay instead of an external
+            # `opencode run --attach`. When set it must be a usable URL.
+            attach = target.get("attach")
+            if attach is not None and (not isinstance(attach, str) or not attach):
+                raise ValueError("opencode_thread attach must be a non-empty string when set")
         elif target_type not in {"local_command", "webhook"} and command is None:
             thread_id = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
             if not isinstance(thread_id, str) or not thread_id:
@@ -1556,7 +1572,7 @@ class JobManager:
         tz = validate_timezone(timezone_name)
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise ValueError("timeout_seconds must be an integer >= 1")
-        if overlap not in {"skip", "allow"}:
+        if not isinstance(overlap, str) or overlap not in {"skip", "allow"}:
             raise ValueError("overlap must be 'skip' or 'allow'")
         if env is not None and not isinstance(env, dict):
             raise ValueError("env must be an object of string values")
@@ -1636,7 +1652,7 @@ class JobManager:
         validate_schedule_spec(cron=cron, interval_seconds=interval)
         tz = validate_timezone(merged.get("timezone") or "UTC")
         overlap = merged.get("overlap", "skip")
-        if overlap not in {"skip", "allow"}:
+        if not isinstance(overlap, str) or overlap not in {"skip", "allow"}:
             raise ValueError("overlap must be 'skip' or 'allow'")
         timeout = merged.get("timeout_seconds")
         if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1):
@@ -2445,6 +2461,14 @@ class JobManager:
                 return
             if not command and target_type in {"codex_cli_thread", "codex_thread", "opencode_thread"} and target.get("auto_dispatch") is False:
                 return
+            if not command and target_type == "opencode_thread" and not target.get("attach"):
+                # Delivered by the in-process OpenCode plugin relay over the same
+                # client-side lease protocol as codex_desktop. The daemon must NOT
+                # spawn `opencode run --session` here: without --attach that starts
+                # an isolated backend whose writes the live TUI never sees (review
+                # P0-3). With no relay subscribed the delivery stays pending until
+                # one connects, then is retried/claimed.
+                return
             if not command and target_type not in {"codex_cli_thread", "codex_thread", "opencode_thread", "webhook"}:
                 return
             delivery = self._claim_delivery(delivery["delivery_id"])
@@ -2535,7 +2559,7 @@ class JobManager:
         path, review rc39 P1) and zero affected rows raises — the caller must
         not report success for a delivery it no longer owns.
         """
-        if status not in {"delivered", "failed"}:
+        if not isinstance(status, str) or status not in {"delivered", "failed"}:
             raise ValueError("delivery completion status must be delivered or failed")
         target = delivery["payload"].get("target", {})
         attempt = int(delivery["attempts"])
@@ -2670,18 +2694,23 @@ class JobManager:
     def relay_register(self, client_id: str, client_type: str, destinations: list[dict[str, Any]]) -> dict[str, Any]:
         """Register (or refresh) a client relay subscription.
 
-        ``destinations`` is a list of ``{"client_type": "codex_desktop",
-        "thread_id": ...}`` identities the client can wake. The daemon uses it
-        only to route relayed deliveries; the pipe/credentials never leave the
-        client process.
+        ``destinations`` is a list of identities the client can wake: for
+        ``codex_desktop`` a ``{"thread_id": ...}``, for ``opencode_thread`` a
+        ``{"session_id": ..., "directory": ...}``. The daemon uses it only to
+        route relayed deliveries; the client's pipe/credentials/URLs never leave
+        the client process.
         """
         self._ensure_open()
         if not isinstance(client_id, str) or not client_id:
             raise ValueError("client_id must be a non-empty string")
-        if client_type not in {"codex_desktop"}:
-            raise ValueError(f"unsupported relay client type: {client_type!r}")
+        if client_type not in RELAY_CLIENT_TYPES:
+            raise ValueError(
+                f"unsupported relay client type: {client_type!r} (expected one of {sorted(RELAY_CLIENT_TYPES)})"
+            )
         if not isinstance(destinations, list):
             raise ValueError("destinations must be a list")
+        if not all(isinstance(item, dict) for item in destinations):
+            raise ValueError("destinations must be a list of objects")
         now = now_iso()
         with self.db_lock:
             self.db.execute(
@@ -2721,18 +2750,22 @@ class JobManager:
         """
         self._ensure_open()
         client_row = self._row(
-            "SELECT client_id, destinations_json FROM relay_subscriptions WHERE client_id=?", (client_id,)
+            "SELECT client_id, client_type, destinations_json FROM relay_subscriptions WHERE client_id=?", (client_id,)
         )
         if not client_row:
             raise ValueError(f"Unknown relay client_id: {client_id}")
+        client_type = client_row["client_type"]
+        identity_keys = RELAY_IDENTITY_KEYS.get(client_type)
+        if identity_keys is None:
+            raise ValueError(f"unknown relay client type: {client_type!r}")
         try:
             destinations = json.loads(client_row["destinations_json"] or "[]")
         except (TypeError, ValueError):
             destinations = []
-        thread_ids = {
-            item.get("thread_id")
+        identities = {
+            item.get(identity_keys[0])
             for item in destinations
-            if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
+            if isinstance(item, dict) and isinstance(item.get(identity_keys[0]), str)
         }
         # Update last_poll_at for liveness tracking.
         with self.db_lock:
@@ -2744,34 +2777,47 @@ class JobManager:
         deadline = time.monotonic() + max(1.0, min(timeout_seconds, 60.0))
         poll_interval = float(os.environ.get("VANTH_RELAY_POLL_INTERVAL", "0.5"))
         while True:
-            due = self._relay_due_deliveries(thread_ids, claim_client_id=client_id)
+            due = self._relay_due_deliveries(
+                identities, target_type=client_type, identity_keys=identity_keys, claim_client_id=client_id
+            )
             if due:
                 return due
             if time.monotonic() >= deadline:
                 return []
             time.sleep(poll_interval)
 
-    def _relay_due_deliveries(self, thread_ids: set[str], *, claim_client_id: str | None = None) -> list[dict[str, Any]]:
+    def _relay_due_deliveries(
+        self,
+        identities: set[str],
+        *,
+        target_type: str = "codex_desktop",
+        identity_keys: tuple[str, ...] = ("thread_id", "threadId"),
+        claim_client_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         now = now_iso()
-        if not thread_ids:
+        if not identities or not identity_keys:
             return []
         # Build the SQL so destinations are filtered BEFORE ORDER BY/LIMIT,
-        # otherwise 20 older deliveries for OTHER tasks could starve a matching
-        # delivery forever (review rc37 P1).
-        placeholders = ",".join("?" for _ in thread_ids)
+        # otherwise 20 older deliveries for OTHER destinations could starve a
+        # matching delivery forever (review rc37 P1). The identity field differs
+        # per relay client type, so it comes from RELAY_IDENTITY_KEYS rather than
+        # being hardcoded (codex_desktop thread_id vs opencode_thread session_id).
+        placeholders = ",".join("?" for _ in identities)
+        identity_predicate = " OR ".join(
+            f"json_extract(payload_json, '$.target.{key}') IN ({placeholders})" for key in identity_keys
+        )
         with self.db_lock:
             rows = self.db.execute(
                 f"""
                 SELECT * FROM deliveries
-                WHERE target_type='codex_desktop'
-                  AND (json_extract(payload_json, '$.target.thread_id') IN ({placeholders})
-                       OR json_extract(payload_json, '$.target.threadId') IN ({placeholders}))
+                WHERE target_type=?
+                  AND ({identity_predicate})
                   AND ((status IN ('pending', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                        OR (status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
                 ORDER BY created_at
                 LIMIT 20
                 """,
-                (*thread_ids, *thread_ids, now, now),
+                (target_type, *([*identities] * len(identity_keys)), now, now),
             ).fetchall()
         claimed = []
         for row in rows:
@@ -2807,7 +2853,7 @@ class JobManager:
         reloaded on behalf of the acknowledger.
         """
         self._ensure_open()
-        if status not in {"delivered", "failed"}:
+        if not isinstance(status, str) or status not in {"delivered", "failed"}:
             raise ValueError("delivery completion status must be delivered or failed")
         if not isinstance(lease_token, str) or not lease_token:
             raise ValueError("relay_ack requires the opaque lease_token returned by relay_poll")
@@ -2910,8 +2956,46 @@ class JobManager:
         # win, so agents can still fan out to other threads. Caller-owned
         # wake-target dicts are copied before any inherited id or event is
         # injected — the caller's objects are never mutated.
+        # Validate field SHAPES before any side effect (metadata capture, DB
+        # insert, runner launch). These are shared by the MCP tool and the HTTP
+        # boundary, so a bad type can no longer be persisted and fail later
+        # inside the runner (or become a sqlite binding error / 500).
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
+            raise ValueError("cwd must be a non-empty string")
+        if name is not None and not isinstance(name, str):
+            raise ValueError("name must be a string")
+        if notes is not None and not isinstance(notes, str):
+            raise ValueError("notes must be a string")
+        if env is not None and (
+            not isinstance(env, dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in env.items())
+        ):
+            raise ValueError("env must be an object of string key/value pairs")
+        if tags is not None and (not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags)):
+            raise ValueError("tags must be a list of strings")
+        if notify_on is not None and (
+            not isinstance(notify_on, list) or not all(isinstance(event, str) for event in notify_on)
+        ):
+            raise ValueError("notify_on must be a list of strings")
+        if not isinstance(interactive, bool):
+            raise ValueError("interactive must be a boolean")
+        if origin_thread_id is not None and not isinstance(origin_thread_id, str):
+            raise ValueError("origin_thread_id must be a string")
+        # Shape-check the container/elements BEFORE identity resolution, which
+        # calls dict(target) and would raise a bare TypeError on a null/non-object
+        # element (misclassified as a 500 instead of a field-level 400).
+        if wake_targets is not None and (
+            not isinstance(wake_targets, list)
+            or not all(isinstance(target, dict) for target in wake_targets)
+        ):
+            raise ValueError("wake_targets must be a list of objects")
         if wake_targets is not None:
             wake_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
+            # An opencode_thread target with no session_id is addressed to the
+            # live plugin relay in this project (see _resolve_relay_sessions).
+            self._resolve_relay_sessions(wake_targets, cwd)
         # Apply notify_on defaults BEFORE validation so a target with no explicit
         # events inherits the notify_on list and is not rejected as empty.
         if notify_on:
@@ -2919,8 +3003,6 @@ class JobManager:
                 if "events" not in target and "notify_on" not in target:
                     target["events"] = notify_on
         validate_wake_targets(wake_targets)
-        if not isinstance(command, str) or not command.strip():
-            raise ValueError("command must be a non-empty string")
         if timeout_seconds is not None and (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise ValueError("timeout_seconds must be an integer >= 1")
         trigger = self._validate_trigger(trigger)
@@ -2956,61 +3038,69 @@ class JobManager:
         # guarded).
         direct_claim_token = None if queued else "claim_" + uuid.uuid4().hex[:16]
         with self.db_lock:
-            # Concurrent-job quota is enforced ATOMICALLY with the row insert
-            # (review rc37 P1): BEGIN IMMEDIATE acquires the write lock before
-            # the count, so the count and the INSERT are ONE transaction. Two
-            # manager processes (or threads) synchronized at a SELECT-then-insert
-            # can no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two
-            # 'launching' rows. Both 'launching' and 'running' reservations count.
-            if self.max_running_jobs and not queued:
-                self.db.execute("BEGIN IMMEDIATE")
-                reserved = self.db.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
-                ).fetchone()[0]
-                if reserved >= self.max_running_jobs:
-                    self.db.rollback()
-                    raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
-            self.db.execute(
-                """
+            try:
+                # Concurrent-job quota is enforced ATOMICALLY with the row insert
+                # (review rc37 P1): BEGIN IMMEDIATE acquires the write lock before
+                # the count, so the count and the INSERT are ONE transaction. Two
+                # manager processes (or threads) synchronized at a SELECT-then-insert
+                # can no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two
+                # 'launching' rows. Both 'launching' and 'running' reservations count.
+                if self.max_running_jobs and not queued:
+                    self.db.execute("BEGIN IMMEDIATE")
+                    reserved = self.db.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
+                    ).fetchone()[0]
+                    if reserved >= self.max_running_jobs:
+                        raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
+                self.db.execute(
+                    """
                 INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
                   timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
                   stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token, secret_env_json,
                   pool, priority, schedule_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    job_id,
-                    name,
-                    command,
-                    cwd,
-                    "queued" if queued else "launching",
-                    created_at,
-                    created_at,
-                    None if queued else created_at,
-                    None if queued else created_at,
-                    timeout_seconds,
-                    json.dumps(notify_on or []),
-                    origin_thread_id,
-                    wake_thread_id,
-                    json.dumps(tags or [], separators=(",", ":")),
-                    json.dumps(env or {}, separators=(",", ":")),
-                    notes,
-                    serialize_run_metadata(run_payload),
-                    str(stdout_path),
-                    str(stderr_path),
-                    str(events_path),
-                    json.dumps(trigger, separators=(",", ":")) if trigger else None,
-                    json.dumps(policy, separators=(",", ":")) if policy else None,
-                    direct_claim_token,
-                    json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
-                    pool,
-                    priority,
-                    schedule_id,
-                ),
-            )
-            self.db.commit()
-            self._insert_wake_targets(job_id, wake_targets or [], created_at)
-            self.db.commit()
+                    (
+                        job_id,
+                        name,
+                        command,
+                        cwd,
+                        "queued" if queued else "launching",
+                        created_at,
+                        created_at,
+                        None if queued else created_at,
+                        None if queued else created_at,
+                        timeout_seconds,
+                        json.dumps(notify_on or []),
+                        origin_thread_id,
+                        wake_thread_id,
+                        json.dumps(tags or [], separators=(",", ":")),
+                        json.dumps(env or {}, separators=(",", ":")),
+                        notes,
+                        serialize_run_metadata(run_payload),
+                        str(stdout_path),
+                        str(stderr_path),
+                        str(events_path),
+                        json.dumps(trigger, separators=(",", ":")) if trigger else None,
+                        json.dumps(policy, separators=(",", ":")) if policy else None,
+                        direct_claim_token,
+                        json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
+                        pool,
+                        priority,
+                        schedule_id,
+                    ),
+                )
+                # The job row and its wake targets commit in ONE transaction: a
+                # crash between the two would leave an accepted job whose
+                # promised notifications were never registered, and the caller
+                # cannot repair that (the job exists, so a retry would duplicate
+                # it). Rollback on ANY failure so a half-written acceptance can
+                # never be swept into the DB by a later commit.
+                self._insert_wake_targets(job_id, wake_targets or [], created_at)
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
         if queued:
             gates = []
             if trigger and trigger.get("job_id"):
@@ -3072,7 +3162,7 @@ class JobManager:
         if job_id is not None or status is not None:
             if not isinstance(job_id, str) or not job_id:
                 raise ValueError("trigger.job_id must be a non-empty string")
-            if status not in TERMINAL_STATUSES:
+            if not isinstance(status, str) or status not in TERMINAL_STATUSES:
                 raise ValueError(f"trigger.status must be one of {sorted(TERMINAL_STATUSES)}")
             if not self._row("SELECT job_id FROM jobs WHERE job_id=?", (job_id,)):
                 raise ValueError(f"Unknown trigger job_id: {job_id}")
@@ -3923,6 +4013,59 @@ class JobManager:
             inserted.append(target_id)
         return inserted
 
+    def _latest_relay_session(self, directory: str | None) -> str | None:
+        """Newest OpenCode plugin-relay session registered for ``directory``.
+
+        The plugin publishes the session it lives in (plus its project
+        directory) whenever it observes a hook, so a wake target that names no
+        session can be resolved to the client actually running in the caller's
+        project. A registration with no directory matches any caller.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT destinations_json, last_poll_at FROM relay_subscriptions WHERE client_type='opencode_thread'"
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+        wanted = (directory if isinstance(directory, str) else "").rstrip("\\/").lower()
+        best: tuple[str, str] | None = None
+        for row in rows:
+            try:
+                destinations = json.loads(row["destinations_json"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            for item in destinations if isinstance(destinations, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                session_id = item.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    continue
+                item_dir = (item.get("directory") or "").rstrip("\\/").lower()
+                if wanted and item_dir and item_dir != wanted:
+                    continue
+                stamp = row["last_poll_at"] or ""
+                if best is None or stamp > best[0]:
+                    best = (stamp, session_id)
+        return best[1] if best else None
+
+    def _resolve_relay_sessions(self, targets: list[dict[str, Any]] | None, directory: str | None) -> None:
+        """Fill in a missing ``opencode_thread`` session id from live relays.
+
+        A target naming neither ``session_id`` nor ``attach`` is delivered by the
+        in-process OpenCode plugin relay; resolving it here (rather than at
+        delivery time) keeps the stored target concrete and addressable, and
+        makes an unregistered client fail at creation with an actionable error
+        (``validate_wake_targets``) instead of silently never waking.
+        """
+        for target in targets or []:
+            if target.get("type") != "opencode_thread" or target.get("attach"):
+                continue
+            if target.get("session_id") or target.get("sessionId"):
+                continue
+            session_id = self._latest_relay_session(target.get("cwd") or directory)
+            if session_id:
+                target["session_id"] = session_id
+
     def _read_stream(
         self,
         job_id: str,
@@ -4308,7 +4451,8 @@ class JobManager:
         with self.db_lock:
             rows = self.db.execute(
                 f"""
-                SELECT job_id, name, status, updated_at, origin_thread_id, wake_thread_id, tags_json
+                SELECT job_id, name, status, created_at, started_at, ended_at, updated_at,
+                       exit_code, origin_thread_id, wake_thread_id, tags_json
                 FROM jobs {where} ORDER BY updated_at DESC LIMIT ?
                 """,
                 (*args, limit),
@@ -4317,6 +4461,11 @@ class JobManager:
         for row in rows:
             item = dict(row)
             item["tags"] = json.loads(item.pop("tags_json") or "[]")
+            # Derived here so presentation layers (CLI `vanth list`, MCP
+            # job_list) never have to re-derive runtime or fall back to
+            # `updated_at` (which a running job's heartbeat refreshes, making
+            # any age computed from it collapse to ~0s).
+            item["runtime_seconds"] = _runtime_seconds(row["started_at"], row["ended_at"])
             jobs.append(item)
         return {"jobs": jobs}
 
@@ -4959,7 +5108,7 @@ class JobManager:
         }
 
     def mark_delivery(self, delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
-        if status not in {"pending", "retrying", "delivered", "failed"}:
+        if not isinstance(status, str) or status not in {"pending", "retrying", "delivered", "failed"}:
             raise ValueError("invalid delivery status")
         error = (error or "")[:DEFAULT_MAX_ERROR_BYTES] or None
         delivered_at = now_iso() if status == "delivered" else None
@@ -5027,7 +5176,10 @@ class JobManager:
         row finalizes its in-flight delivery_attempts entry first.
         """
         validate_limit(limit, "limit", 10000)
-        if status is not None and status not in {"pending", "retrying", "dispatching", "delivered", "failed"}:
+        if status is not None and (
+            not isinstance(status, str)
+            or status not in {"pending", "retrying", "dispatching", "delivered", "failed"}
+        ):
             raise ValueError("invalid delivery status")
         if older_than_seconds is not None and (isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0):
             raise ValueError("older_than_seconds must be a non-negative integer")
@@ -5089,10 +5241,10 @@ class JobManager:
     def tail(self, job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
              follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None) -> dict[str, Any]:
         validate_limit(max_bytes, "max_bytes", max(self.max_log_bytes, 8192))
+        if not isinstance(stream, str) or stream not in {"stdout", "stderr"}:
+            raise ValueError("stream must be stdout or stderr")
         if offset is not None and (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0):
             raise ValueError("offset must be a non-negative integer")
-        if stream not in {"stdout", "stderr"}:
-            raise ValueError("stream must be stdout or stderr")
         if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds < 0 or timeout_seconds > 86400:
             raise ValueError("timeout_seconds must be between 0 and 86400")
         if grep is not None and (not isinstance(grep, str) or not grep):
@@ -5370,8 +5522,12 @@ class JobManager:
         # ambient process table, so they must not flip the health exit code.
         soft_warning_types = {"codex_unavailable", "opencode_unavailable", "orphaned_mcp_servers"}
         hard_warnings = [w for w in warnings if w.get("type") not in soft_warning_types]
+        # A dead maintenance/dispatch loop is a HARD failure: queues stop
+        # draining and wake deliveries stop progressing, yet `/ready` (which
+        # trusts this flag) would keep reporting healthy and hide the outage.
+        maintenance_alive = bool(self.dispatcher_thread and self.dispatcher_thread.is_alive())
         return {
-            "ok": not hard_warnings and quick_check == "ok",
+            "ok": not hard_warnings and quick_check == "ok" and maintenance_alive,
             "ok_warnings": [w.get("type") for w in warnings],
             "home": str(self.home),
             "db_path": str(self.home / "jobs.sqlite"),
@@ -5383,7 +5539,8 @@ class JobManager:
             "opencode": {"command": opencode_bin, "available": opencode_available},
             "schema_version": int(self.db.execute("PRAGMA user_version").fetchone()[0]),
             "quick_check": quick_check,
-            "maintenance_alive": bool(self.dispatcher_thread and self.dispatcher_thread.is_alive()),
+            "maintenance_alive": maintenance_alive,
+            "relays": self.relay_status(),
             "stale_delivery_leases": stale_leases,
             "dead_letter_count": len(dead_lettered),
             "dead_lettered": dead_lettered,
@@ -5399,6 +5556,38 @@ class JobManager:
             "warnings": warnings,
             "orphaned_mcp_servers": orphaned_mcp,
         }
+
+    def relay_status(self) -> list[dict[str, Any]]:
+        """Registered client relays and their liveness (wake-reachability view).
+
+        ``codex_desktop``/``opencode_thread`` wakes are delivered by whichever
+        client relay long-polls for the destination. With no relay registered (or
+        a stale one) those deliveries stay pending forever, so doctor reports the
+        subscription itself rather than only counting deliveries.
+        """
+        stale_after = float(os.environ.get("VANTH_RELAY_STALE_SECONDS", "90"))
+        now = datetime.now(timezone.utc)
+        statuses = []
+        for row in self.db.execute(
+            "SELECT client_id, client_type, destinations_json, updated_at, last_poll_at "
+            "FROM relay_subscriptions ORDER BY client_type, client_id"
+        ).fetchall():
+            last_poll = _parse_iso(row["last_poll_at"]) if row["last_poll_at"] else None
+            age = (now - last_poll).total_seconds() if last_poll else None
+            try:
+                destinations = json.loads(row["destinations_json"] or "[]")
+            except (TypeError, ValueError):
+                destinations = []
+            statuses.append(
+                {
+                    "client_id": row["client_id"],
+                    "client_type": row["client_type"],
+                    "destinations": destinations if isinstance(destinations, list) else [],
+                    "last_poll_age_seconds": age,
+                    "live": age is not None and age <= stale_after,
+                }
+            )
+        return statuses
 
     def _cleanup_rows(self, older_than_seconds: int) -> list[sqlite3.Row]:
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
@@ -5721,6 +5910,12 @@ class JobManager:
         # Apply the events default before validation (events must be non-empty).
         if "events" not in target and "notify_on" not in target:
             target = {**target, "events": ["completed", "failed"]}
+        target = dict(target)
+        # Resolve an unaddressed opencode_thread target to the live plugin relay
+        # in the job's project before validation demands a session id.
+        job_row = self._row("SELECT cwd FROM jobs WHERE job_id=?", (job_id,))
+        if job_row:
+            self._resolve_relay_sessions([target], job_row["cwd"])
         validate_wake_targets([target])
         target_type = target.get("type")
         events = target.get("events")
@@ -5756,6 +5951,13 @@ class JobManager:
         resolved = targets[0]
         if "events" not in resolved and "notify_on" not in resolved:
             resolved = {**resolved, "events": ["completed", "failed"]}
+        # Resolve an unaddressed opencode_thread target to the live plugin relay
+        # in the job's project before validation demands a session id. Resolving
+        # only when the job exists preserves the existing error precedence for an
+        # unknown job_id.
+        job_row = self._row("SELECT cwd FROM jobs WHERE job_id=?", (job_id,))
+        if job_row:
+            self._resolve_relay_sessions([resolved], job_row["cwd"])
         validate_wake_targets([resolved])
         target_type = resolved.get("type")
         events = resolved.get("events")
@@ -6218,8 +6420,12 @@ def job_start(
         deliveries older than the TTL (log-retention without the paywall).
 
     Pass ``remote_id`` to run the job on a paired remote host instead of the
-    local daemon. Remote mutations require ``idempotency_key`` (8..128 chars in
-    ``[A-Za-z0-9_-]``); when omitted the daemon mints one.
+    local daemon; discover ids with ``remote_list`` (pairing is interactive:
+    `vanth remote pair user@host`). Remote mutations REQUIRE a caller-supplied
+    ``idempotency_key`` (8..128 chars in ``[A-Za-z0-9_-]``) — that is what makes
+    a lost response safe to retry — and the daemon rejects a missing one. Local
+    starts are the opposite: they must NOT pass a key (there is no local dedup
+    store yet).
     """
     # Thread identity is resolved HERE, in the MCP process that owns the
     # calling task (review P1-4). The persistent daemon's environment belongs
@@ -6343,8 +6549,46 @@ def job_decisions(job_id: str | None = None, status: str | None = None, limit: i
 
 @mcp.tool()
 def job_list(status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
-             name: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
+             name: str | None = None, tags: list[str] | None = None,
+             remote_id: str | None = None) -> dict[str, Any]:
+    """List jobs. With ``remote_id``, list that paired host's jobs (its shadow).
+
+    Discover paired hosts with ``remote_list``.
+    """
+    if remote_id:
+        # The remote read path projects the controller's shadow and supports only
+        # `limit`; silently dropping a filter would return jobs the caller did not
+        # ask for (e.g. completed ones when filtering on "running").
+        unsupported = [
+            name
+            for name, value in (("status", status), ("thread_id", thread_id), ("name", name), ("tags", tags))
+            if value is not None
+        ]
+        if unsupported:
+            raise ValueError(
+                f"filters not supported for remote job lists: {', '.join(unsupported)}; "
+                "fetch with job_list(remote_id=...) and filter locally"
+            )
+        return get_client().get(f"/remotes/{remote_id}/jobs", {"limit": limit})
     return get_client().get("/jobs", {"status": status, "limit": limit, "thread_id": thread_id, "name": name, "tags": tags})
+
+
+@mcp.tool()
+def remote_list() -> dict[str, Any]:
+    """List paired remote execution hosts.
+
+    Pass a returned ``remote_id`` to ``job_start``/``job_list``/``job_status``/
+    ``job_tail``/``job_stop``/``job_rerun``/``job_wait`` to act on that host
+    instead of the local daemon. Pairing itself is interactive and lives in the
+    CLI (`vanth remote pair user@host`).
+    """
+    return get_client().get("/remotes")
+
+
+@mcp.tool()
+def remote_doctor(remote_id: str | None = None) -> dict[str, Any]:
+    """Report SSH availability and remote state; omit ``remote_id`` for all hosts."""
+    return get_client().get("/remotes/doctor", {"remote_id": remote_id})
 
 
 @mcp.tool()
@@ -6418,9 +6662,37 @@ def job_clear_deliveries(
 
 @mcp.tool()
 def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
-             follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None) -> dict[str, Any]:
-    return get_client().get(f"/jobs/{job_id}/tail", {"stream": stream, "max_bytes": max_bytes, "offset": offset,
-                                                      "follow": follow, "timeout_seconds": timeout_seconds, "grep": grep})
+             follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None,
+             remote_id: str | None = None) -> dict[str, Any]:
+    """Read a job's captured output.
+
+    With ``remote_id`` the log is read from that paired host over the remote
+    protocol (a single byte range; ``follow``/``grep`` do not apply, and
+    ``offset``/``max_bytes`` select the range).
+    """
+    if remote_id:
+        # A remote read is a single byte range: refuse the options it cannot
+        # honour instead of silently ignoring them (callers would otherwise
+        # believe they were following a live log).
+        if follow:
+            raise ValueError("follow is not supported when reading a remote job's log; poll job_tail instead")
+        if grep is not None:
+            # `is not None`, not truthiness: grep="" was supplied and cannot be
+            # honoured, so it must not be silently dropped.
+            raise ValueError("grep is not supported when reading a remote job's log; filter the returned content")
+        return get_client().get(
+            f"/remotes/{remote_id}/jobs/{job_id}/tail",
+            {"stream": stream, "offset": offset or 0, "size": max_bytes},
+            timeout=float(timeout_seconds) + 30,
+        )
+    # Long-poll: the client deadline must exceed the server-side follow window
+    # (default 5s, but callers can ask for much longer), not the 30s default.
+    return get_client().get(
+        f"/jobs/{job_id}/tail",
+        {"stream": stream, "max_bytes": max_bytes, "offset": offset,
+         "follow": follow, "timeout_seconds": timeout_seconds, "grep": grep},
+        timeout=float(timeout_seconds) + 30,
+    )
 
 
 @mcp.tool()
@@ -6449,10 +6721,13 @@ def job_wait(
     cross-machine event push arrives in Phase 4); ``since_event_id``,
     ``return_progress`` and ``metric_ge`` are ignored in that mode.
     """
+    # Long-poll: the client deadline must exceed the server-side wait budget
+    # (default 3600s), not the 30s default.
     return get_client().post(
         f"/jobs/{job_id}/wait",
         {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds,
          "return_progress": return_progress, "metric_ge": metric_ge, "remote_id": remote_id},
+        timeout=float(timeout_seconds) + 30,
     )
 
 
@@ -6466,9 +6741,15 @@ def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 1
     ``cancelled`` event carries ``{"actor": "tool", "reason": ...}`` so the kill
     is attributable after the fact.
     """
-    return get_client().post(f"/jobs/{job_id}/stop", {"signal": signal, "kill_after_seconds": kill_after_seconds,
-                                                       "actor": "tool", "reason": reason,
-                                                       "remote_id": remote_id, "idempotency_key": idempotency_key})
+    # The daemon may legitimately wait out the whole grace period, so the client
+    # deadline must cover it (not the 30s default).
+    return get_client().post(
+        f"/jobs/{job_id}/stop",
+        {"signal": signal, "kill_after_seconds": kill_after_seconds,
+         "actor": "tool", "reason": reason,
+         "remote_id": remote_id, "idempotency_key": idempotency_key},
+        timeout=float(kill_after_seconds) + 30,
+    )
 
 
 @mcp.tool()
@@ -7024,9 +7305,13 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
     return get_client().get("/cleanup/preview", {"older_than_seconds": older_than_seconds})
 
 
+# Global flags that may precede the subcommand (`vanth --json list`); they do not
+# name a command, so the dispatch gate must look past them.
+_VANTH_CLI_GLOBAL_FLAGS = {"--json"}
 _VANTH_CLI_SUBCOMMANDS = {
     "status", "doctor", "restart", "setup", "--help", "-h", "help",
-    "list", "ps", "logs", "tail", "stop", "artifacts", "prune",
+    "start", "list", "ps", "logs", "tail", "stop", "deliveries", "api",
+    "artifacts", "prune", "backup", "restore", "wait", "diff",
     "autostart", "--version", "version", "remote",
 }
 
@@ -7201,12 +7486,15 @@ def _hint_setup() -> None:
     if os.environ.get("VANTH_NO_SETUP_HINT") in {"1", "true", "yes"}:
         return
     try:
-        from .setup import _is_configured, client_config_paths
+        from .setup import client_config_paths, effective_state
 
         found = client_config_paths()
         missing = []
         for client, paths in found.items():
-            if not any(_is_configured(client, path) for path in paths):
+            # Only a definite "not configured" is worth hinting about: a
+            # `disabled` or `unreadable` (commented JSONC) file must not
+            # produce a false "run vanth setup" hint.
+            if effective_state(client, paths) == "not-configured":
                 missing.append(client)
         if missing:
             print(
@@ -7224,8 +7512,12 @@ def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     # Human-facing subcommands are dispatched to the CLI; anything else
     # (including no args) runs the MCP stdio server, which is what MCP
-    # clients expect from `vanth` (bare).
-    if args and args[0] in _VANTH_CLI_SUBCOMMANDS:
+    # clients expect from `vanth` (bare). Leading global flags are skipped so
+    # `vanth --json list` (the documented global form) routes here too: checking
+    # only args[0] sent it to the MCP stdio server — a hang for an agent, and
+    # "unknown command '--json'" in a terminal.
+    first_non_flag = next((arg for arg in args if arg not in _VANTH_CLI_GLOBAL_FLAGS), None)
+    if args and (first_non_flag in _VANTH_CLI_SUBCOMMANDS or first_non_flag is None):
         raise SystemExit(cli_main(args))
     # Interactive misuse guard (user report): bare `vanth` typed in a real
     # terminal would otherwise start the MCP stdio server and appear to

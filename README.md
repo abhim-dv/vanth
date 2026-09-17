@@ -25,11 +25,12 @@ retention, cron/interval schedules, pools/priority/pause queues, readiness
 triggers, kill attribution + secret masking, duration/flaky analytics, managed
 artifacts, and remote SSH execution (**beta**).
 
-**For agents:** start work with `job_start`, then `job_wait` for
-`progress`/`checkpoint`/`completed` events instead of polling; make jobs emit
+**For agents:** when MCP is available, start work with `job_start`, then
+`job_wait` for `progress`/`checkpoint`/`completed` events instead of polling.
+When MCP is unavailable, use the `vanth start` CLI fallback. Make jobs emit
 `AGENT_EVENT` lines (below) so progress, metrics, and checkpoints appear live
-in the `vanth-monitor` dashboard; and let long jobs resume you via wake
-targets instead of you checking in.
+in the `vanth-monitor` dashboard; and let long jobs resume you via wake targets
+instead of you checking in.
 
 ---
 
@@ -128,16 +129,50 @@ for scripts.
 | Command | Purpose |
 |---|---|
 | `vanth --version` | Print the installed version |
-| `vanth status` | Daemon up/down, pid, schema, running jobs, deliveries (`--json`) |
+| `vanth status [<job-id>]` | Daemon up/down, pid, schema, running jobs, deliveries — or, with a job id, that one job's status/exit/runtime/last event (the CLI `job_status`) (`--json`) |
 | `vanth doctor` | Full health report (same as `job_doctor`, human-readable; `--json`) |
 | `vanth restart` | Gracefully stop + start the daemon (jobs survive) |
 | `vanth setup [opencode] [codex] [claude] [--remove] [--yes]` | Register/unregister the MCP server in your clients' configs |
-| `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`) |
-| `vanth logs <job_id>` (`tail` alias) | Show a job's output (`--stream stdout\|stderr\|all`, `--offset`, `--max-bytes`, `--json`) |
+| `vanth start [options] [--] <command...>` | Start a background job without MCP. Options: `--name`, `--cwd`, `--timeout`, `--env K=V`, `--wake JSON`, `--interactive`, `--priority`, `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`, `--policy JSON`; `--` passes command flags verbatim |
+| `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`); defaults to in-flight (launching/queued/running/…), `--all` shows finished jobs; running jobs show DURATION and AGE |
+| `vanth deliveries [--status S] [--job JOB_ID] [--limit N] [--json]` | List wake deliveries, attempts, and last errors |
+| `vanth api` | Print the loopback HTTP surface and authentication details |
+| `vanth logs <job_id>` (`tail` alias) | Show a job's output (`--stream stdout\|stderr\|all`, `--offset`, `--max-bytes`, `--grep`, `--json`) |
+| `vanth wait <job_id>` | Block until an event fires (the CLI `job_wait`): `--events completed,failed`, `--timeout SECONDS`, `--since-event-id ID`. Exits 0 on the event, 3 on timeout |
+| `vanth diff <job_id> <other>` | Compare two jobs' run specs |
 | `vanth stop <job_id>` | Stop a running job (`--signal`, `--kill-after`) |
 | `vanth artifacts <job_id>` | List a job's artifacts (`--limit`, `--json`) |
 | `vanth prune` | Manual retention cleanup; dry-run by default (`--older-than N`, `--yes`) |
 | `vanth autostart enable\|disable\|status` | Daemon survives reboots (Windows Task Scheduler / macOS launchd / Linux systemd user unit) |
+
+Every command supports `-h`/`--help` (and `vanth help <command>`), and job-id
+arguments accept an **unambiguous prefix** — hand-copying a 12-character id is
+otherwise easy to get wrong, and an unknown id now suggests near matches.
+
+For `vanth start`, `<command...>` begins at the first non-option argument. A
+single argument is used verbatim (so a whole quoted command string works);
+multiple arguments are re-quoted for the host shell, so the program and its
+arguments — including empty ones — survive, and shell metacharacters in an
+argument stay data (on Windows `%`, `!`, and `"` cannot be encoded safely, so
+pass the whole command as one quoted string for those). Repeated `--env`,
+`--wake`, `--tag`, and `--secret-env` flags are allowed;
+
+**If the command contains shell operators (`&&`, `|`, `>`, `<`), pass it as ONE
+quoted string or put the steps in a script file and start that.** Reassembling
+operators from separate arguments is where shell quoting goes wrong (and the
+classic PowerShell-5.1 failure mode is that a single-quoted string with inner
+quotes arrives split into garbage argv). `vanth start` warns when it detects
+this:
+
+```cmd
+vanth start "cmd /c ping -n 30 host >nul && echo done"   # one quoted string
+vanth start -- run.cmd                                     # or a script file
+```
+
+`--wake` takes the same wake-target JSON shape documented in
+[docs/agent-tools.md](docs/agent-tools.md). The global `--json` flag is
+recognized only before `--`, so a wrapped command keeps its own literal
+`--json`.
 
 Examples:
 
@@ -229,7 +264,17 @@ vanth setup
 `vanth setup` detects your installed clients (opencode, Codex, and generic
 `mcpServers`-style clients such as Claude Code / Cursor), shows what it found,
 backs up each config before touching it (`.vanth-setup-<ts>.bak`), and upserts
-the Vanth MCP entry — leaving every other setting and comment untouched.
+the Vanth MCP entry — leaving every other setting and comment untouched. OpenCode
+deep-merges `config.json`, `opencode.json`, and `opencode.jsonc` in that order
+(later files win). Setup reads JSONC read-only (comments are stripped in memory,
+never rewritten) and edits a `.jsonc` only when it has no comments to lose; it
+writes at most one file (never a duplicate entry) and refuses to write a
+lower-precedence file that a higher-precedence one would override. A registration
+it cannot safely make is reported as a skipped client with manual instructions
+rather than as success, and `--remove` clears every safely-editable
+registration. `vanth status` reports the *effective* state of the deep-merged
+entry: an entry with `enabled: false` is `disabled`, and a file that cannot be
+parsed is `unreadable` rather than `not configured`.
 
 ```cmd
 vanth setup                  # detect + configure everything found (prompts)
@@ -243,7 +288,7 @@ Configs it manages:
 
 | Client | File | Section |
 |---|---|---|
-| opencode | `~/.config/opencode/opencode.json` | `mcp.vanth` |
+| opencode | `~/.config/opencode/config.json`, `opencode.json`, or `opencode.jsonc` | `mcp.vanth` |
 | Codex | `~/.codex/config.toml` | `[mcp_servers.vanth]` |
 | Claude Code / Cursor | `~/.claude.json` | `mcpServers.vanth` |
 
@@ -884,14 +929,30 @@ Resumes an OpenCode session:
 ```json
 {
   "type": "opencode_thread",
-  "thread_id": "ses_...",
+  "session_id": "ses_...",              # optional if a plugin is registered
   "events": ["checkpoint", "failed", "completed"],
   "cwd": "F:\\git\\project",
-  "opencode_command": ["opencode"],     # override the binary
-  "attach": "http://127.0.0.1:4096",    # submit via an opencode serve instance
+  "opencode_command": ["opencode"],     # override the binary (attach path only)
+  "attach": "http://127.0.0.1:4096",    # only for an `opencode serve` instance
   "timeout_seconds": 120
 }
 ```
+
+**A plain `opencode` TUI is woken by the plugin relay, not by `attach`.** A TUI
+binds no TCP port and injects no session id, so there is no server URL to attach
+to and an external `opencode run --session` writes to a backend the visible
+session never sees. `vanth setup` therefore installs a small plugin
+(`~/.config/opencode/plugins/vanth.ts`); it registers the session it lives in
+with the daemon and injects a wake prompt through its own in-process client, so
+the prompt lands in the session you are watching. Restart opencode once after
+installing it.
+
+With the plugin loaded, `vanth start`/`job_start` can name just
+`{"type": "opencode_thread", "events": [...]}`: Vanth resolves the session from
+the relay registered for the job's `cwd` (an explicit `session_id` always wins).
+`vanth doctor` lists registered relays and their liveness — if none is `live`,
+`opencode_thread` wakes cannot be delivered. `attach` remains supported for
+headless `opencode serve` deployments and takes the direct-subprocess path.
 
 The default OpenCode turn timeout is 30 seconds; raise it for long turns.
 
@@ -1053,6 +1114,8 @@ Environment variables (defaults live in `src/vanth/server.py`,
 | `VANTH_DAEMON_URL` | `http://127.0.0.1:8765` | Where clients reach the daemon |
 | `VANTH_DAEMON_HOST` | `127.0.0.1` | Bind address (loopback only) |
 | `VANTH_DAEMON_PORT` | `8765` | Bind port |
+| `VANTH_CLIENT_TIMEOUT` | `30s` | Client socket timeout; `<=0` disables (long polls use their own budget) |
+| `VANTH_REQUEST_TIMEOUT` | `30s` | Daemon blocking socket read/write timeout |
 | `VANTH_MAX_REQUEST_BYTES` | `1 MiB` | HTTP request body cap |
 | `VANTH_MAX_RESPONSE_BYTES` | `4 MiB` | HTTP response cap |
 | `VANTH_MAX_EVENT_BYTES` | `64 KiB` | Single event payload cap |
@@ -1103,7 +1166,7 @@ Key knobs in one glance:
   remote.sqlite    remote-host pairing + transfer journals (when remote is used)
   token            bearer token (owner-only permissions)
   daemon.lock      single-daemon OS lock
-  daemon.json      discovery metadata (url, pid, started_at, schema) — written atomically, removed on graceful shutdown
+  daemon.json      discovery metadata (url, pid, started_at, schema, auth, token_path) — written atomically, removed on graceful shutdown
   logs/            daemon.log + per-job runner/stdout/stderr logs
   events/          per-job JSONL event mirrors (monitor fallback source)
   specs/           per-job launch specs (removed once the runner starts)
@@ -1158,12 +1221,15 @@ after snapshotting the current state. Run `vanth backup` while the daemon is up
 
 ## HTTP API (equivalent of the MCP tools)
 
-Authenticated with `Authorization: Bearer <token>`.
+The loopback API base URL is the `url` in `<VANTH_HOME>/daemon.json` and the
+token is stored at `<VANTH_HOME>/token`. Every route except `GET /health` needs
+`Authorization: Bearer <token>`. Run `vanth api` for the current surface and
+route details.
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/metrics` | Prometheus text exposition |
-| GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`, `name`, `tags`) |
+| GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`, `name`, `tags`); includes lifecycle timestamps, exit code, and runtime |
 | POST | `/jobs` | Start a job |
 | POST | `/jobs/{id}/rerun` | Rerun a job with its original configuration |
 | GET | `/jobs/{id}/status` | Job status (includes command/env/cwd) |
@@ -1193,6 +1259,47 @@ Authenticated with `Authorization: Bearer <token>`.
 | POST | `/cleanup` | Cleanup (`older_than_seconds`, `dry_run`) |
 | GET | `/doctor` | Health report |
 | GET | `/health` | Unauthenticated liveness |
+| GET | `/remotes` | Paired remote hosts |
+| GET | `/remotes/doctor` | SSH binaries + remote state (`remote_id`) |
+| GET | `/remotes/{id}/jobs` | Remote jobs from the controller's shadow (`limit`) |
+| GET | `/remotes/{id}/status/{job}` | One remote job's status |
+| GET | `/remotes/{id}/jobs/{job}/tail` | Remote log range (`stream`, `offset`, `size`) |
+| POST | `/artifacts/push-remote` | Publish an artifact to a remote (`remote_id`, `version_id`) |
+| POST | `/artifacts/pull-remote` | Fetch a remote artifact (`remote_id`, `version_id`, `dest_path`) |
+
+---
+
+## Remote execution
+
+Running jobs on another host is **beta** (POSIX targets). Pairing is interactive,
+so it lives in the CLI; everything after that is available from MCP, the CLI, or
+HTTP.
+
+```bash
+vanth remote pair user@host        # one-time; writes ~/.vanth/remote.sqlite
+vanth remote list                  # -> remote ids
+vanth remote doctor                # SSH binaries + per-host state
+```
+
+Then target that host with the `remote_id`:
+
+| Task | MCP | HTTP |
+|---|---|---|
+| See hosts + ids | `remote_list` | `GET /remotes` |
+| Start a job there | `job_start(remote_id=...)` | `POST /jobs` with `"remote_id"` |
+| List its jobs | `job_list(remote_id=...)` | `GET /remotes/{id}/jobs` |
+| Status / wait / stop / rerun | `job_status` / `job_wait` / `job_stop` / `job_rerun` with `remote_id` | `/remotes/{id}/status/{job}` etc. |
+| Read its logs | `job_tail(job_id, remote_id=...)` | `GET /remotes/{id}/jobs/{job}/tail` |
+
+Notes: remote mutations **require** a caller-supplied `idempotency_key` (8–128
+chars of `[A-Za-z0-9_-]`) — that is what makes a lost response safe to retry —
+and the daemon rejects a missing one (a local `start` must *not* pass one).
+Read costs differ: `job_list(remote_id=...)` reads the controller's shadow with
+no SSH round trip (and accepts no filters beyond `limit`), while
+`job_status(remote_id=...)` makes a live status request to the host, and
+`job_tail(..., remote_id=...)` reads one byte range of the remote log over the
+protocol (no `follow`/`grep`). `vanth remote pending` / `retry` reconcile
+requests whose response was lost.
 
 ---
 
@@ -1259,6 +1366,10 @@ Start it through `job_start` and watch it in `vanth monitor`.
   `logs/<job_id>.runner.log` and the heartbeat thresholds.
 - **No charts in the monitor**: the job isn't emitting `AGENT_EVENT` `metric` or
   `progress` lines — add them (optional).
+- **OpenCode wake never arrives (TUI session)**: check `vanth doctor` — if no
+  `opencode_thread` relay is `live`, the plugin is not loaded. Re-run
+  `vanth setup opencode` and restart opencode. Without a live relay an
+  `opencode_thread` target is rejected at creation rather than silently lost.
 - **OpenCode wake timing out**: increase `timeout_seconds` on the wake target
   beyond the expected turn length.
 - **OpenCode wake failed with `Session not found`**: the wake target's

@@ -25,6 +25,21 @@ def _default_daemon_url() -> str:
     return f"http://{host}:{port}"
 
 
+def _default_timeout() -> float | None:
+    """Per-request socket timeout for the HTTP client.
+
+    Without this a hung/blocked daemon blocks the CLI (and an MCP tool call)
+    forever — ``urlopen(timeout=None)`` has no upper bound. Override with
+    ``VANTH_CLIENT_TIMEOUT`` seconds; values <= 0 mean "no timeout" for
+    callers that deliberately want to block.
+    """
+    try:
+        value = float(os.environ.get("VANTH_CLIENT_TIMEOUT", "30"))
+    except ValueError:
+        return 30.0
+    return None if value <= 0 else value
+
+
 def auth_token_path(home: str | os.PathLike[str] | None = None) -> str:
     return os.fspath(canonical_home(home) / "token")
 
@@ -116,7 +131,7 @@ class VanthClient:
             time.sleep(0.1)
         raise RuntimeError("vanthd did not start")
 
-    def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def get(self, path: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
         url = self.url + path
         if params:
             clean = {key: value for key, value in params.items() if value is not None}
@@ -124,12 +139,12 @@ class VanthClient:
                 url += "?" + urllib.parse.urlencode(clean, doseq=True)
         try:
             request = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.token}"})
-            with urllib.request.urlopen(request, timeout=None) as response:
+            with urllib.request.urlopen(request, timeout=_default_timeout() if timeout is None else timeout) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             return json.loads(exc.read().decode())
 
-    def post(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def post(self, path: str, payload: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
         data = json.dumps(payload or {}).encode()
         request = urllib.request.Request(
             self.url + path,
@@ -138,7 +153,7 @@ class VanthClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=None) as response:
+            with urllib.request.urlopen(request, timeout=_default_timeout() if timeout is None else timeout) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             return json.loads(exc.read().decode())

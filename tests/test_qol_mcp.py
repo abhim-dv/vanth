@@ -285,17 +285,22 @@ def test_wake_now_enqueues_immediate_delivery_after_completion(tmp_path):
         manager.close()
 
 
-def test_wake_now_opencode_requires_explicit_session(tmp_path):
-    """Review P1-1: OpenCode cannot auto-inherit a session id, so wake_now must
-    reject an opencode_thread target without an explicit session_id."""
+def test_wake_now_opencode_requires_session_or_registered_relay(tmp_path):
+    """Review P1-1: OpenCode cannot auto-inherit a session id. A target without an
+    explicit id is resolved from a live plugin relay for the job's directory
+    (tests/test_opencode_relay.py); with no relay registered it must be rejected."""
     manager = JobManager(tmp_path / "state")
     try:
         job_id = start_job(manager, "print('x')")
-        with pytest.raises(ValueError, match="explicit session_id"):
+        with pytest.raises(ValueError, match="requires session_id"):
             manager.wake_now(job_id, {"type": "opencode_thread", "events": ["completed"]})
-        # attach is also required so the wake hits the visible client's server.
-        with pytest.raises(ValueError, match="attach"):
-            manager.wake_now(job_id, {"type": "opencode_thread", "events": ["completed"], "session_id": "ses_1"})
+        # ``attach`` is OPTIONAL now (a plain TUI exposes no server URL): without
+        # it the delivery goes to the in-process plugin relay, and a session id
+        # alone is a complete address.
+        result = manager.wake_now(
+            job_id, {"type": "opencode_thread", "events": ["completed"], "session_id": "ses_1"}
+        )
+        assert result["woken"] is True
     finally:
         manager.close()
 

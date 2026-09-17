@@ -2,7 +2,145 @@
 
 All notable changes to Vanth are documented here.
 
-## Unreleased
+## 1.10.0 - 2026-09-17
+
+### OpenCode wake (TUI)
+
+- `opencode_thread` wakes now work in a plain `opencode` TUI session. Such a
+  session binds no TCP port and injects no session id, so there was never an
+  `attach` URL to use and an external `opencode run --session` wrote to a
+  backend the visible session never saw — meaning this target type could not be
+  delivered at all. `vanth setup` now installs an in-process OpenCode plugin
+  (`~/.config/opencode/plugins/vanth.ts`) that registers the session it lives in
+  and injects wake prompts through its own client, over the same client relay
+  protocol (`/relay/register|poll|ack`) used for Codex Desktop. `attach` is now
+  optional (still required to be a valid URL when set) and remains the path for
+  headless `opencode serve`. A target with no `session_id` resolves to the relay
+  registered for the job's `cwd`; with no live relay it is rejected at creation
+  with an actionable message instead of pending forever. `vanth doctor` reports
+  registered relays and their liveness.
+
+### CLI and HTTP API
+
+- Added `vanth start` as a non-MCP fallback for launching background jobs,
+  including repeated `--env`/`--wake` options, interactive mode, and `--`
+  command-argument passthrough. Arguments are re-quoted for the host shell, so
+  command quoting, empty arguments, and shell metacharacters in an argument
+  survive (an argument that cannot be encoded safely on Windows — `%`, `!`, `"`
+  — is refused with an instruction to pass one quoted string). Added
+  `vanth deliveries` for
+  actionable wake delivery failures and `vanth api` for the loopback HTTP
+  surface.
+- `vanth --help` now documents API discovery and bearer authentication;
+  `daemon.json` also records `auth: "bearer"` and `token_path`, never the token.
+- `vanth list` now renders running-job duration and age, honors explicit status
+  filters, treats `--all` as terminal-only, and rejects `--status` with `--all`.
+  `GET /jobs` includes lifecycle timestamps, exit code, and runtime.
+
+### CLI onboarding
+
+- Found by a blind usability test (an agent given only "use `job_start`/`job_wait`
+  with no MCP tools available", which scored the CLI 2/5):
+  - **`vanth diff` never ran** — it was implemented in the CLI but missing from
+    the entry point's dispatch set, so it fell through to the MCP stdio server
+    and reported "unknown command".
+  - **Every subcommand now supports `-h`/`--help`** (and `vanth help <command>`).
+    Previously `vanth start --help` returned "unknown option '--help'" and
+    `vanth stop --help` was read as a *job id*.
+  - **`vanth wait <job_id>`** — the CLI counterpart of `job_wait`, so the
+    documented "wait, don't poll" workflow works without an MCP client. Exits 0
+    on the event, 3 on timeout.
+  - Job-id arguments accept an **unambiguous prefix**, and an unknown id suggests
+    near matches: the test dropped one character from a copied id and got a bare
+    "unknown job".
+  - **`vanth status <job-id>`** inspects a single job (status, exit code,
+    runtime, pid, last event, progress) — the CLI counterpart of `job_status`
+    that a blind test went looking for. It previously ignored the argument and
+    reprinted daemon health.
+  - `vanth --help` now prints an **MCP-tool → CLI-command mapping** plus a full
+    start/wait/status/logs example: the onboarding tests were told to use
+    `job_start`/`job_wait` and had to discover `vanth start`/`vanth wait`
+    themselves (one tried `vanth job_start --help`).
+  - **`vanth --json <command>` now works.** The entry point only inspected the
+    first argument, so the documented global flag before the subcommand fell
+    through to the MCP stdio server (a hang for an agent, "unknown command
+    '--json'" in a terminal). `vanth list --json` was unaffected.
+  - **`vanth list` now defaults to in-flight jobs, not just `running`.** A job is
+    inserted as `launching` and only becomes `running` once the runner publishes,
+     so for that window it appeared in neither `list` nor `list --all`: the agent
+     started a job, listed, and saw nothing.
+  - `vanth start` gained the `job_start` options it was missing — `--priority`,
+    `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`,
+    `--policy JSON` — so the CLI fallback is a real substitute for the MCP tool.
+  - `vanth list` gained `--thread-id`, `--name`, and `--tag`: the closest CLI
+    equivalent of `job_view` and filtered `job_list`.
+  - `vanth start` now **warns** when a command using shell operators (`&&`, `|`,
+    `>`) was reassembled from separate arguments, and points at the two reliable
+    forms: one quoted string, or a script file. (A fourth blind run hit exactly
+    this: PowerShell split a single-quoted command into garbage argv and the job
+    died in cmd.exe.)
+  - Help: `vanth --help` documents `help <command>`, both `--json` forms
+    (`vanth --json list` == `vanth list --json`), an MCP→CLI mapping, a full
+    workflow example, and Windows quoting rules; `start`/`logs`/`stop`/`doctor`/
+    `status`/`list` now carry examples and defaults where the audit asked.
+
+### Remote execution
+
+- `remote_list` and `remote_doctor` MCP tools, `job_list(remote_id=...)`, and
+  `job_tail(job_id, remote_id=...)`, so a remote host's jobs and logs are
+  reachable without hand-written HTTP. `vanth api` and the README now document
+  the `/remotes/{id}/...` routes and that `POST /jobs` accepts `remote_id`.
+- Wired the previously orphaned remote log read: `RemoteControl.log_range` and
+  the helper that serves `job.log_range` both existed, but no route, tool, or
+  command called the controller side, so a remote job's output was unreadable
+  through every surface. `GET /remotes/{id}/jobs/{job}/tail` now reads a byte
+  range (`stream`, `offset`, `size`).
+
+### Fixes
+
+- **Daemon deadlock (artifact subsystem)**: `manager_lock` was a non-reentrant
+  `Lock` while the lazy artifact accessors nest (`get_artifact_broker` /
+  `get_artifact_collections` / `get_artifact_lifecycle` /
+  `get_artifact_storage_profiles` -> `get_artifacts`). The first such request
+  self-deadlocked while holding the lock forever, which then blocked
+  `get_artifacts()` for every later request — collections, lifecycle, storage
+  profiles, remote artifact transfers, and even plain `materialize`/`verify`
+  all hung for the daemon's lifetime, while `/jobs` kept answering because
+  `get_manager()` short-circuits on its cached global. The lock is now an
+  `RLock`.
+- `vanth list` no longer reports "no jobs" when its default running-only filter
+  is empty and finished jobs exist; it says so and points at `--all`.
+- `vanth list` DURATION/AGE no longer renders a raw seconds remainder for
+  durations of a day or more (`5d 17h 1727s` -> `5d 17h 28m 47s`).
+- Malformed request bodies on `/artifacts/push-remote`, `/artifacts/pull-remote`,
+  remote `job.stop`/`job.rerun`, and `/remote/helper` are now field-level 400s
+  naming the missing field instead of internal 500s.
+- Hardened `POST /jobs` validation and error classification, rejected
+  idempotency keys for local starts, and committed a job with its wake targets
+  atomically; remote idempotency keys remain supported. Malformed
+  `wake_targets` containers are a field-level 400, not an internal 500.
+- Dead maintenance or dispatch loops now make `vanth doctor` and `GET /ready`
+  unhealthy; doctor reports maintenance state and dead-lettered deliveries.
+  OpenCode wake validation errors now explain the missing TUI server URL and
+  point to `opencode serve` or `local_command`/`webhook` targets.
+- OpenCode setup/status now handles the merged `config.json`, `opencode.json`,
+  and `opencode.jsonc` files. JSONC is parsed read-only (comments stripped in
+  memory) so a commented file is detected accurately, and is edited only when it
+  has no comments to lose. Status and the startup hint report the deep-merged
+  *effective* state (a lower file's `enabled: false` still wins), setup refuses
+  to write a file a higher-precedence one would shadow, `--remove` clears every
+  safely-editable registration, and any skipped client (including a requested
+  client with no config file) is reported as an incomplete result rather than
+  success.
+- Malformed nested job fields (`wake_targets`/`trigger`/`policy`/`origin_thread_id`
+  and the delivery/tail/schedule status filters) are now field-level 400s instead
+  of internal 500s from unhashable set membership or SQLite binding.
+- Included oversized stop grace periods in the client deadline so
+  `vanth stop --kill-after` and the MCP `job_stop` no longer time out while the
+  daemon is still stopping the job.
+- HTTP client requests now default to a 30-second socket timeout via
+  `VANTH_CLIENT_TIMEOUT`, and daemon socket reads/writes are bounded by
+  `VANTH_REQUEST_TIMEOUT`; long polls retain their own budgets.
 
 ### Durable approval / decision requests
 

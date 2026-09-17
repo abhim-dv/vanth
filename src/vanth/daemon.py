@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import http
 import ipaddress
@@ -20,11 +21,18 @@ from typing import Any
 
 from .client import auth_token_path, ensure_auth_token
 from .paths import canonical_home, secure_home_permissions
+from .remote.protocol import VanthRemoteProtocolError
 from .server import TERMINAL_STATUSES, JobManager
 
 
 manager: JobManager | None = None
-manager_lock = threading.Lock()
+# RLock, not Lock: the lazy accessors below nest (get_artifact_broker ->
+# get_artifacts, get_artifact_collections -> get_artifacts, ...). With a plain
+# Lock the first such call self-deadlocked while holding the lock forever, which
+# also blocked get_artifacts() for every later request and bricked the artifact
+# subsystem for the daemon's lifetime (get_manager() hides it by short-circuiting
+# on the cached global before taking the lock).
+manager_lock = threading.RLock()
 shutdown_event = threading.Event()
 _httpd: "TrackingHTTPServer | None" = None
 _remote_store = None
@@ -194,18 +202,21 @@ def _remote_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Route a remote mutation through RemoteControl with a caller-supplied key."""
-    control = get_remote_control()
+    # Validate the caller's fields BEFORE anything that initializes lockdowning
+    # state (get_remote_control takes manager_lock): a malformed body must yield a
+    # field error, not a wait on initialization or an init failure masquerading
+    # as the caller's fault.
     key = payload.pop("idempotency_key", None)
     if key is None:
-        from .remote.protocol import VanthRemoteProtocolError
         raise VanthRemoteProtocolError(
             "INVALID_REQUEST", "remote mutations require caller-supplied idempotency_key"
         )
+    job_id = required_field(payload, "job_id") if method in {"job.stop", "job.rerun"} else None
+    control = get_remote_control()
     expected = _remote_epoch(remote_id)
     remote_row = get_remote_store().get_remote(remote_id)
     expected_instance = remote_row.get("instance_id")
     if not expected_instance:
-        from .remote.protocol import VanthRemoteProtocolError
         raise VanthRemoteProtocolError(
             "INVALID_REQUEST", "remote is not paired with a verified instance identity"
         )
@@ -216,14 +227,14 @@ def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict
         return control.run_request(remote_id, request, expected_state_epoch=expected)
     if method == "job.stop":
         return control.stop(
-            remote_id, payload["job_id"],
+            remote_id, job_id,
             signal=payload.get("signal", "terminate"),
             kill_after_seconds=payload.get("kill_after_seconds", 10),
             idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance,
         )
     if method == "job.rerun":
         overrides = {k: v for k, v in payload.items() if k != "job_id"}
-        return control.rerun(remote_id, payload["job_id"], overrides, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
+        return control.rerun(remote_id, job_id, overrides, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
     return control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
 
 
@@ -479,6 +490,46 @@ def error(handler: BaseHTTPRequestHandler, message: str, status: int = 400) -> N
     ok(handler, {"result": "error", "error": message[:4096]}, status)
 
 
+def required_field(payload: dict[str, Any], key: str) -> Any:
+    """Read a required request field, raising a 400-class error when absent.
+
+    Indexing ``payload[key]`` directly raises ``KeyError``, which the POST
+    handler maps to a 500 "Internal server error": a client that forgot a field
+    would see a server fault instead of the field name. ``ValueError`` maps to a
+    field-level 400 (the same contract ``JobManager`` uses).
+    """
+    value = payload.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise ValueError(f"{key} is required")
+    return value
+
+
+# Payload surface accepted by POST /jobs. An explicit allow-list means a
+# misspelled or unknown field is a clear, field-level 400 at the HTTP boundary
+# instead of being forwarded into ``JobManager.start(**payload)`` and surfacing
+# as an opaque Python ``TypeError``.
+_JOB_START_FIELDS = {
+    "command", "cwd", "name", "env", "timeout_seconds", "notify_on",
+    "wake_targets", "origin_thread_id", "tags", "notes", "interactive",
+    "trigger", "policy", "secret_env", "pool", "priority",
+    "remote_id", "idempotency_key",
+}
+
+
+def _validate_job_start_payload(payload: dict[str, Any]) -> None:
+    """Reject unknown/missing fields with a field-level message before the
+    request reaches the job manager (which validates values, not the shape)."""
+    unknown = sorted(set(payload) - _JOB_START_FIELDS)
+    if unknown:
+        raise ValueError(
+            "unknown field(s): " + ", ".join(unknown)
+            + " (allowed: " + ", ".join(sorted(_JOB_START_FIELDS)) + ")"
+        )
+    command = payload.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("missing required field: command (non-empty string)")
+
+
 def _decision_route(path: str) -> tuple[str, str, str] | None:
     """Match the exact decision routes, or None.
 
@@ -499,6 +550,16 @@ def _decision_route(path: str) -> tuple[str, str, str] | None:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "vanthd/1"
+
+    # Bound every blocking socket read/write so a partial request body or a
+    # stalled client cannot pin a request thread indefinitely. This is a
+    # per-IO timeout, not a whole-request deadline: the long-poll routes
+    # (/jobs/:id/wait, /tail?follow=true) perform no socket I/O while waiting,
+    # so they are unaffected and keep their own timeouts.
+    try:
+        timeout = float(os.environ.get("VANTH_REQUEST_TIMEOUT", "30"))
+    except ValueError:
+        timeout = 30.0
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -571,6 +632,53 @@ class Handler(BaseHTTPRequestHandler):
 
                 ok(self, projected_dashboard(get_manager(), get_remote_store(), parsed.path.split("/")[2],
                                              limit=int(query.get("limit", ["5000"])[0])))
+            elif parsed.path.startswith("/remotes/") and parsed.path.endswith("/tail"):
+                # GET /remotes/{remote_id}/jobs/{job_id}/tail — a byte range of a
+                # log living ON THE REMOTE, via the job.log_range protocol. The
+                # controller-side log_range existed but nothing called it, so
+                # remote logs were unreadable through every surface (CLI, MCP,
+                # HTTP) even though the helper implemented them.
+                parts = parsed.path.split("/")
+                if len(parts) != 6 or parts[3] != "jobs":
+                    error(self, "Not found", 404)
+                    return
+                remote_id, remote_job_id = parts[2], parts[4]
+                # A remote read is one byte range. Reject follow/grep here too (the
+                # MCP wrapper rejects them) so a direct HTTP caller cannot get a
+                # silent, unfiltered snapshot while believing it is following.
+                # parse_qs drops blank values, so re-parse with them kept: `?grep=`
+                # must be rejected too, not treated as absent.
+                supplied = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                if supplied.get("follow", ["false"])[0].lower() in {"1", "true", "yes"}:
+                    raise ValueError("follow is not supported for a remote job log; poll this route instead")
+                if "grep" in supplied:
+                    raise ValueError("grep is not supported for a remote job log; filter the returned content")
+                stream = query.get("stream", ["stdout"])[0]
+                if stream not in {"stdout", "stderr"}:
+                    raise ValueError("stream must be stdout or stderr")
+                size = int(query.get("size", ["65536"])[0])
+                if size < 1 or size > 1048576:
+                    raise ValueError("size must be an integer between 1 and 1048576")
+                frame = get_remote_control().log_range(
+                    remote_id, remote_job_id,
+                    stream=stream,
+                    offset=int(query.get("offset", ["0"])[0]),
+                    size=size,
+                )
+                try:
+                    content = base64.b64decode(frame.get("content") or "").decode("utf-8", "replace")
+                except (ValueError, TypeError):
+                    content = ""
+                ok(self, {
+                    "job_id": remote_job_id,
+                    "remote_id": remote_id,
+                    "shadow": False,
+                    "stream": frame.get("stream", stream),
+                    "offset": frame.get("offset", 0),
+                    "size": frame.get("size"),
+                    "truncated": frame.get("truncated", False),
+                    "content": content,
+                })
             elif parsed.path == "/view":
                 ok(self, get_manager().agent_view(query.get("thread_id", [None])[0], int(query.get("limit", ["50"])[0])))
             elif parsed.path == "/jobs":
@@ -720,20 +828,39 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
             if not self._authorized():
-                allowed = {"command", "cwd", "name", "env", "timeout_seconds", "notify_on", "wake_targets", "origin_thread_id", "tags", "notes", "interactive", "trigger", "policy", "secret_env", "pool", "priority", "remote_id", "idempotency_key"}
-                if self.path == "/jobs" and ("command" not in payload or set(payload) - allowed):
+                if self.path == "/jobs" and ("command" not in payload or set(payload) - _JOB_START_FIELDS):
                     raise ValueError("invalid job request")
                 error(self, "Unauthorized", 401)
                 return
             parsed = urllib.parse.urlparse(self.path)
             decision_route = _decision_route(parsed.path)
             if parsed.path == "/jobs":
+                _validate_job_start_payload(payload)
                 remote_id = payload.pop("remote_id", None)
                 if remote_id:
                     ok(self, _remote_submit(remote_id, "job.start", _remote_payload(payload)))
                 else:
+                    if payload.get("idempotency_key") is not None:
+                        # Local starts have no durable dedup store yet. Silently
+                        # dropping the key would violate the caller's retry
+                        # contract (a retry could execute the workload twice),
+                        # so refuse it explicitly until it is really supported.
+                        raise ValueError(
+                            "idempotency_key is not supported for local job starts; "
+                            "omit it (remote starts accept it)"
+                        )
                     payload.pop("idempotency_key", None)
-                    ok(self, asyncio.run(get_manager().start(**payload)))
+                    # Field shapes are validated at the manager boundary, so a
+                    # TypeError here is a genuine bug, not user error: report it
+                    # as a 500 and log a traceback rather than echoing an
+                    # internal Python message as if the caller got it wrong.
+                    try:
+                        result = asyncio.run(get_manager().start(**payload))
+                    except TypeError:
+                        logging.getLogger("vanth.daemon").exception("job start failed")
+                        error(self, "Internal server error", 500)
+                        return
+                    ok(self, result)
             elif decision_route is not None:
                 action, decision_job, token = decision_route
                 if action == "request":
@@ -850,6 +977,10 @@ class Handler(BaseHTTPRequestHandler):
                 ok(self, {"state_epoch": remote_store.get_state_epoch(), "instance_id": remote_store.get_instance_id()})
             elif parsed.path == "/remote/helper":
                 frame = payload.get("frame", payload)
+                # ``frame`` is caller-supplied: a non-object (e.g. {"frame": 5})
+                # would raise AttributeError on .get and surface as a 500.
+                if not isinstance(frame, dict):
+                    raise ValueError("frame must be an object")
                 remote = _remote_job_manager()
                 kind = frame.get("kind")
                 if kind == "request":
@@ -859,8 +990,6 @@ class Handler(BaseHTTPRequestHandler):
                 elif kind == "log_range":
                     response = remote.handle_log_range_request(frame)
                 else:
-                    from .remote.protocol import VanthRemoteProtocolError
-
                     raise VanthRemoteProtocolError("PROTOCOL_UNKNOWN_KIND", f"unknown frame kind: {frame.get('kind')!r}")
                 ok(self, response)
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/metrics"):
@@ -890,14 +1019,22 @@ class Handler(BaseHTTPRequestHandler):
                     idempotency_key=payload.get("idempotency_key"),
                 ))
             elif parsed.path == "/artifacts/materialize":
+                # Hoisted deliberately: Python evaluates the receiver
+                # (get_artifacts()) BEFORE the arguments, so inlining these
+                # required_field calls would open the catalog for a request that
+                # is missing a field — and could surface an init error instead of
+                # the field error.
+                materialize_version = required_field(payload, "version_id")
+                materialize_dest = required_field(payload, "dest_path")
                 ok(self, get_artifacts().materialize(
-                    payload["version_id"],
-                    payload["dest_path"],
+                    materialize_version,
+                    materialize_dest,
                     overwrite=bool(payload.get("overwrite", False)),
                     idempotency_key=payload.get("idempotency_key"),
                 ))
             elif parsed.path == "/artifacts/verify":
-                ok(self, get_artifacts().verify(payload["version_id"], idempotency_key=payload.get("idempotency_key")))
+                verify_version = required_field(payload, "version_id")
+                ok(self, get_artifacts().verify(verify_version, idempotency_key=payload.get("idempotency_key")))
             elif parsed.path == "/artifacts/collections":
                 ok(self, get_artifact_collections().create_collection(
                     payload.get("name"), idempotency_key=payload.get("idempotency_key")))
@@ -958,13 +1095,21 @@ class Handler(BaseHTTPRequestHandler):
                     parsed.path.split("/")[2], payload.get("config") or {},
                     idempotency_key=payload.get("idempotency_key")))
             elif parsed.path == "/artifacts/push-remote":
+                # Validate BEFORE building the broker: arguments are evaluated
+                # after the receiver, so inlining these calls would open the
+                # broker (an expensive, lock-taking init) for a bad request.
+                push_remote_id = required_field(payload, "remote_id")
+                push_version_id = required_field(payload, "version_id")
                 ok(self, get_artifact_broker().push_blob(
-                    payload["remote_id"], payload["version_id"],
+                    push_remote_id, push_version_id,
                     idempotency_key=payload.get("idempotency_key"),
                 ))
             elif parsed.path == "/artifacts/pull-remote":
+                pull_remote_id = required_field(payload, "remote_id")
+                pull_version_id = required_field(payload, "version_id")
+                pull_dest_path = required_field(payload, "dest_path")
                 ok(self, get_artifact_broker().pull_blob(
-                    payload["remote_id"], payload["version_id"], payload["dest_path"],
+                    pull_remote_id, pull_version_id, pull_dest_path,
                     idempotency_key=payload.get("idempotency_key"),
                 ))
             elif parsed.path == "/shutdown":
@@ -974,6 +1119,14 @@ class Handler(BaseHTTPRequestHandler):
                 error(self, "Not found", 404)
         except RequestTooLarge as exc:
             error(self, str(exc), 413)
+        except VanthRemoteProtocolError as exc:
+            # A remote-protocol rejection is a caller/state error, not a daemon
+            # fault. Mapping it to 500 hid actionable messages (e.g. "remote
+            # mutations require caller-supplied idempotency_key") behind
+            # "Internal server error". A malformed request is a 400; state
+            # conflicts (unpaired identity, unknown frame kind) are 409, matching
+            # the GET remote path.
+            error(self, str(exc), 400 if getattr(exc, "code", "") == "INVALID_REQUEST" else 409)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, OverflowError) as exc:
             error(self, str(exc))
         except Exception:
@@ -1016,6 +1169,10 @@ def write_daemon_metadata(home: Path, url: str) -> None:
         "pid": os.getpid(),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "schema_version": LATEST_SCHEMA_VERSION,
+        # Auth bootstrap so a client (or a human) can reach the API without
+        # reading source. The scheme/path only — never the token itself.
+        "auth": "bearer",
+        "token_path": str(home / "token"),
     }
     path = home / "daemon.json"
     tmp = path.with_suffix(".json.tmp")
