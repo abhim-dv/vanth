@@ -2,6 +2,61 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.11.0 - 2026-09-22
+
+### CLI and HTTP API
+
+- Added `vanth wake <job-id>` (the CLI counterpart of the MCP
+  `job_add_wake_target` / `job_wake_now`) to register a wake target on a job
+  that is already running or finished: `--type` / `--events` / `--cwd` /
+  `--config JSON` (or a full `--target JSON`), and `--now` to enqueue a
+  synthetic wake immediately. `vanth api` now lists
+  `POST /jobs/{id}/wake` and `POST /jobs/{id}/wake-now`. README documents that
+  targets are not fixed at start time and spells out per-type thread-identity
+  resolution.
+- `--wake` / `--trigger` / `--policy` accept `@path` (a JSON file) or `-`
+  (stdin) in addition to a literal, so PowerShell 5.1 quote-stripping no longer
+  corrupts nested JSON.
+
+### Wake target fixes
+
+- **A relay client id is rejected as a wake destination.** `opencode_thread`
+  (`opencode-<pid>-<rand>`) and `codex_desktop` (`mcp-<pid>-<thread>`) targets
+  naming the long-poll `client_id` that `vanth doctor` prints were accepted and
+  then never claimed — the delivery sat `pending` forever with no error. They are
+  now refused at creation with an actionable message pointing at the destination
+  session/thread id.
+- **Identity aliases are canonicalized once at persistence.** A target
+  registered with `threadId`/`sessionId` (or the other type's key) is rewritten
+  to the key the relay eligibility SQL and bridges actually read, so an
+  alias-only `opencode_thread` target is matchable instead of silently
+  unclaimable. `wake_thread_id` now records the session id for
+  `opencode_thread`, so `list --thread-id` finds it.
+- **The relay poll collects destinations under every accepted alias**, so a
+  relay registered with a legacy key is offered its deliveries rather than
+  polling with an empty identity set.
+- **`codex_desktop` with a `command` but no thread id is rejected** — the relay
+  path ignores `command` and still requires the identity.
+- `daemon_wake` / `job_add_wake_target` now resolve caller-task identity
+  (`CODEX_THREAD_ID` / `VANTH_CODEX_DESKTOP_THREAD`) like `job_wake_now` did.
+
+### Reliability fixes
+
+- A queued trigger job whose parent row was pruned/removed is cancelled
+  (`trigger parent ... no longer exists`) instead of staying `queued` forever
+  with no event.
+- `stop` on a queued job re-reads and falls through to the live-stop path when
+  the dispatcher claimed the row to `launching` between the read and the CAS,
+  so a zero-row CAS is never reported as a successful cancellation.
+- `cleanup` re-checks terminal status inside the delete transaction, so a
+  restart recovery that reclaims a terminal row to `launching` cannot have the
+  job (and its wake targets/events) deleted out from under a live launch.
+- A launch re-claim clears the previous run's `pid` / `worker_pid` /
+  `runner_heartbeat_at`, so an abandoned re-claim cannot force-kill whatever
+  process now holds the recycled pid.
+- A delivery dispatch thread that fails to start is dropped from the in-flight
+  set instead of permanently consuming a `max_delivery_concurrency` slot.
+
 ## 1.10.0 - 2026-09-17
 
 ### OpenCode wake (TUI)

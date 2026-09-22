@@ -111,6 +111,16 @@ def test_validate_wake_targets_no_longer_requires_attach():
         )
 
 
+def test_validate_wake_targets_requires_identity_for_codex_desktop_with_command():
+    """codex_desktop is relay-delivered, so its command is ignored: the identity
+    is still required or the delivery would never be claimed."""
+    validate_wake_targets(
+        [{"type": "codex_desktop", "events": ["completed"], "thread_id": "t", "command": ["echo"]}]
+    )
+    with pytest.raises(ValueError, match="codex_desktop target requires thread_id"):
+        validate_wake_targets([{"type": "codex_desktop", "events": ["completed"], "command": ["echo"]}])
+
+
 def test_wake_without_attach_is_never_spawned_locally(monkeypatch, tmp_path):
     """The daemon must not fall back to `opencode run --session`, which writes to
     a backend the live TUI never sees; the delivery waits for the plugin relay."""
@@ -260,5 +270,81 @@ def test_doctor_reports_relay_liveness(tmp_path):
         assert len(relays) == 1
         assert relays[0]["live"] is True
         assert relays[0]["destinations"][0]["session_id"] == SESSION
+    finally:
+        manager.close()
+
+
+def test_relay_client_id_in_session_id_is_rejected(tmp_path):
+    """`vanth doctor` prints the relay client id; copying it into session_id
+    yields a delivery the relay never matches (pending forever, no error), so it
+    must fail at target creation instead."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        register(manager, client_id="opencode-1234-abcd", session_id=SESSION, directory=str(tmp_path))
+        with pytest.raises(ValueError, match="relay client id"):
+            start_job(
+                manager,
+                "print('bad wake')",
+                cwd=str(tmp_path),
+                wake_targets=[
+                    {"type": "opencode_thread", "events": ["completed"], "session_id": "opencode-1234-abcd"}
+                ],
+            )
+        # A stale client id (its relay no longer registered) is caught by shape.
+        with pytest.raises(ValueError, match="relay client id"):
+            start_job(
+                manager,
+                "print('stale wake')",
+                cwd=str(tmp_path),
+                wake_targets=[
+                    {"type": "opencode_thread", "events": ["completed"], "session_id": "opencode-9999-zzzz"}
+                ],
+            )
+    finally:
+        manager.close()
+
+
+def test_thread_id_alias_is_canonicalized_and_delivered(tmp_path):
+    """An `opencode_thread` target that names its id via the `thread_id` alias
+    must be canonicalized to `session_id` (the key the relay SQL matches), not
+    left as an alias that is silently never claimed."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        register(manager, directory=str(tmp_path))
+        job_id = start_job(
+            manager,
+            "print('alias')",
+            cwd=str(tmp_path),
+            wake_targets=[{"type": "opencode_thread", "events": ["completed"], "thread_id": SESSION}],
+        )
+        assert stored_session(manager, job_id) == SESSION
+        wait_completed(manager, job_id)
+        wait_relay_delivery(manager, job_id)
+        claimed = manager.relay_poll(CLIENT, timeout_seconds=2)
+        assert [d["payload"]["target"]["session_id"] for d in claimed] == [SESSION]
+    finally:
+        manager.close()
+
+
+def test_camelcase_destination_alias_is_pollable(tmp_path):
+    """A relay that registers its destination under the legacy `sessionId` alias
+    must still be offered its deliveries (identities are collected under every
+    alias, not just the canonical one)."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        manager.relay_register(
+            client_id=CLIENT,
+            client_type="opencode_thread",
+            destinations=[{"client_type": "opencode_thread", "sessionId": SESSION, "directory": str(tmp_path)}],
+        )
+        job_id = start_job(
+            manager,
+            "print('camel')",
+            cwd=str(tmp_path),
+            wake_targets=[{"type": "opencode_thread", "events": ["completed"], "session_id": SESSION}],
+        )
+        wait_completed(manager, job_id)
+        claimed = manager.relay_poll(CLIENT, timeout_seconds=2)
+        assert [d["payload"]["target"]["session_id"] for d in claimed] == [SESSION]
     finally:
         manager.close()

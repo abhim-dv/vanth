@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import struct
@@ -342,6 +343,12 @@ RELAY_IDENTITY_KEYS = {
     "codex_desktop": ("thread_id", "threadId"),
     "opencode_thread": ("session_id", "sessionId"),
 }
+# The OpenCode plugin's long-poll identity (``vanth.ts``): ``opencode-<pid>-<rand>``.
+# It is NOT a wake destination — an ``opencode_thread`` delivery is matched on the
+# destination ``session_id`` (``ses_...``), so a target carrying a client id is
+# never claimed and stays pending forever with no error. Callers repeatedly copy
+# this from ``vanth doctor``, so it is rejected at target creation.
+OPENCODE_CLIENT_ID_RE = re.compile(r"^opencode-\d+-[a-z0-9]+$")
 # Durable approval/decision requests (roadmap Tier-1). A decision is its own
 # small state machine keyed by ``decision_id``; the job row is untouched, so a
 # job can keep running (or stay queued) while a human decides.
@@ -413,19 +420,37 @@ _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def canonicalize_wake_target(target: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of a wake-target dict with ``threadId`` canonicalized to
-    ``thread_id``.
+    """Return a copy of a wake-target dict with its identity key canonicalized.
 
-    The documented legacy ``threadId`` alias is accepted by validation and
-    ``_delivery_thread_target``, but the relay SQL eligibility filter only reads
-    ``$.target.thread_id``. Canonicalizing ONCE at persistence guarantees a
-    delivery registered with either alias is pollable (review rc38 P1). A copy
-    is returned — the caller's dict is never mutated.
+    Wake targets accept several aliases for the destination id (``threadId``,
+    ``sessionId``, and — for ``opencode_thread``/codex types — each other's key),
+    but every consumer reads exactly one: the relay eligibility SQL filters on
+    ``$.target.session_id`` for ``opencode_thread`` and ``$.target.thread_id`` for
+    ``codex_desktop``, and the bridges read the same. Canonicalizing ONCE at
+    persistence guarantees a delivery registered with any alias is matchable; an
+    alias left in place makes the delivery silently unclaimable. A copy is
+    returned — the caller's dict is never mutated.
     """
     copied = dict(target)
-    if "threadId" in copied and "thread_id" not in copied:
-        copied["thread_id"] = copied["threadId"]
-    copied.pop("threadId", None)
+    target_type = copied.get("type")
+    # isinstance guards the set membership below: an unhashable type (e.g. a
+    # list) would raise TypeError and surface as an internal 500.
+    if isinstance(target_type, str) and target_type == "opencode_thread":
+        identity = copied.get("session_id") or copied.get("sessionId") or copied.get("thread_id") or copied.get("threadId")
+        if identity:
+            copied["session_id"] = identity
+        for alias in ("sessionId", "thread_id", "threadId"):
+            copied.pop(alias, None)
+    elif isinstance(target_type, str) and target_type in {"codex_desktop", "codex_thread", "codex_cli_thread"}:
+        identity = copied.get("thread_id") or copied.get("threadId") or copied.get("session_id") or copied.get("sessionId")
+        if identity:
+            copied["thread_id"] = identity
+        for alias in ("threadId", "session_id", "sessionId"):
+            copied.pop(alias, None)
+    else:
+        if "threadId" in copied and "thread_id" not in copied:
+            copied["thread_id"] = copied["threadId"]
+        copied.pop("threadId", None)
     return copied
 
 
@@ -476,6 +501,13 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
                 for key, value in headers.items():
                     if not isinstance(key, str) or not isinstance(value, str):
                         raise ValueError("webhook target headers must be string key/value pairs")
+        if target_type == "codex_desktop" and command is not None:
+            # codex_desktop is relay-only: _dispatch_delivery returns before the
+            # command branch, so a command is ignored and the identity is still
+            # required. Without this, such a target is silently never claimed.
+            identity = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
+            if not isinstance(identity, str) or not identity:
+                raise ValueError("codex_desktop target requires thread_id (it is delivered by the Desktop relay; command is ignored)")
         if target_type == "opencode_thread" and command is None:
             # OpenCode cannot auto-inherit a session id (review P1-1): the id is
             # never injected by the client, so a missing one must be rejected
@@ -484,9 +516,10 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             session_id = target.get("session_id") or target.get("sessionId") or target.get("thread_id") or target.get("threadId")
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError(
-                    "opencode_thread target requires session_id (or a live vanth OpenCode plugin "
-                    "registered for this directory — check `vanth doctor`); pass an id from "
-                    "`opencode session list` when the plugin is not loaded"
+                    "opencode_thread target requires session_id — the OpenCode session id "
+                    "(`ses_...`, from `opencode session list` or the destination shown by "
+                    "`vanth doctor`), NOT the relay client id (`opencode-<pid>-<rand>`); "
+                    "omit it to resolve the live plugin relay for the job's directory"
                 )
             # ``attach`` is OPTIONAL: a plain TUI session exposes no server URL
             # (review P0-3), so without it the wake is delivered by the
@@ -1336,6 +1369,7 @@ class JobManager:
             probe_budget = [self.probe_budget]
 
             to_cancel: list[tuple[str, str, str]] = []
+            to_cancel_orphan: list[tuple[str, str]] = []
             to_cancel_probe: list[tuple[str, dict[str, Any]]] = []
             to_launch: list[tuple[str, str | None]] = []
             for row in rows:
@@ -1349,6 +1383,12 @@ class JobManager:
                 if trigger and trigger.get("job_id"):
                     parent, target = trigger["job_id"], trigger["status"]
                     parent_status, parent_ended = parents.get(parent, (None, None))
+                    if parent_status is None:
+                        # The parent row is gone (pruned/removed): the gate can
+                        # never fire, so cancel rather than waiting forever with
+                        # no event (the queued job would otherwise never move).
+                        to_cancel_orphan.append((job_id, parent))
+                        continue
                     if parent_status in TERMINAL_STATUSES and parent_status != target:
                         # Cancellation is independent of pause: a held job whose
                         # trigger can never fire must not linger.
@@ -1410,6 +1450,22 @@ class JobManager:
                         data={"actor": "daemon", "reason": "trigger parent reached an incompatible terminal status",
                               "trigger": {"job_id": parent, "status": status},
                               "parent_status": parents.get(parent, (None, None))[0]},
+                    )
+            for job_id, parent in to_cancel_orphan:
+                reason = f"trigger parent {parent} no longer exists"
+                with self.db_lock:
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status='cancelled', stop_actor='daemon', stop_reason=?, "
+                        "ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
+                        (reason, now_iso(), now_iso(), job_id),
+                    ).rowcount
+                    self.db.commit()
+                if changed:
+                    self._emit(
+                        job_id,
+                        "cancelled",
+                        message=f"Queued job cancelled: {reason}",
+                        data={"actor": "daemon", "reason": reason, "trigger": {"job_id": parent}},
                     )
         except Exception:
             self.logger.exception("queued-job dispatch failed")
@@ -2059,7 +2115,15 @@ class JobManager:
                     continue
                 thread = threading.Thread(target=self._dispatch_delivery, args=(self._delivery_dict(row),), daemon=True)
                 self._delivery_threads.add(thread)
-            thread.start()
+            try:
+                thread.start()
+            except RuntimeError:
+                # Can't start a thread: drop it from the in-flight set so it does
+                # not permanently count against max_delivery_concurrency (the
+                # worker's own finally-discard never runs).
+                with self._delivery_threads_lock:
+                    self._delivery_threads.discard(thread)
+                self.logger.warning("delivery dispatch thread failed to start delivery_id=%s", row["delivery_id"])
 
     def close(self) -> None:
         with self._close_lock:
@@ -2762,11 +2826,18 @@ class JobManager:
             destinations = json.loads(client_row["destinations_json"] or "[]")
         except (TypeError, ValueError):
             destinations = []
-        identities = {
-            item.get(identity_keys[0])
-            for item in destinations
-            if isinstance(item, dict) and isinstance(item.get(identity_keys[0]), str)
-        }
+        # Collect destinations under EVERY identity alias the client type accepts,
+        # not just the canonical one: a relay that registered with the legacy
+        # alias would otherwise poll with an empty identity set and never be
+        # offered its deliveries (silent permanent pending).
+        identities: set[str] = set()
+        for item in destinations:
+            if not isinstance(item, dict):
+                continue
+            for key in identity_keys:
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    identities.add(value)
         # Update last_poll_at for liveness tracking.
         with self.db_lock:
             self.db.execute(
@@ -2996,6 +3067,7 @@ class JobManager:
             # An opencode_thread target with no session_id is addressed to the
             # live plugin relay in this project (see _resolve_relay_sessions).
             self._resolve_relay_sessions(wake_targets, cwd)
+            self._reject_relay_client_id_targets(wake_targets)
         # Apply notify_on defaults BEFORE validation so a target with no explicit
         # events inherits the notify_on list and is not rejected as empty.
         if notify_on:
@@ -3019,9 +3091,12 @@ class JobManager:
         stderr_path = self.logs / f"{job_id}.stderr.log"
         events_path = self.events_dir / f"{job_id}.jsonl"
         created_at = now_iso()
+        # The wake identity is the session id for opencode_thread and the thread
+        # id otherwise (both are canonicalized by _resolve_relay_sessions above),
+        # so `list --thread-id` can find an opencode job by the session it wakes.
         wake_thread_id = next(
             (
-                target.get("thread_id") or target.get("threadId")
+                target.get("session_id") if target.get("type") == "opencode_thread" else target.get("thread_id")
                 for target in (wake_targets or [])
                 if target.get("type") in {"codex_thread", "codex_cli_thread", "codex_desktop", "opencode_thread"}
             ),
@@ -3453,7 +3528,8 @@ class JobManager:
                             state["pending_restart_after"] = value
                 token = "claim_" + uuid.uuid4().hex[:16]
                 changed = self.db.execute(
-                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=?, worker_pid=NULL "
+                    "UPDATE jobs SET status='launching', claim_token=?, policy_state_json=?, updated_at=?, "
+                    "worker_pid=NULL, pid=NULL, runner_heartbeat_at=NULL "
                     "WHERE job_id=? AND status IN ('queued','failed','orphaned') AND policy_disabled=0",
                     (token, json.dumps(state, separators=(",", ":")), now_iso(), job_id),
                 ).rowcount
@@ -4056,15 +4132,68 @@ class JobManager:
         delivery time) keeps the stored target concrete and addressable, and
         makes an unregistered client fail at creation with an actionable error
         (``validate_wake_targets``) instead of silently never waking.
+
+        The identity alias is canonicalized IN PLACE first, so an alias-only
+        target (e.g. ``thread_id`` on an ``opencode_thread`` target) is treated as
+        already addressed rather than having a different session injected, and
+        every later step sees the key the relay SQL actually reads.
         """
+        for target in targets or []:
+            if not isinstance(target, dict):
+                continue
+            canonical = canonicalize_wake_target(target)
+            if canonical != target:
+                target.clear()
+                target.update(canonical)
         for target in targets or []:
             if target.get("type") != "opencode_thread" or target.get("attach"):
                 continue
-            if target.get("session_id") or target.get("sessionId"):
+            if target.get("session_id"):
                 continue
             session_id = self._latest_relay_session(target.get("cwd") or directory)
             if session_id:
                 target["session_id"] = session_id
+
+    def _reject_relay_client_id_targets(self, targets: list[dict[str, Any]] | None) -> None:
+        """Refuse a relay-delivered wake addressed to a relay CLIENT id.
+
+        The relay ``client_id`` (``opencode-<pid>-<rand>`` for the OpenCode
+        plugin, ``mcp-<pid>-<thread>`` for Codex Desktop — both printed by ``vanth
+        doctor``) is the long-poll identity, not a destination. A relay-delivered
+        target (``opencode_thread``/``codex_desktop`` with no ``command``) is
+        claimed by matching the payload's destination identity, so a target naming
+        a client id is never claimed: the delivery sits ``pending`` forever with
+        no error and no retry. Reject it at creation instead.
+        """
+        client_ids = self._relay_client_ids()
+        for target in targets or []:
+            if not isinstance(target, dict) or target.get("command"):
+                continue
+            target_type = target.get("type")
+            if not isinstance(target_type, str) or target_type not in RELAY_IDENTITY_KEYS:
+                continue
+            identity = (
+                target.get("session_id")
+                or target.get("sessionId")
+                or target.get("thread_id")
+                or target.get("threadId")
+            )
+            if not isinstance(identity, str) or not identity:
+                continue
+            is_opencode_shape = target_type == "opencode_thread" and OPENCODE_CLIENT_ID_RE.match(identity)
+            if is_opencode_shape or identity in client_ids:
+                raise ValueError(
+                    f"{target_type} target id {identity!r} is a relay client id, not a wake destination; "
+                    "pass the destination id shown by `vanth doctor` (the session/thread id), "
+                    "not the relay's client id"
+                )
+
+    def _relay_client_ids(self) -> set[str]:
+        try:
+            rows = self.db.execute("SELECT client_id FROM relay_subscriptions").fetchall()
+        except sqlite3.Error:
+            return set()
+        return {row["client_id"] for row in rows}
 
     def _read_stream(
         self,
@@ -5603,12 +5732,31 @@ class JobManager:
             raise ValueError("older_than_seconds must be a non-negative integer")
         rows = self._cleanup_rows(older_than_seconds)
         job_ids = [row["job_id"] for row in rows]
+        deleted = list(job_ids)
         if not dry_run and job_ids:
             with self.db_lock:
                 placeholders = ",".join("?" for _ in job_ids)
                 self.db.execute("BEGIN IMMEDIATE")
+                # Re-check terminal status INSIDE the transaction: a restart
+                # recovery can claim a terminal row back to 'launching' between
+                # the selection above and these DELETEs. Deleting the row — or its
+                # wake targets / events / logs — out from under a live launch would
+                # silently lose the job (and the launch would then find no target).
+                still = [
+                    r["job_id"]
+                    for r in self.db.execute(
+                        f"SELECT job_id FROM jobs WHERE job_id IN ({placeholders}) "
+                        "AND status IN ('completed','failed','timeout','cancelled','orphaned')",
+                        job_ids,
+                    )
+                ]
+                deleted = still
+                still_set = set(still)
+                still_ph = ",".join("?" for _ in still)
                 for row in rows:
                     job_id = row["job_id"]
+                    if job_id not in still_set:
+                        continue
                     artifacts = [
                         row["stdout_path"],
                         row["stderr_path"],
@@ -5627,16 +5775,16 @@ class JobManager:
                         "INSERT OR IGNORE INTO cleanup_tombstones(tombstone_id, job_id, artifacts_json, created_at) VALUES (?, ?, ?, ?)",
                         ("clean_" + uuid.uuid4().hex[:16], job_id, json.dumps(artifacts, separators=(",", ":")), now_iso()),
                     )
-                self.db.execute(f"DELETE FROM delivery_attempts WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE job_id IN ({placeholders}))", job_ids)
-                self.db.execute(f"DELETE FROM deliveries WHERE job_id IN ({placeholders})", job_ids)
-                self.db.execute(f"DELETE FROM wake_targets WHERE job_id IN ({placeholders})", job_ids)
-                self.db.execute(f"DELETE FROM decisions WHERE job_id IN ({placeholders})", job_ids)
-                self.db.execute(f"DELETE FROM events WHERE job_id IN ({placeholders})", job_ids)
-                self.db.execute(f"DELETE FROM jobs WHERE job_id IN ({placeholders}) AND status!='running'", job_ids)
+                self.db.execute(f"DELETE FROM delivery_attempts WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE job_id IN ({still_ph}))", still)
+                self.db.execute(f"DELETE FROM deliveries WHERE job_id IN ({still_ph})", still)
+                self.db.execute(f"DELETE FROM wake_targets WHERE job_id IN ({still_ph})", still)
+                self.db.execute(f"DELETE FROM decisions WHERE job_id IN ({still_ph})", still)
+                self.db.execute(f"DELETE FROM events WHERE job_id IN ({still_ph})", still)
+                self.db.execute(f"DELETE FROM jobs WHERE job_id IN ({still_ph})", still)
                 self.db.commit()
         if not dry_run:
             self._drain_cleanup_tombstones()
-        return {"dry_run": dry_run, "older_than_seconds": older_than_seconds, "jobs": job_ids, "count": len(job_ids)}
+        return {"dry_run": dry_run, "older_than_seconds": older_than_seconds, "jobs": deleted, "count": len(deleted)}
 
     def cleanup_preview(self, older_than_seconds: int) -> dict[str, Any]:
         """Dry-run preview of the jobs a cleanup would remove, without deleting."""
@@ -5744,7 +5892,21 @@ class JobManager:
                     message="Queued job cancelled before its trigger fired",
                     data={"actor": actor, "reason": reason},
                 )
-            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Queued job cancelled"}
+                return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Queued job cancelled"}
+            # The dispatcher claimed the row to 'launching' between our read and
+            # this CAS. Re-read and fall through to the live-stop path below so we
+            # stop the launch instead of reporting a cancellation that did not
+            # happen (a zero-row CAS must never be reported as success).
+            row = self._row(
+                "SELECT status, worker_pid, pid, stop_requested_at, claim_token, trigger_json FROM jobs WHERE job_id=?",
+                (job_id,),
+            )
+            if not row or row["status"] not in {"running", "launching"}:
+                return {
+                    "job_id": job_id,
+                    "status": row["status"] if row else "unknown",
+                    "message": "Job left the queue; stop is a no-op",
+                }
         if row and row["status"] not in {"running", "launching"}:
             # Already-terminal stop is an idempotent no-op (review rc14 P1-11):
             # repeated/cleanup stops must not raise when the job finished
@@ -5916,6 +6078,7 @@ class JobManager:
         job_row = self._row("SELECT cwd FROM jobs WHERE job_id=?", (job_id,))
         if job_row:
             self._resolve_relay_sessions([target], job_row["cwd"])
+            self._reject_relay_client_id_targets([target])
         validate_wake_targets([target])
         target_type = target.get("type")
         events = target.get("events")
@@ -5958,6 +6121,7 @@ class JobManager:
         job_row = self._row("SELECT cwd FROM jobs WHERE job_id=?", (job_id,))
         if job_row:
             self._resolve_relay_sessions([resolved], job_row["cwd"])
+            self._reject_relay_client_id_targets([resolved])
         validate_wake_targets([resolved])
         target_type = resolved.get("type")
         events = resolved.get("events")
@@ -6426,6 +6590,15 @@ def job_start(
     a lost response safe to retry — and the daemon rejects a missing one. Local
     starts are the opposite: they must NOT pass a key (there is no local dedup
     store yet).
+
+    ``wake_targets`` resumes a client when the job emits a matching event. For
+    ``opencode_thread``, pass the OpenCode ``ses_...`` session id (from
+    ``opencode session list``, or the destination ``vanth doctor`` prints) — NOT
+    the relay client id ``opencode-<pid>-<rand>``, which is the long-poll
+    identity and can never be woken. Omit ``session_id`` to resolve the live
+    plugin relay for the job's directory; ``attach`` is optional (only for a
+    headless ``opencode serve``). The daemon rejects a client id in
+    ``session_id`` rather than enqueueing a wake that would never be claimed.
     """
     # Thread identity is resolved HERE, in the MCP process that owns the
     # calling task (review P1-4). The persistent daemon's environment belongs
@@ -7115,7 +7288,8 @@ def _build_wake_target(
     When ``target`` is given it is returned unchanged (backward compatible).
     Otherwise a target is built from ``type`` / ``events`` / ``config``.
     ``type`` is required and must be a supported wake target type
-    (local_command, codex_cli_thread, codex_desktop, opencode_thread, webhook);
+    (local_command, codex_cli_thread, codex_thread, codex_desktop,
+    opencode_thread, webhook);
     events default to ["completed", "failed"].
     """
     if target is not None:
@@ -7161,8 +7335,14 @@ def daemon_wake(
     required when ``target`` is not given. This registers a target for FUTURE
     events only (matching the original semantics). Use ``job_wake_now`` to
     surface a wake immediately, or ``job_add_wake_target`` to register a target.
+    Caller-task inheritance resolves ``CODEX_THREAD_ID`` /
+    ``VANTH_CODEX_DESKTOP_THREAD`` for ``codex_*`` targets without an explicit
+    thread id.
     """
+    origin_thread_id = _mcp_origin_thread_id()
     resolved = _build_wake_target(target, events, type, config)
+    if origin_thread_id:
+        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
@@ -7176,12 +7356,14 @@ def job_wake_now(
     """Surface a wake for a job IMMEDIATELY, even if the event already fired.
 
     Original signature: extra target config passed as plain keyword arguments.
-    ``opencode_thread`` targets require an explicit ``session_id`` and
-    ``attach``. Caller-task inheritance resolves ``CODEX_THREAD_ID`` for
+    ``opencode_thread`` targets require an explicit ``session_id`` — the OpenCode
+    ``ses_...`` id (from ``opencode session list``, or the destination ``vanth
+    doctor`` prints), NOT the relay client id ``opencode-<pid>-<rand>``; ``attach``
+    is optional. Caller-task inheritance resolves ``CODEX_THREAD_ID`` for
     ``codex_cli_thread``/``codex_thread``/``codex_desktop`` targets without an
     explicit thread id.
     """
-    origin_thread_id = os.environ.get("CODEX_THREAD_ID")
+    origin_thread_id = _mcp_origin_thread_id()
     resolved = _build_wake_target(target, events, type, config)
     if origin_thread_id:
         resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
@@ -7198,15 +7380,32 @@ def job_add_wake_target(
     """Register a wake target against a job for FUTURE events.
 
     Original signature: extra target config passed as plain keyword arguments.
-    ``opencode_thread`` targets require an explicit ``session_id`` and
-    ``attach``.
+    ``opencode_thread`` targets need ``session_id`` — the OpenCode ``ses_...`` id
+    (from ``opencode session list``, or the destination ``vanth doctor`` prints),
+    NOT the relay client id ``opencode-<pid>-<rand>``; omit it to resolve the live
+    plugin relay for the job's directory. ``attach`` is optional. Caller-task
+    inheritance resolves ``CODEX_THREAD_ID``/``VANTH_CODEX_DESKTOP_THREAD`` for
+    ``codex_cli_thread``/``codex_thread``/``codex_desktop`` targets without an
+    explicit thread id.
     """
+    origin_thread_id = _mcp_origin_thread_id()
     resolved = _build_wake_target(target, events, type, config)
+    if origin_thread_id:
+        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
 def _mcp_wake_payload(target, events, type, config) -> dict[str, Any]:
     return _build_wake_target(target, events, type, config or {})
+
+
+def _mcp_origin_thread_id() -> str | None:
+    """Caller task identity, resolved in the MCP process that owns the task.
+
+    OpenCode injects no session id, so only the Codex identities are inherited
+    (``resolve_wake_target_identity`` applies them to codex_* targets only).
+    """
+    return os.environ.get("CODEX_THREAD_ID") or os.environ.get("VANTH_CODEX_DESKTOP_THREAD")
 
 
 @mcp.tool(name="job_add_wake_target")
@@ -7221,23 +7420,33 @@ def mcp_job_add_wake_target(
 
     Pass a full target dict ({"type", "events", ...config}) as ``target``, or
     use the shorthand: ``type`` (required, one of local_command /
-    codex_cli_thread / codex_desktop / opencode_thread / webhook) plus optional
-    ``events`` and ``config`` (extra target config). Events default to
-    ["completed", "failed"].
+    codex_cli_thread / codex_thread / codex_desktop / opencode_thread / webhook)
+    plus optional ``events`` and ``config`` (extra target config). Events default
+    to ["completed", "failed"].
 
     This only schedules a target for events that will occur AFTER registration.
     To surface a wake immediately (even if the event already fired), use
-    ``job_wake_now``. ``opencode_thread`` targets require an explicit
-    ``session_id`` (OpenCode cannot auto-inherit one — review P1-1) and an
-    ``attach`` server URL so the wake reaches the visible client's server.
+    ``job_wake_now``. ``opencode_thread`` targets need ``session_id`` — the
+    OpenCode ``ses_...`` id (from ``opencode session list``, or the destination
+    ``vanth doctor`` prints), NOT the relay client id ``opencode-<pid>-<rand>``;
+    omit it to resolve the live plugin relay for the job's directory. ``attach``
+    is optional (only for a headless ``opencode serve``).
     ``codex_desktop`` targets wake a RUNNING Codex Desktop task through its
     native app-tools host pipe (requires the Desktop integration).
+
+    Caller-task inheritance is resolved HERE, in the MCP process that owns the
+    calling task: a ``codex_cli_thread``/``codex_thread``/``codex_desktop``
+    target without an explicit ``thread_id`` inherits the calling Codex task
+    identity (``CODEX_THREAD_ID`` / ``VANTH_CODEX_DESKTOP_THREAD``).
 
     Registered under the external MCP name ``job_add_wake_target`` (the rc37
     contract); ``mcp_`` is only an implementation-prefix for the Python callable
     (review rc38 P1 — clients must not learn prefix names).
     """
+    origin_thread_id = _mcp_origin_thread_id()
     resolved = _mcp_wake_payload(target, events, type, config)
+    if origin_thread_id:
+        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
@@ -7255,9 +7464,12 @@ def mcp_job_wake_now(
     target AND enqueues a synthetic delivery right away, so the wake reaches the
     target session without waiting for a matching event. Use ``target`` as a
     full dict, or the shorthand: ``type`` (required) + ``events`` + ``config``
-    (extra target config kwargs). ``opencode_thread`` targets require an
-    explicit ``session_id`` and ``attach`` (the opencode server URL so the wake
-    hits the visible client's server).
+    (extra target config kwargs). ``opencode_thread`` targets need ``session_id``
+    — the OpenCode ``ses_...`` id (from ``opencode session list``, or the
+    destination ``vanth doctor`` prints), NOT the relay client id
+    ``opencode-<pid>-<rand>``; omit it to resolve the live plugin relay for the
+    job's directory. ``attach`` is optional (only for a headless ``opencode
+    serve``).
 
     Caller-task inheritance is resolved HERE, in the MCP process that owns the
     calling task (review P0-2): a ``codex_cli_thread``/``codex_thread``/
@@ -7268,7 +7480,7 @@ def mcp_job_wake_now(
     contract); ``mcp_`` is only an implementation-prefix for the Python callable
     (review rc38 P1 — clients must not learn prefix names).
     """
-    origin_thread_id = os.environ.get("CODEX_THREAD_ID") or os.environ.get("VANTH_CODEX_DESKTOP_THREAD")
+    origin_thread_id = _mcp_origin_thread_id()
     resolved = _mcp_wake_payload(target, events, type, config)
     if origin_thread_id:
         resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
@@ -7289,13 +7501,16 @@ def mcp_daemon_wake(
     ``job_wake_now`` to surface a wake immediately. This alias registers the
     target only (matching the original semantics). ``config`` holds extra
     target config kwargs. Supported types include local_command /
-    codex_cli_thread / codex_desktop / opencode_thread / webhook.
+    codex_cli_thread / codex_thread / codex_desktop / opencode_thread / webhook.
 
     Registered under the external MCP name ``daemon_wake`` (the rc37 contract);
     ``mcp_`` is only an implementation-prefix for the Python callable (review
     rc38 P1 — clients must not learn prefix names).
     """
+    origin_thread_id = _mcp_origin_thread_id()
     resolved = _mcp_wake_payload(target, events, type, config)
+    if origin_thread_id:
+        resolved = resolve_wake_target_identity([resolved], origin_thread_id)[0]
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
@@ -7311,7 +7526,7 @@ _VANTH_CLI_GLOBAL_FLAGS = {"--json"}
 _VANTH_CLI_SUBCOMMANDS = {
     "status", "doctor", "restart", "setup", "--help", "-h", "help",
     "start", "list", "ps", "logs", "tail", "stop", "deliveries", "api",
-    "artifacts", "prune", "backup", "restore", "wait", "diff",
+    "artifacts", "prune", "backup", "restore", "wait", "diff", "wake",
     "autostart", "--version", "version", "remote",
 }
 

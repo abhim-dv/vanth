@@ -1116,6 +1116,47 @@ class TestRelay:
         finally:
             manager.close()
 
+    def test_session_id_alias_is_canonicalized_to_thread_id(self, tmp_path):
+        """A codex_desktop target naming its thread via `session_id` is accepted
+        by validation, so it must be canonicalized to `thread_id` (the key the
+        relay SQL reads) — otherwise it is silently never claimed."""
+        manager = JobManager(tmp_path / "state", recover=False)
+        try:
+            manager.relay_register(
+                "client_1", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_alias"}]
+            )
+
+            async def main():
+                job = await manager.start(
+                    shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
+                    wake_targets=[{"type": "codex_desktop", "events": ["completed"], "session_id": "thread_alias"}],
+                )
+                await manager.wait(job["job_id"], ["completed"], timeout_seconds=30)
+                return job["job_id"]
+
+            asyncio.run(main())
+            polled = manager.relay_poll("client_1", timeout_seconds=1)
+            assert polled, "a delivery registered with session_id must be pollable"
+            assert polled[0]["payload"]["target"].get("thread_id") == "thread_alias"
+        finally:
+            manager.close()
+
+    def test_relay_client_id_in_thread_id_is_rejected(self, tmp_path):
+        manager = JobManager(tmp_path / "state", recover=False)
+        try:
+            manager.relay_register(
+                "mcp-1234-abcd", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_real"}]
+            )
+            with pytest.raises(ValueError, match="relay client id"):
+                asyncio.run(
+                    manager.start(
+                        shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
+                        wake_targets=[{"type": "codex_desktop", "events": ["completed"], "thread_id": "mcp-1234-abcd"}],
+                    )
+                )
+        finally:
+            manager.close()
+
     def test_sql_filter_before_limit_no_starvation(self, tmp_path):
         manager = JobManager(tmp_path / "state", recover=False)
         try:

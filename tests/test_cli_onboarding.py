@@ -186,3 +186,75 @@ def test_job_id_resolution_degrades_when_listing_fails():
             raise RuntimeError("daemon down")
 
     assert cli._resolve_job_id(_Broken(), "job_x") == ("job_x", "")
+
+
+def test_wake_registers_a_target_after_the_job_started(monkeypatch, capsys):
+    """Adding a wake to an in-flight job is the documented MCP capability; the
+    CLI must reach the same /wake route (and /wake-now with --now)."""
+    monkeypatch.setattr(cli, "VanthClient", _RecordingVanth)
+    rc = cli.main([
+        "wake", "job_1", "--type", "opencode_thread", "--events", "completed",
+        "--cwd", "F:\\git\\persistent-gdn", "--config", '{"session_id": "ses_x"}',
+    ])
+    assert rc == 0, capsys.readouterr().err
+    captured = _RecordingVanth.captured
+    assert captured["path"] == "/jobs/job_1/wake"
+    assert captured["target"] == {
+        "type": "opencode_thread",
+        "events": ["completed"],
+        "cwd": "F:\\git\\persistent-gdn",
+        "session_id": "ses_x",
+    }
+
+
+def test_wake_now_posts_to_the_wake_now_route(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "VanthClient", _RecordingVanth)
+    rc = cli.main(["wake", "job_1", "--now", "--type", "local_command",
+                   "--config", '{"command": ["echo", "hi"]}'])
+    assert rc == 0, capsys.readouterr().err
+    assert _RecordingVanth.captured["path"] == "/jobs/job_1/wake-now"
+    assert _RecordingVanth.captured["target"]["events"] == ["completed", "failed"]
+
+
+def test_wake_requires_a_type_or_full_target(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "VanthClient", _RecordingVanth)
+    assert cli.main(["wake", "job_1"]) == 2
+    assert "--type is required" in capsys.readouterr().err
+
+
+def test_json_options_accept_a_file_and_stdin(tmp_path):
+    """PowerShell 5.1 strips the quotes from a JSON literal handed to a native
+    executable, so `@path` and `-` (stdin) must work for the JSON options."""
+    wake_file = tmp_path / "wake.json"
+    wake_file.write_text('{"type": "opencode_thread", "events": ["completed"]}', encoding="utf-8")
+    assert cli._load_json_object(f"@{wake_file}", "--wake") == {
+        "type": "opencode_thread",
+        "events": ["completed"],
+    }
+    assert cli._load_json_object('{"a": 1}', "--wake") == {"a": 1}
+    with pytest.raises(ValueError, match="expects a JSON object"):
+        cli._load_json_object("[1, 2]", "--wake")
+    with pytest.raises(ValueError, match="cannot read"):
+        cli._load_json_object("@/no/such/file.json", "--wake")
+
+
+def test_start_reads_wake_json_from_a_file(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli, "VanthClient", _RecordingVanth)
+    wake_file = tmp_path / "wake.json"
+    wake_file.write_text('{"type": "opencode_thread", "events": ["completed"]}', encoding="utf-8")
+    rc = cli.main(["start", "--name", "j", "--wake", f"@{wake_file}", "--", "echo", "hi"])
+    assert rc == 0, capsys.readouterr().err
+    assert _RecordingVanth.captured["wake_targets"] == [
+        {"type": "opencode_thread", "events": ["completed"]}
+    ]
+
+
+def test_start_reads_trigger_json_from_stdin(monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr(cli, "VanthClient", _RecordingVanth)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"job_id": "job_x", "status": "completed"}'))
+    rc = cli.main(["start", "--trigger", "-", "--", "echo", "hi"])
+    assert rc == 0, capsys.readouterr().err
+    assert _RecordingVanth.captured["trigger"] == {"job_id": "job_x", "status": "completed"}
+

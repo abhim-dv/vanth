@@ -136,6 +136,7 @@ for scripts.
 | `vanth start [options] [--] <command...>` | Start a background job without MCP. Options: `--name`, `--cwd`, `--timeout`, `--env K=V`, `--wake JSON`, `--interactive`, `--priority`, `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`, `--policy JSON`; `--` passes command flags verbatim |
 | `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`); defaults to in-flight (launching/queued/running/…), `--all` shows finished jobs; running jobs show DURATION and AGE |
 | `vanth deliveries [--status S] [--job JOB_ID] [--limit N] [--json]` | List wake deliveries, attempts, and last errors |
+| `vanth wake <job_id> [--now] [--type T] [--events a,b] [--cwd DIR] [--config JSON] [--target JSON]` | Add a wake target to a job **after it started** (in-flight or finished). Fires on future events; `--now` surfaces a synthetic wake immediately. CLI counterpart of `job_add_wake_target` / `job_wake_now` |
 | `vanth api` | Print the loopback HTTP surface and authentication details |
 | `vanth logs <job_id>` (`tail` alias) | Show a job's output (`--stream stdout\|stderr\|all`, `--offset`, `--max-bytes`, `--grep`, `--json`) |
 | `vanth wait <job_id>` | Block until an event fires (the CLI `job_wait`): `--events completed,failed`, `--timeout SECONDS`, `--since-event-id ID`. Exits 0 on the event, 3 on timeout |
@@ -847,6 +848,24 @@ When a job emits a matching event, the daemon creates a durable delivery and
 dispatches it through the adapter. Delivery is **at-least-once**; every payload
 carries a `delivery_id` for deduplication.
 
+Targets are not fixed at start time. `POST /jobs/{id}/wake` (MCP
+`job_add_wake_target`, CLI `vanth wake`) registers a target on a job that is
+already running or finished — it fires on events **after** registration.
+`POST /jobs/{id}/wake-now` (MCP `job_wake_now`, CLI `vanth wake --now`)
+registers the target AND enqueues a synthetic `"wake_now"` delivery at once, so
+a wake reaches the session even if the triggering event already fired; it never
+fabricates a `"completed"`/`"failed"` event.
+
+**Thread identity.** `codex_cli_thread` / `codex_desktop` targets omit the id and
+inherit the calling task's (`CODEX_THREAD_ID` / `VANTH_CODEX_DESKTOP_THREAD`);
+an explicit `thread_id` always wins. `opencode_thread` does **not** inherit the
+calling session (OpenCode never injects `OPENCODE_SESSION_ID` into MCP
+subprocesses): it resolves the session from the newest live plugin relay
+registered for the job's `cwd` (see `vanth doctor`), and otherwise requires an
+explicit `session_id`. A target naming an explicit session can be resumed by a
+subprocess (`opencode run --session`); the plugin relay is what lands the prompt
+in the TUI you are watching.
+
 ### local_command
 
 Runs an arbitrary command, passing the delivery payload as JSON on stdin:
@@ -1232,6 +1251,8 @@ route details.
 | GET | `/jobs` | List jobs (`status`, `limit`, `thread_id`, `name`, `tags`); includes lifecycle timestamps, exit code, and runtime |
 | POST | `/jobs` | Start a job |
 | POST | `/jobs/{id}/rerun` | Rerun a job with its original configuration |
+| POST | `/jobs/{id}/wake` | Register a wake target for the job's FUTURE events, after the job started (`target`) |
+| POST | `/jobs/{id}/wake-now` | Register a wake target and surface a synthetic wake immediately (`target`) |
 | GET | `/jobs/{id}/status` | Job status (includes command/env/cwd) |
 | GET | `/jobs/{id}/events` | Events (`since_event_id`, `types`, `limit`, `reverse`) |
 | GET | `/jobs/{id}/metrics` | Metric series (`metric`, `from_ms`, `to_ms`, `limit`) |

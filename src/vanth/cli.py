@@ -322,7 +322,19 @@ def cmd_doctor(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                 age = relay.get("last_poll_age_seconds")
                 state = "live" if relay.get("live") else "STALE"
                 age_text = "never polled" if age is None else f"last poll {_humanize(age)} ago"
-                print(f"  relay:         {relay.get('client_type')} {relay.get('client_id')} {state} ({age_text})")
+                sessions = sorted(
+                    {
+                        d.get("session_id") or d.get("thread_id")
+                        for d in relay.get("destinations") or []
+                        if isinstance(d, dict) and (d.get("session_id") or d.get("thread_id"))
+                    }
+                )
+                # Show the wake DESTINATION (session_id) first: the client_id is
+                # the long-poll identity, not a wake target, and copying it into a
+                # target silently never wakes (see _reject_relay_client_id_sessions).
+                target_ids = ", ".join(sessions) if sessions else "(no destination)"
+                print(f"  relay:         {relay.get('client_type')} {target_ids} "
+                      f"[client {relay.get('client_id')}] {state} ({age_text})")
         else:
             print("  relay:         none - codex_desktop/opencode_thread wakes cannot be delivered")
         dead = report.get("dead_lettered") or []
@@ -747,6 +759,36 @@ def _join_command(tokens: list[str]) -> str:
     return shlex.join(tokens)
 
 
+def _load_json_object(value: str, arg: str) -> dict[str, Any]:
+    """Parse a JSON object from a literal, a file path (``@path``), or stdin (``-``).
+
+    The file/stdin forms exist because PowerShell 5.1 strips the quotes from a
+    JSON literal handed to a native executable, so ``--wake '{...}'`` is
+    unusable there. ``--wake @wake.json`` (or ``--wake -``) is the reliable form
+    on any shell. Raises ``ValueError`` with an actionable message.
+    """
+    if value == "-":
+        text = sys.stdin.read()
+    elif value.startswith("@"):
+        path = value[1:]
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"{arg}: cannot read {path!r}: {exc}") from exc
+    else:
+        text = value
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        raise ValueError(
+            f"{arg} expects a JSON object, got {value!r} "
+            "(pass a literal, `@path` to read a file, or `-` for stdin)"
+        ) from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{arg} expects a JSON object")
+    return parsed
+
+
 def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     """Start a background job without the MCP tools.
 
@@ -800,12 +842,9 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                     return 2
             elif arg in {"--trigger", "--policy"}:
                 try:
-                    parsed = json.loads(value)
-                except ValueError:
-                    print(f"vanth start: {arg} expects a JSON object, got {value!r}", file=sys.stderr)
-                    return 2
-                if not isinstance(parsed, dict):
-                    print(f"vanth start: {arg} expects a JSON object", file=sys.stderr)
+                    parsed = _load_json_object(value, arg)
+                except ValueError as exc:
+                    print(f"vanth start: {exc}", file=sys.stderr)
                     return 2
                 payload["trigger" if arg == "--trigger" else "policy"] = parsed
             elif arg == "--timeout":
@@ -826,12 +865,9 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                 env[key] = val
             elif arg == "--wake":
                 try:
-                    target = json.loads(value)
-                except ValueError:
-                    print(f"vanth start: --wake expects a JSON object, got {value!r}", file=sys.stderr)
-                    return 2
-                if not isinstance(target, dict):
-                    print("vanth start: --wake expects a JSON object", file=sys.stderr)
+                    target = _load_json_object(value, "--wake")
+                except ValueError as exc:
+                    print(f"vanth start: {exc}", file=sys.stderr)
                     return 2
                 wake.append(target)
         elif arg == "--interactive":
@@ -1450,6 +1486,101 @@ def cmd_deliveries(argv: list[str], home: Path, *, json_out: bool = False) -> in
     return 0
 
 
+def cmd_wake(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    """Register a wake target on a job after the fact (the CLI counterpart of
+    the MCP `job_add_wake_target` / `job_wake_now`).
+
+    Works on an in-flight or finished job: ``--now`` surfaces a synthetic wake
+    immediately, otherwise the target fires on the job's FUTURE events.
+    """
+    if not argv:
+        print("vanth wake: missing job id", file=sys.stderr)
+        return 2
+    job_id = argv[0]
+    now = False
+    target_type: str | None = None
+    events: list[str] | None = None
+    config: dict[str, Any] = {}
+    target: dict[str, Any] | None = None
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--now":
+            now = True
+        elif arg in {"--type", "--events", "--config", "--cwd", "--target"}:
+            i += 1
+            if i >= len(argv):
+                print(f"vanth wake: {arg} requires a value", file=sys.stderr)
+                return 2
+            value = argv[i]
+            if arg == "--type":
+                target_type = value
+            elif arg == "--cwd":
+                config["cwd"] = value
+            elif arg == "--events":
+                events = [part.strip() for part in value.split(",") if part.strip()]
+                if not events:
+                    print("vanth wake: --events requires a non-empty comma-separated list", file=sys.stderr)
+                    return 2
+            elif arg == "--target":
+                try:
+                    target = _load_json_object(value, "--target")
+                except ValueError as exc:
+                    print(f"vanth wake: {exc}", file=sys.stderr)
+                    return 2
+            else:
+                try:
+                    parsed = _load_json_object(value, "--config")
+                except ValueError as exc:
+                    print(f"vanth wake: {exc}", file=sys.stderr)
+                    return 2
+                config.update(parsed)
+        else:
+            print(f"vanth wake: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    if target is None:
+        if not target_type:
+            print("vanth wake: --type is required (or pass --target JSON)", file=sys.stderr)
+            return 2
+        target = {"type": target_type, "events": events or ["completed", "failed"], **config}
+    elif target_type or events or config:
+        # A supplied --target is posted verbatim, so --type/--events/--cwd/--config
+        # would be silently ignored. Reject the mixture instead of dropping input.
+        print(
+            "vanth wake: --target cannot be combined with --type/--events/--cwd/--config",
+            file=sys.stderr,
+        )
+        return 2
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+    except Exception as exc:
+        print(f"vanth wake: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    job_id, problem = _requiring_job_id(client, job_id, "wake")
+    if problem:
+        return problem
+    route = "wake-now" if now else "wake"
+    try:
+        result = client.post(f"/jobs/{job_id}/{route}", {"target": target})
+    except Exception as exc:
+        print(f"vanth wake: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        print(f"vanth wake: daemon error: {result.get('error') or result}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        verb = "surfaced" if now else "registered"
+        print(
+            f"vanth wake: {verb} {result.get('target_type') or target.get('type')} wake on "
+            f"{job_id} {result.get('events') or target.get('events')}"
+        )
+    return 0
+
+
 _HTTP_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/health (no auth)"),
     ("GET", "/ready | /doctor | /metrics"),
@@ -1458,6 +1589,7 @@ _HTTP_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/view | /deliveries | /decisions | /schedules | /pools"),
     ("POST", "/jobs  (add `remote_id` to run on a paired host)"),
     ("POST", "/jobs/{id}/stop | /send | /pause | /resume | /rerun | /wait"),
+    ("POST", "/jobs/{id}/wake | /wake-now  (add a wake target after the fact)"),
     ("POST", "/deliveries/{id}/mark | /retry | /deliveries/clear"),
     ("POST", "/cleanup | /reap-orphans | /shutdown"),
     ("POST", "/artifacts/put | /put-dir | /materialize | /verify | /gc | ..."),
@@ -1694,6 +1826,7 @@ def _usage() -> str:
         "  wait           block until a job emits an event (CLI job_wait)\n"
         "  diff           diff the run specs of two jobs\n"
         "  stop           stop a running job\n"
+        "  wake           add a wake target to a job after it started (--now to fire once)\n"
         "  deliveries     list wake deliveries (--status failed shows why)\n"
         "  artifacts      list a job's artifacts\n"
         "  backup         write one archive of jobs + artifacts + events\n"
@@ -1726,6 +1859,7 @@ def _usage() -> str:
         "  job_wait    -> vanth wait <id>               job_stop  -> vanth stop <id>\n"
         "  job_status  -> vanth status <id>             job_list  -> vanth list [--all]\n"
         "  job_rerun   -> vanth start --name N -- <command>   job_view -> vanth list\n"
+        "  job_add_wake_target / job_wake_now -> vanth wake <id> [--now]\n"
         "  full workflow: vanth start -- ping -n 30 127.0.0.1\n"
         "                 vanth wait <id> --events completed,failed\n"
         "                 vanth status <id> && vanth logs <id>\n"
@@ -1759,7 +1893,8 @@ _COMMAND_HELP: dict[str, str] = {
             "  MCP `job_view`.\n"
             "  example: vanth list --all --name train --limit 10\n",
     "start": "usage: vanth start [--name N] [--cwd DIR] [--timeout S] [--env K=V]...\n"
-             "                  [--wake JSON]... [--interactive] [--] <command...>\n"
+             "                  [--wake JSON|@FILE|-]... [--trigger JSON|@FILE|-]\n"
+             "                  [--interactive] [--] <command...>\n"
              "  Start a background job (the non-MCP front door).\n"
              "\n"
              "  options: --name --cwd --timeout --env --wake --interactive --priority\n"
@@ -1770,6 +1905,13 @@ _COMMAND_HELP: dict[str, str] = {
              "  as one double-quoted string with NO quotes inside it, or use a script\n"
              "  file. A single-quoted string containing inner \" is split into garbage\n"
              "  arguments by PowerShell 5.1; % ! and \" cannot be encoded either.\n"
+             "  JSON options (--wake/--trigger/--policy) hit the same quoting wall:\n"
+             "  write the object to a file and pass @path (or @- for stdin).\n"
+             "\n"
+             "  wakes: --wake '{\"type\":\"opencode_thread\",\"events\":[\"completed\"]}'\n"
+             "  needs NO session_id — the daemon resolves the live OpenCode plugin\n"
+             "  relay for --cwd. Add \"session_id\":\"ses_...\" only to target a specific\n"
+             "  session; never use the relay client id (opencode-<pid>-<rand>).\n"
              "\n"
              "  examples:\n"
              "    vanth start -- python train.py --epochs 10\n"
@@ -1778,6 +1920,7 @@ _COMMAND_HELP: dict[str, str] = {
              "    vanth start \"cmd /c ping -n 15 host >nul && echo ONBOARD_MARKER\"\n"
              "    vanth start \"cmd /c ping -n 30 host >nul && echo done\"   # one string\n"
              "    vanth start -- run.cmd                                 # script file\n"
+             "    vanth start --name j --wake @wake.json -- make -j8     # JSON from a file\n"
              "    vanth start --name j --wake '{\"type\":\"opencode_thread\",\"events\":[\"completed\"]}' -- make -j8\n",
      "logs": "usage: vanth logs <job-id> [--stream stdout|stderr|all] [--max-bytes N]\n"
              "                   [--offset N] [--grep TEXT] [--json]\n"
@@ -1801,6 +1944,25 @@ _COMMAND_HELP: dict[str, str] = {
              "  example: vanth stop job_abc123 --signal kill && vanth status job_abc123\n",
     "deliveries": "usage: vanth deliveries [--status delivered|failed|pending] [--job-id ID] [--json]\n"
                   "  Wake deliveries, so a nonzero `failed` count is actionable.\n",
+    "wake": "usage: vanth wake <job-id> [--now] [--type TYPE] [--events a,b]\n"
+            "                  [--cwd DIR] [--config JSON|@FILE|-] [--target JSON|@FILE|-]\n"
+            "                  [--json]\n"
+            "  Register a wake target on a job AFTER it started (the CLI counterpart\n"
+            "  of the MCP `job_add_wake_target`). Fires on the job's FUTURE events;\n"
+            "  --now surfaces a synthetic wake immediately instead (job_wake_now).\n"
+            "  --type is required unless --target gives a full dict: local_command /\n"
+            "  codex_cli_thread / codex_thread / codex_desktop / opencode_thread /\n"
+            "  webhook. JSON options accept @path (a file) or - (stdin) to dodge\n"
+            "  PowerShell 5.1 quote stripping.\n"
+            "  opencode_thread resolves the session from a live plugin relay for the\n"
+            "  job's cwd; otherwise pass session_id (the OpenCode ses_... id from\n"
+            "  `opencode session list` or the destination in `vanth doctor`) inside\n"
+            "  --config. NOT the relay client id (opencode-<pid>-<rand>) — that is the\n"
+            "  long-poll identity and never wakes. attach is optional (headless serve).\n"
+            "  Events default to completed,failed.\n"
+            "  examples: vanth wake job_abc123 --type opencode_thread --events completed\n"
+            "            vanth wake job_abc123 --now --type local_command \\\n"
+            "              --config '{\"command\": [\"echo\", \"done\"]}'\n",
     "artifacts": "usage: vanth artifacts <job-id> [--limit N] [--json]\n"
                  "  Artifacts attached to a job.\n",
     "diff": "usage: vanth diff <job-id> <other-job-id> [--json]\n"
@@ -1873,6 +2035,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stop(argv[1:], home, json_out=json_out)
     if command == "deliveries":
         return cmd_deliveries(argv[1:], home, json_out=json_out)
+    if command == "wake":
+        return cmd_wake(argv[1:], home, json_out=json_out)
     if command == "api":
         return cmd_api(argv[1:], home, json_out=json_out)
     if command == "artifacts":

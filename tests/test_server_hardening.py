@@ -377,3 +377,48 @@ def test_job_start_mcp_tool_is_not_a_coroutine_function():
 
     tool = mcp._tool_manager._tools["job_start"]
     assert inspect.iscoroutinefunction(tool.fn) is False
+
+
+def test_launch_claim_clears_stale_workload_pid(tmp_path):
+    """A re-claim must not carry the previous run's workload pid.
+
+    The row keeps its old `pid` after a failure, so an abandoned re-claim would
+    force-kill whatever process now holds that (recycled) pid. Only the runner
+    may publish a workload pid, at promotion."""
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        job_id = "job_reclaim_pid"
+        stamp = now_iso()
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, "
+                "events_path, pid, worker_pid, runner_heartbeat_at) "
+                "VALUES (?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    "true",
+                    stamp,
+                    stamp,
+                    str(manager.logs / f"{job_id}.stdout.log"),
+                    str(manager.logs / f"{job_id}.stderr.log"),
+                    str(manager.events_dir / f"{job_id}.jsonl"),
+                    os.getpid(),
+                    os.getpid(),
+                    stamp,
+                ),
+            )
+            manager.db.commit()
+
+        token = manager._claim_launch(job_id)
+        assert token
+        row = manager._row(
+            "SELECT status, pid, worker_pid, runner_heartbeat_at FROM jobs WHERE job_id=?", (job_id,)
+        )
+        assert row["status"] == "launching"
+        assert row["pid"] is None
+        assert row["worker_pid"] is None
+        assert row["runner_heartbeat_at"] is None
+    finally:
+        manager.close()

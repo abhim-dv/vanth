@@ -188,6 +188,11 @@ export const VanthPlugin: Plugin = async ({ client, directory }) => {
         await syncRegistration(connection);
         await drain(connection);
       } catch {
+        // A poll failure can mean the daemon expired our subscription (restart
+        // or an outage longer than the relay TTL). Forget the memoized key so
+        // the next pass re-registers instead of polling an unknown client_id
+        // forever — which would silently never wake anything.
+        registeredKey = "";
         await sleep(POLL_ERROR_BACKOFF_MS);
       }
     }

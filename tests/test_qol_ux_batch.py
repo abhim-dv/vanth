@@ -117,6 +117,28 @@ def test_trigger_unknown_parent_raises(tmp_path):
         manager.close()
 
 
+def test_trigger_child_cancelled_when_parent_row_is_removed(tmp_path):
+    """A pruned/removed parent can never satisfy the gate, so the child must be
+    cancelled rather than left `queued` forever with no event (silent stuck)."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        # Parent still running, so the DAG gate cannot be satisfied yet.
+        parent = start_job(manager, "import time; time.sleep(30)")
+        child = asyncio.run(manager.start(
+            cmd("print('never runs')"),
+            trigger={"job_id": parent, "status": "completed"},
+        ))
+        child_id = child["job_id"]
+        assert manager.status(child_id)["status"] == "queued"
+        with manager.db_lock:
+            manager.db.execute("DELETE FROM jobs WHERE job_id=?", (parent,))
+            manager.db.commit()
+        manager._dispatch_queued_jobs()
+        assert manager.status(child_id)["status"] == "cancelled"
+    finally:
+        manager.close()
+
+
 def test_stop_queued_job_cancels_without_running(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:

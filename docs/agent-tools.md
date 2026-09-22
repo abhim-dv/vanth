@@ -967,12 +967,12 @@ a wake for an event that already happened. Use `job_wake_now` for that.
 
 Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
 the shorthand: `type` (required, one of `local_command` / `codex_cli_thread` /
-`codex_desktop` / `opencode_thread` / `webhook`) plus optional `events` and
-`config` (a single object holding the extra target config). Events default to
-`["completed", "failed"]`.
+`codex_thread` / `codex_desktop` / `opencode_thread` / `webhook`) plus optional
+`events` and `config` (a single object holding the extra target config). Events
+default to `["completed", "failed"]`.
 
-`codex_cli_thread` / `codex_desktop` targets inherit the calling Codex task's
-thread id (resolved by the MCP wrapper from `CODEX_THREAD_ID` /
+`codex_cli_thread` / `codex_thread` / `codex_desktop` targets inherit the calling
+Codex task's thread id (resolved by the MCP wrapper from `CODEX_THREAD_ID` /
 `VANTH_CODEX_DESKTOP_THREAD`); an explicit `thread_id` always wins.
 `codex_desktop` wakes a RUNNING Desktop task through its native app-tools host
 pipe — it requires the Desktop integration to be provisioned (run `vanth setup
@@ -982,11 +982,16 @@ thread bridge) when it is not. It does not support arbitrary historical or
 unloaded Desktop threads: the private host may accept those sends without
 producing a usable turn. Use `codex_cli_thread` for an unloaded persisted task.
 
-`opencode_thread` targets require an explicit `session_id` (OpenCode does not
-inject `OPENCODE_SESSION_ID` into MCP subprocesses, so Vanth cannot inherit
-it) AND an `attach` URL — the opencode server the visible TUI/client is
-attached to. Without `attach`, `opencode run --session` runs against an
-isolated backend and does not wake the visible client.
+`opencode_thread` targets need `session_id` — the OpenCode session id (`ses_...`,
+from `opencode session list`), **not** the relay client id
+`opencode-<pid>-<rand>` that `vanth doctor` prints as `[client ...]` (a target
+naming a client id is rejected, since the relay matches on the destination
+session and would never claim it). Omit `session_id` entirely to resolve the
+newest live plugin relay registered for the job's `cwd`; the in-process plugin
+then injects the wake into the TUI you are watching. `attach` is optional and
+only needed for a headless `opencode serve` (an explicit `session_id` plus the
+server URL); without a plugin relay and without `attach` there is no visible
+client to wake.
 
 **Parameters**
 
@@ -995,7 +1000,7 @@ isolated backend and does not wake the visible client.
 | `job_id` | `string` | required | Job to register the wake target on |
 | `target` | `object?` | `None` | Full wake-target dict (`{type, events, ...config}`); given, used as-is |
 | `events` | `string[]?` | `["completed","failed"]` | Shorthand; non-empty list of event types (e.g. `["checkpoint"]`) |
-| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `codex_desktop` / `opencode_thread` / `webhook` |
+| `type` | `string?` | required (shorthand) | One of `local_command` / `codex_cli_thread` / `codex_thread` / `codex_desktop` / `opencode_thread` / `webhook` |
 | `config` | `object?` | `{}` | Extra target config (e.g. `{"command": ..., "thread_id": ..., "session_id": ..., "attach": ...}`) merged into the shorthand target |
 
 **Response**
@@ -1014,7 +1019,8 @@ Surface a wake **immediately**, even if the triggering event already fired.
 This is the genuine "wake now" operation: it registers the target AND enqueues
 a synthetic delivery right away, so the wake reaches the target session without
 waiting for a matching event. Same target contract as `job_add_wake_target`;
-`opencode_thread` targets require an explicit `session_id`.
+`opencode_thread` targets need the `ses_...` session id (or omit it to resolve a
+live plugin relay), **not** the relay client id `opencode-<pid>-<rand>`.
 
 **Response**
 
