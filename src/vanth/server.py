@@ -7917,7 +7917,7 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
 _VANTH_CLI_GLOBAL_FLAGS = {"--json"}
 _VANTH_CLI_SUBCOMMANDS = {
     "status", "doctor", "restart", "setup", "--help", "-h", "help",
-    "start", "list", "ps", "logs", "tail", "stop", "deliveries", "api",
+    "start", "list", "ps", "logs", "tail", "stop", "sleep", "deliveries", "api",
     "artifacts", "prune", "backup", "restore", "wait", "diff", "wake",
     "autostart", "--version", "version", "remote",
 }

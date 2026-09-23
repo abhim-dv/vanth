@@ -87,3 +87,20 @@ def test_sleep_requires_positive_integer(capsys, tmp_path):
     assert cli.cmd_sleep(["abc"], tmp_path) == 2
     assert cli.cmd_sleep([], tmp_path) == 2
     assert "positive number" in capsys.readouterr().err
+
+
+def test_server_routes_every_cli_subcommand():
+    """`vanth` is `server.main`, which only routes to the CLI for names in
+    `_VANTH_CLI_SUBCOMMANDS`. A command the CLI dispatches but that set omits is
+    unreachable (this is how `vanth sleep` shipped broken)."""
+    import inspect
+    import re
+
+    from vanth import server
+
+    src = inspect.getsource(cli.main)
+    names = set(re.findall(r'command == "([A-Za-z0-9_-]+)"', src))
+    for block in re.findall(r"command in \{([^}]*)\}", src, re.DOTALL):
+        names |= set(re.findall(r'"([A-Za-z0-9_-]+)"', block))
+    missing = names - server._VANTH_CLI_SUBCOMMANDS
+    assert not missing, f"dispatched by cli.main but unreachable via `vanth`: {sorted(missing)}"

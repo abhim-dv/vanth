@@ -2,6 +2,18 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.12.1 - 2026-09-23
+
+### Fixes
+
+- `vanth sleep <seconds>` was unreachable through the real entrypoint: `vanth`
+  is `server.main`, which routes to the CLI only for names in
+  `_VANTH_CLI_SUBCOMMANDS`, and `sleep` was missing. Added it, plus a parity
+  test asserting every command `cli.main` dispatches is routable via `vanth`.
+- The Go monitor's `LatestSchemaVersion` was not bumped for schemas 17/18, so
+  the monitor rejected a current database (cross-language CI was red). Bumped
+  to 18 and regenerated the committed cross-language fixture.
+
 ## 1.12.0 - 2026-09-23
 
 ### Zero-JSON wakes and agent UX
