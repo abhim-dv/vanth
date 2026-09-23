@@ -123,9 +123,12 @@ def test_mcp_job_start_wake_me_payload(monkeypatch):
     monkeypatch.setattr(server_mod, "get_client", lambda: FakeClient())
     server_mod.job_start(command="echo hi", wake_me=True)
     assert captured["path"] == "/jobs"
-    assert captured["payload"]["wake_targets"] == [
-        {"type": "opencode_thread", "events": ["completed", "failed"]}
-    ]
+    target = captured["payload"]["wake_targets"][0]
+    assert target["type"] == "opencode_thread"
+    assert target["events"] == ["completed", "failed"]
+    assert target["cwd"]  # pins relay resolution to the caller's directory
+    server_mod.job_start(command="echo hi", wake_me=True, cwd="D:\\proj")
+    assert captured["payload"]["wake_targets"][0]["cwd"] == "D:\\proj"
     # Explicit wake_targets win over the shorthand.
     explicit = [{"type": "local_command", "events": ["checkpoint"], "command": ["echo", "hi"]}]
     server_mod.job_start(command="echo hi", wake_me=True, wake_targets=explicit)

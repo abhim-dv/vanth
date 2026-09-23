@@ -18,13 +18,18 @@ class RecordingClient:
 def test_wake_me_forms(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "VanthClient", RecordingClient)
     assert cli.cmd_start(["--wake-me", "--", "echo", "ok"], tmp_path) == 0
-    assert RecordingClient.payload["wake_targets"] == [{
-        "type": "opencode_thread", "events": ["completed", "failed"]
-    }]
+    target = RecordingClient.payload["wake_targets"][0]
+    assert target["type"] == "opencode_thread"
+    assert target["events"] == ["completed", "failed"]
+    assert target["cwd"]  # pins relay resolution to the caller's directory
+
     assert cli.cmd_start(["--wake-me=checkpoint", "--", "echo", "ok"], tmp_path) == 0
-    assert RecordingClient.payload["wake_targets"] == [{
-        "type": "opencode_thread", "events": ["checkpoint"]
-    }]
+    target = RecordingClient.payload["wake_targets"][0]
+    assert target["type"] == "opencode_thread"
+    assert target["events"] == ["checkpoint"]
+
+    assert cli.cmd_start(["--cwd", "D:\\proj", "--wake-me", "--", "echo", "ok"], tmp_path) == 0
+    assert RecordingClient.payload["wake_targets"][0]["cwd"] == "D:\\proj"
 
 
 def test_wake_me_empty_is_usage_error(capsys, tmp_path):

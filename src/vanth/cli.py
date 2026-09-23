@@ -834,6 +834,7 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     payload: dict[str, Any] = {}
     env: dict[str, str] = {}
     wake: list[dict[str, Any]] = []
+    wake_me_events: list[str] | None = None
     tags: list[str] = []
     secret_env: list[str] = []
     command_tokens: list[str] = []
@@ -854,7 +855,7 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            wake.append({"type": "opencode_thread", "events": events})
+            wake_me_events = events
         elif arg in {
             "--name", "--cwd", "--timeout", "--env", "--wake", "--priority",
             "--pool", "--tag", "--notes", "--secret-env", "--trigger", "--policy",
@@ -960,6 +961,15 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     payload["command"] = command
     if env:
         payload["env"] = env
+    if wake_me_events is not None:
+        # Resolve the live plugin relay for the CALLER's directory (the job's
+        # --cwd, else this process's cwd) — an omitted cwd would otherwise match
+        # the newest relay of ANY project and wake an unrelated session.
+        wake.append({
+            "type": "opencode_thread",
+            "events": wake_me_events,
+            "cwd": payload.get("cwd") or os.getcwd(),
+        })
     if wake:
         payload["wake_targets"] = wake
     if tags:

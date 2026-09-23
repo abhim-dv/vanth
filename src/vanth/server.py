@@ -7000,9 +7000,15 @@ def job_start(
     )
     copied_targets: list[dict[str, Any]] | None = None
     if wake_me and wake_targets is None:
-        # Mirror the CLI shorthand: the events MUST be present, because a wake
-        # target with neither events nor notify_on is rejected as empty.
-        wake_targets = [{"type": "opencode_thread", "events": ["completed", "failed"]}]
+        # Mirror the CLI shorthand: the events MUST be present (a wake target
+        # with neither events nor notify_on is rejected as empty), and the
+        # caller's directory pins relay resolution so an omitted session_id does
+        # not resolve an unrelated project's relay.
+        wake_targets = [{
+            "type": "opencode_thread",
+            "events": ["completed", "failed"],
+            "cwd": cwd or os.getcwd(),
+        }]
     if wake_targets is not None:
         copied_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
     return get_client().post(

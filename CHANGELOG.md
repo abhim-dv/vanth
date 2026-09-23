@@ -2,6 +2,16 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.12.2 - 2026-09-23
+
+### Fixes
+
+- `--wake-me` / `job_start(wake_me=True)` with no `cwd` resolved the newest
+  plugin relay of **any** project, so the wake could land in an unrelated
+  session. The shorthand now pins the target's `cwd` to the job's `--cwd` (or
+  the caller's working directory), so relay resolution targets the caller's
+  project.
+
 ## 1.12.1 - 2026-09-23
 
 ### Fixes
