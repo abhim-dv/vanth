@@ -21,6 +21,7 @@ import time
 import pytest
 
 from vanth.client import VanthClient
+from vanth.migrations import LATEST_SCHEMA_VERSION
 from vanth.server import JobManager
 
 
@@ -264,7 +265,7 @@ def test_v15_database_upgrades_to_decisions_table(tmp_path):
 
     reopened = JobManager(home)
     try:
-        assert reopened.doctor()["schema_version"] == 16
+        assert reopened.doctor()["schema_version"] == LATEST_SCHEMA_VERSION
         assert reopened.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='decisions'"
         ).fetchone() is not None

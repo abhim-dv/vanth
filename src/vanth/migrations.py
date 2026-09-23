@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 16
+LATEST_SCHEMA_VERSION = 18
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -70,10 +70,13 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_events_job_seq ON events(job_id, seq);
         CREATE INDEX IF NOT EXISTS idx_events_job_type_seq ON events(job_id, type, seq);
         CREATE TABLE IF NOT EXISTS wake_targets (
-          target_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, type TEXT NOT NULL,
+          target_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, remote_id TEXT, type TEXT NOT NULL,
           events_json TEXT NOT NULL, config_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_wake_targets_job ON wake_targets(job_id);
+        CREATE TABLE IF NOT EXISTS remote_event_cursors (
+          binding_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL, updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS deliveries (
           delivery_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, target_id TEXT NOT NULL,
           job_id TEXT NOT NULL, target_type TEXT NOT NULL, status TEXT NOT NULL,
@@ -132,7 +135,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_decisions_job ON decisions(job_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_decisions_pending ON decisions(status, expires_at);
-        PRAGMA user_version=16;
+        PRAGMA user_version=18;
         """
     )
 
@@ -338,6 +341,20 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 db.execute("CREATE INDEX IF NOT EXISTS idx_decisions_pending ON decisions(status, expires_at)")
                 db.execute("PRAGMA user_version=16")
                 version = 16
+            if version < 17:
+                _add_missing(db, "wake_targets", {"remote_id": "TEXT"})
+                db.execute("PRAGMA user_version=17")
+                version = 17
+            if version < 18:
+                db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS remote_event_cursors (
+                      binding_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL, updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                db.execute("PRAGMA user_version=18")
+                version = 18
             db.commit()
         except Exception:
             db.rollback()

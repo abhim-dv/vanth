@@ -103,6 +103,25 @@ class RequestJournal:
             )
             self.db.commit()
 
+    def prune_resolved(self, older_than_seconds: int) -> int:
+        """Delete resolved entries past a TTL.
+
+        Pending entries are kept — they are the retry handles `vanth remote
+        pending` surfaces. The poll loop journals a fresh request per tick, so
+        resolved entries would otherwise accumulate forever.
+        """
+        if older_than_seconds <= 0:
+            return 0
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+        with self._lock:
+            cursor = self.db.execute(
+                "DELETE FROM client_requests WHERE status='resolved' AND updated_at <= ?", (cutoff,)
+            )
+            self.db.commit()
+        return cursor.rowcount
+
     # -- reads (CLI) -------------------------------------------------------------
 
     def pending(self, remote_id: str | None = None) -> list[dict[str, Any]]:

@@ -337,6 +337,12 @@ def cmd_doctor(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                       f"[client {relay.get('client_id')}] {state} ({age_text})")
         else:
             print("  relay:         none - codex_desktop/opencode_thread wakes cannot be delivered")
+        undeliverable_wakes = report.get("undeliverable_wakes", 0)
+        if undeliverable_wakes > 0:
+            print(
+                f"  wake_targets:  {undeliverable_wakes} undeliverable "
+                "(these wakes can never fire; inspect with `vanth deliveries --status pending`)"
+            )
         dead = report.get("dead_lettered") or []
         if dead:
             print(f"  dead_letters:  {report.get('dead_letter_count')} (inspect with `vanth deliveries --status failed`)")
@@ -744,6 +750,30 @@ def _quote_for_cmd(token: str) -> str:
     return f'"{token}"'
 
 
+#: A shell operator/redirect that arrived as its OWN argv token is the mangling
+#: signature: ``_quote_for_cmd`` then wraps it in quotes, so cmd.exe sees a
+#: literal ``">nul"``/``"&&"`` argument instead of a redirect/chain and the job
+#: silently does the wrong thing. An operator INSIDE a larger token (``rg
+#: "a|b"``) is quoted as a whole and is therefore safe, so it must NOT be
+#: refused.
+_SHELL_OPERATOR_TOKENS = {"&", "&&", "|", "||", ">", ">>", "<", "<<"}
+
+
+def _is_shell_operator_token(token: str) -> bool:
+    stripped = token.strip()
+    if not stripped:
+        return False
+    # A bare operator, or an output redirect (`>nul`, `>>log`) — a redirect is
+    # unambiguously shell syntax, whereas a leading `<` (`<html>`, `<foo>`) is
+    # commonly literal data, so it is refused only when the token IS the
+    # operator.
+    if stripped in _SHELL_OPERATOR_TOKENS or stripped.startswith(">"):
+        return True
+    # A file-descriptor redirect (`2>`, `2>&1`, `1>>log`) starts with a digit
+    # before the operator.
+    return bool(re.match(r"^\d+(>>?|<<?)", stripped))
+
+
 def _join_command(tokens: list[str]) -> str:
     """Reassemble argv into a shell command string using the HOST shell's quoting.
 
@@ -794,7 +824,7 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
 
     Usage:
       vanth start [--name N] [--cwd DIR] [--env KEY=VAL]... [--timeout SECONDS]
-                  [--wake JSON]... [--interactive] [--] <command...>
+                  [--wake JSON]... [--wake-me[=EVENTS]] [--interactive] [--] <command...>
 
     The command is the first non-option argument onward. A single argument is
     used verbatim; multiple arguments are re-quoted for the host shell so the
@@ -813,7 +843,19 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         if arg == "--":
             command_tokens = list(argv[i + 1:])
             break
-        if arg in {
+        if arg == "--wake-me" or arg.startswith("--wake-me="):
+            value = arg.partition("=")[2] if "=" in arg else "completed,failed"
+            parts = value.split(",")
+            events = [part.strip() for part in parts]
+            if not value or any(not event or not re.fullmatch(r"[A-Za-z0-9_.:-]+", event) for event in events):
+                print(
+                    "vanth start: --wake-me expects a non-empty comma-separated event list "
+                    "(e.g. completed,failed)",
+                    file=sys.stderr,
+                )
+                return 2
+            wake.append({"type": "opencode_thread", "events": events})
+        elif arg in {
             "--name", "--cwd", "--timeout", "--env", "--wake", "--priority",
             "--pool", "--tag", "--notes", "--secret-env", "--trigger", "--policy",
         }:
@@ -900,16 +942,21 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     # from separate argv elements is where quoting goes wrong (the reported
     # failure: PowerShell 5.1 split a single-quoted command containing inner
     # quotes into garbage argv, and the joined command then died in cmd.exe).
-    # Warn instead of silently running something the caller did not mean.
-    if len(command_tokens) > 1 and any(op in command for op in ("&&", "||", "|", ">", "<")):
+    # Refuse instead of silently running something the caller did not mean.
+    # Keyed on TOKENS, not the joined string: a bare `>nul`/`&&` argv element
+    # was meant as shell syntax but `_quote_for_cmd` neutralises it into a
+    # literal argument, whereas an operator inside a larger token (`rg "a|b"`)
+    # is safe and must be allowed.
+    if len(command_tokens) > 1 and any(_is_shell_operator_token(token) for token in command_tokens):
         print(
-            "vanth start: note: this command uses shell operators (&&, |, >) and was reassembled "
-            "from separate arguments.\n"
-            "  On Windows the reliable forms are one quoted string - "
+            "vanth start: refusing reassembled command (a bare shell operator was passed as its own argument):\n"
+            f"  {command}\n"
+            "  Pass the whole command as ONE quoted string - "
             '`vanth start "cmd /c ping -n 3 host >nul && echo done"` -\n'
             "  or a script file: write the steps to `run.cmd` and `vanth start -- run.cmd`.",
             file=sys.stderr,
         )
+        return 2
     payload["command"] = command
     if env:
         payload["env"] = env
@@ -929,12 +976,34 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     if not _expect_ok(result):
         print(f"vanth start: {result.get('error') or result}", file=sys.stderr)
         return 1
+    for warning in result.get("warnings") or []:
+        print(f"vanth start: warning: {warning}", file=sys.stderr)
     if json_out:
         print(json.dumps(result, indent=2, default=str))
     else:
         print(f"started {result.get('job_id')} ({result.get('status')})")
         print(f"  watch: vanth logs {result.get('job_id')}")
     return 0
+
+
+def cmd_sleep(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    """Start a background job that sleeps for the requested seconds."""
+    if len(argv) != 1:
+        print("vanth sleep: expected exactly one positive number of seconds", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"[0-9]+", argv[0].strip()) or int(argv[0]) <= 0:
+        print("vanth sleep: expected exactly one positive number of seconds", file=sys.stderr)
+        return 2
+    seconds = int(argv[0])
+    return cmd_start(
+        [
+            "--name", f"sleep-{seconds}s",
+            "--timeout", str(seconds + 60),
+            "--", sys.executable, "-c", f"import time; time.sleep({seconds})",
+        ],
+        home,
+        json_out=json_out,
+    )
 
 
 def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
@@ -1826,6 +1895,7 @@ def _usage() -> str:
         "  wait           block until a job emits an event (CLI job_wait)\n"
         "  diff           diff the run specs of two jobs\n"
         "  stop           stop a running job\n"
+        "  sleep          start a background sleep job\n"
         "  wake           add a wake target to a job after it started (--now to fire once)\n"
         "  deliveries     list wake deliveries (--status failed shows why)\n"
         "  artifacts      list a job's artifacts\n"
@@ -1860,7 +1930,7 @@ def _usage() -> str:
         "  job_status  -> vanth status <id>             job_list  -> vanth list [--all]\n"
         "  job_rerun   -> vanth start --name N -- <command>   job_view -> vanth list\n"
         "  job_add_wake_target / job_wake_now -> vanth wake <id> [--now]\n"
-        "  full workflow: vanth start -- ping -n 30 127.0.0.1\n"
+        "  full workflow: vanth sleep 30\n"
         "                 vanth wait <id> --events completed,failed\n"
         "                 vanth status <id> && vanth logs <id>\n"
         "\n"
@@ -1893,11 +1963,12 @@ _COMMAND_HELP: dict[str, str] = {
             "  MCP `job_view`.\n"
             "  example: vanth list --all --name train --limit 10\n",
     "start": "usage: vanth start [--name N] [--cwd DIR] [--timeout S] [--env K=V]...\n"
-             "                  [--wake JSON|@FILE|-]... [--trigger JSON|@FILE|-]\n"
+             "                  [--wake JSON|@FILE|-]... [--wake-me[=EVENTS]]\n"
+             "                  [--trigger JSON|@FILE|-]\n"
              "                  [--interactive] [--] <command...>\n"
              "  Start a background job (the non-MCP front door).\n"
              "\n"
-             "  options: --name --cwd --timeout --env --wake --interactive --priority\n"
+             "  options: --name --cwd --timeout --env --wake --wake-me --interactive --priority\n"
              "           --pool --tag --notes --secret-env --trigger --policy --json\n"
              "\n"
              "  quoting (Windows/PowerShell): pass simple commands as separate\n"
@@ -1909,6 +1980,7 @@ _COMMAND_HELP: dict[str, str] = {
              "  write the object to a file and pass @path (or @- for stdin).\n"
              "\n"
              "  wakes: --wake '{\"type\":\"opencode_thread\",\"events\":[\"completed\"]}'\n"
+             "  shorthand: vanth start --wake-me -- <command> (or --wake-me=completed,failed,checkpoint)\n"
              "  needs NO session_id — the daemon resolves the live OpenCode plugin\n"
              "  relay for --cwd. Add \"session_id\":\"ses_...\" only to target a specific\n"
              "  session; never use the relay client id (opencode-<pid>-<rand>).\n"
@@ -1916,7 +1988,7 @@ _COMMAND_HELP: dict[str, str] = {
              "  examples:\n"
              "    vanth start -- python train.py --epochs 10\n"
              "    vanth start --name train --cwd C:\\\\work -- python train.py\n"
-             "    vanth start -- ping -n 30 127.0.0.1                 # portable 'sleep 30'\n"
+             "    vanth sleep 30                                      # background sleep\n"
              "    vanth start \"cmd /c ping -n 15 host >nul && echo ONBOARD_MARKER\"\n"
              "    vanth start \"cmd /c ping -n 30 host >nul && echo done\"   # one string\n"
              "    vanth start -- run.cmd                                 # script file\n"
@@ -1942,6 +2014,8 @@ _COMMAND_HELP: dict[str, str] = {
              "  It returns as soon as the stop is REQUESTED, so confirm with\n"
              "  `vanth status <job-id>` (or `vanth list --all`).\n"
              "  example: vanth stop job_abc123 --signal kill && vanth status job_abc123\n",
+    "sleep": "usage: vanth sleep <seconds>\n"
+             "  Start a background job that sleeps for a positive number of seconds.\n",
     "deliveries": "usage: vanth deliveries [--status delivered|failed|pending] [--job-id ID] [--json]\n"
                   "  Wake deliveries, so a nonzero `failed` count is actionable.\n",
     "wake": "usage: vanth wake <job-id> [--now] [--type TYPE] [--events a,b]\n"
@@ -2033,6 +2107,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_diff(argv[1:], home, json_out=json_out)
     if command == "stop":
         return cmd_stop(argv[1:], home, json_out=json_out)
+    if command == "sleep":
+        return cmd_sleep(argv[1:], home, json_out=json_out)
     if command == "deliveries":
         return cmd_deliveries(argv[1:], home, json_out=json_out)
     if command == "wake":

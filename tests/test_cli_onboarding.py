@@ -124,13 +124,13 @@ def test_start_rejects_malformed_trigger_json(monkeypatch, capsys):
     assert "expects a JSON object" in capsys.readouterr().err
 
 
-def test_start_warns_when_shell_operators_were_reassembled(monkeypatch, capsys):
+def test_start_refuses_when_shell_operators_were_reassembled(monkeypatch, capsys):
     """The reported onboarding failure: a command with > and && arrived as
     separate argv elements, was reassembled, and died in cmd.exe."""
     monkeypatch.setattr(cli, "VanthClient", _RecordingVanth)
-    assert cli.main(["start", "--", "cmd", "/c", "ping", "host", ">nul", "&&", "echo", "hi"]) == 0
+    assert cli.main(["start", "--", "cmd", "/c", "ping", "host", ">nul", "&&", "echo", "hi"]) == 2
     err = capsys.readouterr().err
-    assert "shell operators" in err
+    assert "refusing reassembled command" in err
     assert "run.cmd" in err  # points at the reliable workaround
 
 
@@ -257,4 +257,3 @@ def test_start_reads_trigger_json_from_stdin(monkeypatch, capsys):
     rc = cli.main(["start", "--trigger", "-", "--", "echo", "hi"])
     assert rc == 0, capsys.readouterr().err
     assert _RecordingVanth.captured["trigger"] == {"job_id": "job_x", "status": "completed"}
-

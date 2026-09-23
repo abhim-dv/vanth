@@ -20,7 +20,7 @@ import functools
 import json
 import secrets
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS remote_shadows (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_remote_requests_remote ON remote_requests(remote_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_remote_requests_status_updated ON remote_requests(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_remote_replay_tombstones_created ON remote_replay_tombstones(created_at);
 CREATE INDEX IF NOT EXISTS idx_remote_shadows_remote ON remote_shadows(remote_id, created_at);
 """
 
@@ -475,6 +477,32 @@ class RemoteStore:
         if not row:
             raise ValueError(f"no replay tombstone for key {idempotency_key!r} on remote {remote_id!r}")
         return self._tombstone_dict(row)
+
+    def prune_requests(self, older_than_seconds: int, *, commit: bool = True) -> dict[str, int]:
+        """Delete settled remote requests and replay tombstones past a TTL.
+
+        The controller's poll loop (`feed_sync`/`events`) submits a fresh request
+        per tick, so this table grows without bound while a remote wake binding
+        is live. Only SETTLED requests are pruned — an in-flight
+        (creating/submitting/accepted) row is the durable replay/retry
+        handle and is never removed.
+        """
+        if older_than_seconds <= 0:
+            return {"requests": 0, "tombstones": 0}
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+        settled = ("completed", "failed", "lost")
+        placeholders = ",".join("?" for _ in settled)
+        with self.db_lock:
+            requests = self.db.execute(
+                f"DELETE FROM remote_requests WHERE status IN ({placeholders}) AND updated_at <= ?",
+                (*settled, cutoff),
+            ).rowcount
+            tombstones = self.db.execute(
+                "DELETE FROM remote_replay_tombstones WHERE created_at <= ?", (cutoff,)
+            ).rowcount
+            if commit:
+                self.db.commit()
+        return {"requests": requests, "tombstones": tombstones}
 
     @staticmethod
     def _tombstone_dict(row) -> dict[str, Any]:

@@ -19,7 +19,7 @@ from pathlib import Path
 
 EXPECTED_KINDS = ["hello", "request", "response", "error", "snapshot", "log_range"]
 EXPECTED_METHODS = ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed",
-                    "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete"]
+                    "job.events", "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete"]
 EXPECTED_CODES = [
     "PROTOCOL_MALFORMED",
     "PROTOCOL_OVERSIZED",

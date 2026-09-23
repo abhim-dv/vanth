@@ -2,6 +2,51 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.12.0 - 2026-09-23
+
+### Zero-JSON wakes and agent UX
+
+- `vanth start --wake-me[=EVENTS]` (CLI) and `job_start(..., wake_me=True)`
+  (MCP): be woken when a job finishes without hand-writing wake JSON. The
+  shorthand defaults to `completed,failed` and resolves the live plugin relay
+  for the job's directory.
+- `job_start` / `vanth start` responses now echo the resolved `wake_targets`
+  (with their `session_id`/`thread_id`) and `wake_addressable`, so a caller can
+  confirm exactly which session will be woken.
+- `notify_on` is no longer a silent no-op: it is stored (it only supplies
+  default `events` for a `wake_targets` entry) but a start with `notify_on` and
+  no `wake_targets` returns a `warnings` entry saying it notifies nobody.
+- `vanth sleep <seconds>` starts a trivial sleep job; the `ping -n` idiom is no
+  longer recommended.
+- `vanth start` now **refuses** (exit 2) a command reassembled from separate
+  arguments when a bare shell-operator token (`&&`, `|`, `>nul`) is present,
+  instead of warning and running a broken command. Pass the whole command as
+  ONE quoted string, or use a script file.
+- `vanth doctor` reports `pending_deliveries` and `undeliverable_wakes`, and
+  startup reconciles pre-1.11 relay-client-id wake targets (their pending
+  deliveries are failed and the dead targets removed).
+
+### Remote wakes
+
+- Wake targets on a remote job (`job_start(remote_id=..., wake_me=True)`) are
+  registered on the **local** daemon and fire when the remote job emits a
+  matching event. Terminal events are durable via the change feed; non-terminal
+  events (`checkpoint` / `progress` / `metric`) are delivered on a best-effort
+  basis from the host's retained events.
+- New remote `job.events` method: bounded, per-job sequence cursors (chunked,
+  `null` = initialize to the current high-water so history is not replayed).
+  Remote `job.start` accepts but ignores `wake_targets` / `notify_on` — the
+  controller registers them, so an un-upgraded controller can still start jobs.
+- The daemon polls the host while a wake binding is outstanding
+  (`VANTH_REMOTE_WAKE_SYNC_SECONDS`, default 5) and prunes settled controller
+  request/journal rows (`VANTH_REMOTE_REQUEST_TTL_SECONDS`, default 7 days).
+- Wake bindings whose remote job is deleted or forgotten are settled rather
+  than re-polled forever.
+
+### Schema
+
+- Schema 17 adds `wake_targets.remote_id`; schema 18 adds `remote_event_cursors`.
+
 ## 1.11.0 - 2026-09-22
 
 ### CLI and HTTP API

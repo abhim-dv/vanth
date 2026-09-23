@@ -29,7 +29,6 @@ the response line. Tests use a fake transport; no real network is touched.
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
 from pathlib import Path
@@ -38,6 +37,7 @@ from typing import Any
 from . import ssh
 from .pairing import _target_argv
 from .protocol import (
+    ERROR_REGISTRY,
     IDEMPOTENCY_KEY_RE,
     VanthRemoteProtocolError,
     decode_frame,
@@ -781,6 +781,55 @@ class RemoteControl:
         if request.get("error"):
             raise VanthRemoteProtocolError("INVALID_REQUEST", str(request["error"]))
         return request.get("response") or {}
+
+    def events(self, remote_id: str, cursors: dict[str, int | None], *, limit: int = 200) -> dict[str, Any]:
+        """Read bounded pages of retained remote job events.
+
+        ``cursors`` is chunked to the protocol's per-request job cap so a host
+        with many wake bindings cannot exceed ``EVENTS_MAX_JOBS`` (which would
+        reject every read and, with the fail-safe terminal ordering, disable
+        non-terminal wakes for that host). Each chunk is one request; the
+        per-job results are merged.
+        """
+        from .protocol import EVENTS_MAX_JOBS
+
+        items = list(cursors.items())
+        merged: dict[str, Any] = {}
+        state_epoch: Any = None
+        feed_epoch: Any = None
+        for start in range(0, len(items), EVENTS_MAX_JOBS):
+            chunk = dict(items[start:start + EVENTS_MAX_JOBS])
+            request = self.submit(
+                remote_id, "job.events", {"cursors": chunk, "limit": limit},
+                idempotency_key="evts-" + secrets.token_hex(8),
+            )
+            if request["status"] == "creating":
+                request = self.run_request(remote_id, request)
+            if request.get("error"):
+                error = request["error"]
+                # The store persists the error as the STRING "<code>: <message>"
+                # (see _finish_error), so a dict-only parse would lose the code
+                # and turn every remote error into INVALID_REQUEST.
+                if isinstance(error, dict):
+                    code = error.get("code")
+                    message = error.get("message") or str(error)
+                else:
+                    text = str(error)
+                    code, _, remainder = text.partition(":")
+                    code = code.strip()
+                    message = remainder.strip() or text
+                    if code not in ERROR_REGISTRY:
+                        message = text
+                if code in ERROR_REGISTRY:
+                    raise VanthRemoteProtocolError(code, message)
+                raise VanthRemoteProtocolError("INVALID_REQUEST", message)
+            result = request.get("response") or {}
+            if result.get("kind") != "events":
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "unexpected job.events response")
+            merged.update(result.get("jobs") or {})
+            state_epoch = result.get("state_epoch", state_epoch)
+            feed_epoch = result.get("feed_epoch", feed_epoch)
+        return {"kind": "events", "state_epoch": state_epoch, "feed_epoch": feed_epoch, "jobs": merged}
 
     def forget_shadow(self, remote_id: str, remote_job_id: str) -> dict[str, Any]:
         """Durably suppress a forgotten shadow; later snapshots cannot resurrect it."""

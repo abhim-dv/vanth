@@ -195,6 +195,8 @@ class RemoteJobManager:
             return self.handle_log_range_request(frame, payload)
         if method == "job.feed":
             return self.handle_feed_request(frame, payload)
+        if method == "job.events":
+            return self.handle_events_request(frame, payload)
         if method in _TRANSFER_METHODS:
             return self._handle_transfer_frame(frame, method, payload)
         return self._handle_mutation(frame, method, payload, idempotency_key, digest)
@@ -987,6 +989,49 @@ class RemoteJobManager:
             "high_water_seq": batch["high_water_seq"],
         })
 
+    def handle_events_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Read bounded per-job event batches after independent sequence cursors."""
+        from .protocol import EVENTS_DEFAULT_LIMIT, EVENTS_MAX_JOBS, EVENTS_MAX_LIMIT
+
+        payload = payload if payload is not None else (frame.get("payload") or {})
+        cursors = payload.get("cursors") or {}
+        limit = min(int(payload.get("limit") or EVENTS_DEFAULT_LIMIT), EVENTS_MAX_LIMIT)
+        jobs: dict[str, dict[str, Any]] = {}
+        with getattr(self.manager, "db_lock", nullcontext()):
+            for job_id, since in list(cursors.items())[:EVENTS_MAX_JOBS]:
+                high_row = self.manager.db.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE job_id=?", (job_id,)
+                ).fetchone()
+                high_water_seq = int(high_row["seq"] if high_row else 0)
+                if since is None:
+                    jobs[job_id] = {
+                        "events": [], "next_seq": high_water_seq,
+                        "high_water_seq": high_water_seq, "has_more": False,
+                    }
+                    continue
+                rows = self.manager.db.execute(
+                    "SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at "
+                    "FROM events WHERE job_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
+                    (job_id, since, limit),
+                ).fetchall()
+                events = [dict(row) for row in rows]
+                next_seq = int(events[-1]["seq"]) if events else since
+                more = self.manager.db.execute(
+                    "SELECT 1 FROM events WHERE job_id=? AND seq>? LIMIT 1", (job_id, next_seq)
+                ).fetchone() is not None
+                jobs[job_id] = {
+                    "events": events, "next_seq": next_seq,
+                    "high_water_seq": high_water_seq, "has_more": more,
+                }
+        state_row = self.store.db.execute(
+            "SELECT feed_epoch FROM remote_state WHERE id=1"
+        ).fetchone()
+        feed_epoch = int(state_row["feed_epoch"] if state_row and state_row["feed_epoch"] else 1)
+        return self._response_frame(frame, {
+            "kind": "events", "state_epoch": self._remote_state_epoch(),
+            "feed_epoch": feed_epoch, "jobs": jobs,
+        })
+
     def handle_log_range_request(self, frame: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Read a byte range of a remote job's stdout/stderr log.
 
@@ -995,10 +1040,6 @@ class RemoteJobManager:
         round-trip exactly through base64.
         """
         import base64
-        import os as _os
-
-        from .protocol import VanthRemoteProtocolError as _VPE
-
         payload = payload if payload is not None else (frame.get("payload") or {})
         remote_job_id = payload["remote_job_id"]
         # Opaque-ID grammar + containment: job ids are untrusted input and are

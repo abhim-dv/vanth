@@ -49,8 +49,9 @@ client or daemon restarts.
 | `name` | `string?` | `None` | Human-readable label |
 | `env` | `map<string,string>?` | `{}` | Extra environment |
 | `timeout_seconds` | `int?` | `None` | >= 1; `None` = no timeout (enforced even across daemon restarts) |
-| `notify_on` | `string[]?` | `None` | Event types that become default wake-target `events` |
+| `notify_on` | `string[]?` | `None` | Only defaults `events` on an existing `wake_targets` entry; without `wake_targets` it notifies nobody, and the start response carries a `warnings` entry saying so |
 | `wake_targets` | `object[]?` | `None` | See README "Wake targets"; `{type, events, ...config}` |
+| `wake_me` | `bool?` | `False` | Zero-JSON `opencode_thread` wake; defaults to `completed,failed`, omits `session_id`, and resolves the live relay for the job's cwd |
 | `origin_thread_id` | `string?` | `None` | The agent thread that launched it (defaults to `CODEX_THREAD_ID`) |
 | `tags` | `string[]?` | `None` | Arbitrary labels, filterable in `job_list` |
 | `notes` | `string?` | `None` | Free-form annotation shown in the monitor |
@@ -71,6 +72,17 @@ client or daemon restarts.
   "message": "Job started"
 }
 ```
+
+CLI counterparts: `vanth start --wake-me -- <command>` (or
+`--wake-me=completed,failed,checkpoint` to override events) and
+`vanth sleep <seconds>` for a trivial sleep job.
+
+When wake targets are supplied (including `wake_me`), the response also carries
+`wake_targets` (each resolved target with its `session_id`/`thread_id`) and
+`wake_addressable` (`true` when every relay-delivered target has a destination,
+`false` when one does not, `null` when there is no relay-delivered target), so
+the caller can confirm exactly which session will be woken. A non-empty
+`notify_on` with no `wake_targets` adds a `warnings` entry — it notifies nobody.
 
 With `trigger` set, the job is created `queued` (no `worker_pid`) and the
 response carries `"trigger"` plus a message like `"Job queued; will start when
@@ -965,6 +977,11 @@ Register a wake target against a job for **future** events. This only fires
 when the triggering event occurs **after** registration — it does NOT surface
 a wake for an event that already happened. Use `job_wake_now` for that.
 
+CLI counterpart: `vanth wake <job_id>` adds a target after start; use
+`vanth start --wake-me -- <command>` to create the default OpenCode wake at
+start time. `vanth deliveries --status pending` or `--status failed` diagnoses
+wakes that will not fire.
+
 Pass a full target dict as `target` (`{"type", "events", ...config}`), or use
 the shorthand: `type` (required, one of `local_command` / `codex_cli_thread` /
 `codex_thread` / `codex_desktop` / `opencode_thread` / `webhook`) plus optional
@@ -982,16 +999,16 @@ thread bridge) when it is not. It does not support arbitrary historical or
 unloaded Desktop threads: the private host may accept those sends without
 producing a usable turn. Use `codex_cli_thread` for an unloaded persisted task.
 
-`opencode_thread` targets need `session_id` — the OpenCode session id (`ses_...`,
-from `opencode session list`), **not** the relay client id
+`opencode_thread` targets may omit `session_id`: Vanth then resolves the newest
+registered plugin relay for the job's `cwd`, and the in-process plugin injects
+the wake into the TUI you are watching. If no relay is registered for that cwd,
+creation fails with an actionable error. An explicit `session_id` (`ses_...`,
+from `opencode session list`) always wins — use it, **not** the relay client id
 `opencode-<pid>-<rand>` that `vanth doctor` prints as `[client ...]` (a target
 naming a client id is rejected, since the relay matches on the destination
-session and would never claim it). Omit `session_id` entirely to resolve the
-newest live plugin relay registered for the job's `cwd`; the in-process plugin
-then injects the wake into the TUI you are watching. `attach` is optional and
-only needed for a headless `opencode serve` (an explicit `session_id` plus the
-server URL); without a plugin relay and without `attach` there is no visible
-client to wake.
+session and would never claim it). `attach` is optional and only needed for a
+headless `opencode serve` (an explicit `session_id` plus the server URL);
+without a plugin relay and without `attach` there is no visible client to wake.
 
 **Parameters**
 
@@ -1019,8 +1036,10 @@ Surface a wake **immediately**, even if the triggering event already fired.
 This is the genuine "wake now" operation: it registers the target AND enqueues
 a synthetic delivery right away, so the wake reaches the target session without
 waiting for a matching event. Same target contract as `job_add_wake_target`;
-`opencode_thread` targets need the `ses_...` session id (or omit it to resolve a
-live plugin relay), **not** the relay client id `opencode-<pid>-<rand>`.
+`opencode_thread` targets may omit `session_id` when a plugin relay is
+registered for the job's cwd (`vanth doctor` lists them and their liveness),
+**not** the relay client id `opencode-<pid>-<rand>`; otherwise supply the
+`ses_...` session id.
 
 **Response**
 

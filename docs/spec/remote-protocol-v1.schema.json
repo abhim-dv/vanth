@@ -45,7 +45,7 @@
     "method": {
       "type": "string",
       "enum": ["job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed",
-               "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete"]
+               "job.events", "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete"]
     },
     "payload": {
       "type": "object",
@@ -138,6 +138,10 @@
           {
             "if": { "properties": { "method": { "const": "job.log_range" } }, "required": ["method"] },
             "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.log_range" } } }
+          },
+          {
+            "if": { "properties": { "method": { "const": "job.events" } }, "required": ["method"] },
+            "then": { "properties": { "payload": { "$ref": "#/$defs/payload_job.events" } } }
           },
           {
             "if": { "properties": { "method": { "const": "artifact.transfer_init" } }, "required": ["method"] },
@@ -286,6 +290,21 @@
         "stream": { "type": "string", "enum": ["stdout", "stderr"] },
         "offset": { "type": "integer", "minimum": 0 },
         "size": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "payload_job.events": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cursors"],
+      "properties": {
+        "cursors": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 50,
+          "description": "remote_job_id -> since seq (>=0) or null to initialize to the job's current high-water seq.",
+          "additionalProperties": { "type": ["integer", "null"], "minimum": 0 }
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
       }
     },
     "payload_job.start": {

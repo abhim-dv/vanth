@@ -537,6 +537,43 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
                 raise ValueError(f"wake target {key} must be an integer >= {minimum}")
 
 
+#: Every identity field a relay-delivered target may carry: the canonical
+#: ``RELAY_IDENTITY_KEYS`` names plus their camelCase aliases and the legacy
+#: ``thread_id`` accepted for ``opencode_thread``.
+_RELAY_IDENTITY_FIELDS = ("session_id", "sessionId", "thread_id", "threadId")
+
+
+def wake_target_identity(target: dict[str, Any]) -> str | None:
+    """The relay destination identity of a relay-delivered wake target.
+
+    Returns ``None`` for a target the daemon does not deliver through a client
+    relay — a non-relay type, or one carrying its own ``command``.
+    """
+    target_type = target.get("type")
+    # isinstance first: an unhashable value (list/dict) in the dict-membership
+    # test raises TypeError and would surface as an internal 500 (field-level
+    # shape errors must stay a 400).
+    if not isinstance(target_type, str) or target_type not in RELAY_IDENTITY_KEYS or target.get("command"):
+        return None
+    for field in _RELAY_IDENTITY_FIELDS:
+        value = target.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def is_relay_client_id(target_type: Any, identity: str, client_ids: set[str]) -> bool:
+    """Whether ``identity`` is a relay CLIENT id, which is never a destination.
+
+    The OpenCode plugin's long-poll identity is ``opencode-<pid>-<rand>`` and is
+    matched by shape; any other registered client id is matched against the live
+    subscription set.
+    """
+    return (
+        target_type == "opencode_thread" and bool(OPENCODE_CLIENT_ID_RE.match(identity))
+    ) or identity in client_ids
+
+
 def validate_limit(value: int, name: str, maximum: int = 1000) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > maximum:
         raise ValueError(f"{name} must be an integer between 1 and {maximum}")
@@ -615,6 +652,8 @@ class JobManager:
         self._last_alert_check: float | None = None
         self.backup_path = migrate(self.db, self.home)
         if recover:
+            with self.db_lock:
+                self._reconcile_invalid_wake_targets()
             self._recover_jobs()
             self._reconcile_running_jobs()
         if recover:
@@ -3195,6 +3234,7 @@ class JobManager:
                 "stderr_path": str(stderr_path),
                 "events_path": str(events_path),
                 "message": message,
+                **self._start_extras(wake_targets, notify_on),
             }
         claim_spec_path = self._write_spec(
             job_id,
@@ -3212,9 +3252,10 @@ class JobManager:
             },
             spec_name=f"{job_id}-{direct_claim_token}.json",
         )
-        return self._launch(
+        result = self._launch(
             job_id, stdout_path, stderr_path, events_path, claim_spec_path, claim_token=direct_claim_token
         )
+        return {**result, **self._start_extras(wake_targets, notify_on)}
 
     def _validate_trigger(self, trigger: dict[str, Any] | None) -> dict[str, Any] | None:
         """Validate a queue trigger: a DAG gate, a readiness probe, or both.
@@ -4062,7 +4103,13 @@ class JobManager:
         except (sqlite3.Error, RuntimeError):
             return
 
-    def _insert_wake_targets(self, job_id: str, targets: list[dict[str, Any]], created_at: str) -> list[str]:
+    def _insert_wake_targets(
+        self,
+        job_id: str,
+        targets: list[dict[str, Any]],
+        created_at: str,
+        remote_id: str | None = None,
+    ) -> list[str]:
         inserted = []
         for target in targets:
             target = canonicalize_wake_target(target)
@@ -4074,12 +4121,13 @@ class JobManager:
             target_id = "target_" + uuid.uuid4().hex[:12]
             self.db.execute(
                 """
-                INSERT INTO wake_targets(target_id, job_id, type, events_json, config_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO wake_targets(target_id, job_id, remote_id, type, events_json, config_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     target_id,
                     job_id,
+                    remote_id,
                     target_type,
                     json.dumps(events, separators=(",", ":")),
                     json.dumps(config, separators=(",", ":")),
@@ -4088,6 +4136,239 @@ class JobManager:
             )
             inserted.append(target_id)
         return inserted
+
+    def register_remote_wake_targets(
+        self, remote_id: str, remote_job_id: str, targets: list[dict[str, Any]]
+    ) -> list[str]:
+        """Register local wake targets for a job running on a paired host."""
+        self._ensure_open()
+        binding_id = self._remote_binding_id(remote_id, remote_job_id)
+        try:
+            resolved = resolve_wake_target_identity(targets, None)
+            self._resolve_relay_sessions(resolved, None)
+            self._reject_relay_client_id_targets(resolved)
+            validate_wake_targets(resolved)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"remote wake was NOT registered: {exc}") from exc
+        with self.db_lock:
+            existing = self.db.execute(
+                "SELECT target_id FROM wake_targets WHERE job_id=? ORDER BY rowid", (binding_id,)
+            ).fetchall()
+            if existing:
+                return [row["target_id"] for row in existing]
+            try:
+                inserted = self._insert_wake_targets(binding_id, resolved, now_iso(), remote_id=remote_id)
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+        return inserted
+
+    @staticmethod
+    def _remote_binding_id(remote_id: str, remote_job_id: str) -> str:
+        """Composite wake-target/event key for a job on a paired host.
+
+        A colon separator keeps it distinct from any local ``job_<hex>`` id, so a
+        remote job id can never collide with a local one. Generated ids never
+        contain ``:``; a caller-supplied id that does would make the composite
+        ambiguous (and ``remote_wake_bindings`` unrecoverable), so reject it.
+        """
+        for value, label in ((remote_id, "remote_id"), (remote_job_id, "remote_job_id")):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{label} must be a non-empty string")
+            if ":" in value:
+                raise ValueError(f"{label} must not contain ':'")
+        return f"remote:{remote_id}:{remote_job_id}"
+
+    def emit_remote_terminal(
+        self,
+        remote_id: str,
+        remote_job_id: str,
+        status: str,
+        *,
+        exit_code: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Emit one terminal event for a remote job's local wake binding."""
+        if status not in TERMINAL_STATUSES:
+            return None
+        binding_id = self._remote_binding_id(remote_id, remote_job_id)
+        with self.db_lock:
+            if self.db.execute(
+                "SELECT 1 FROM events WHERE job_id=? AND type IN ({}) LIMIT 1".format(
+                    ",".join("?" for _ in TERMINAL_STATUSES)
+                ),
+                (binding_id, *TERMINAL_STATUSES),
+            ).fetchone():
+                # Already fired (the feed re-delivers, or a crash landed between
+                # the event commit and the delete below). Drop the binding anyway
+                # so remote_wake_bindings stops re-polling the host forever.
+                self.db.execute("DELETE FROM wake_targets WHERE job_id=?", (binding_id,))
+                self.db.execute("DELETE FROM remote_event_cursors WHERE binding_id=?", (binding_id,))
+                self.db.commit()
+                return None
+            event = self._emit(
+                binding_id,
+                status,
+                message=f"Remote job {remote_id}/{remote_job_id} {status}",
+                data={"remote_id": remote_id, "remote_job_id": remote_job_id, "exit_code": exit_code},
+                source="remote",
+            )
+            self.db.execute("DELETE FROM wake_targets WHERE job_id=?", (binding_id,))
+            self.db.execute("DELETE FROM remote_event_cursors WHERE binding_id=?", (binding_id,))
+            self.db.commit()
+            return event
+
+    def remote_event_cursor(self, remote_id: str, remote_job_id: str) -> int | None:
+        binding_id = self._remote_binding_id(remote_id, remote_job_id)
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT next_seq FROM remote_event_cursors WHERE binding_id=?", (binding_id,)
+            ).fetchone()
+        return None if row is None else int(row["next_seq"])
+
+    def set_remote_event_cursor(self, remote_id: str, remote_job_id: str, next_seq: int) -> None:
+        binding_id = self._remote_binding_id(remote_id, remote_job_id)
+        with self.db_lock:
+            self._remote_cursor_upsert(self.db, binding_id, next_seq)
+            self.db.commit()
+
+    @staticmethod
+    def _remote_cursor_upsert(db: sqlite3.Connection, binding_id: str, next_seq: int) -> None:
+        """Advance a binding's event cursor, never rewinding it."""
+        db.execute(
+            "INSERT INTO remote_event_cursors(binding_id, next_seq, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(binding_id) DO UPDATE SET next_seq=max(next_seq, excluded.next_seq), "
+            "updated_at=excluded.updated_at",
+            (binding_id, int(next_seq), now_iso()),
+        )
+
+    def emit_remote_event(
+        self, remote_id: str, remote_job_id: str, event: dict[str, Any], next_seq: int
+    ) -> dict[str, Any] | None:
+        binding_id = self._remote_binding_id(remote_id, remote_job_id)
+        seq = int(event["seq"])
+        with self.db_lock:
+            if not self.db.execute("SELECT 1 FROM wake_targets WHERE job_id=? LIMIT 1", (binding_id,)).fetchone():
+                return None
+            row = self.db.execute(
+                "SELECT next_seq FROM remote_event_cursors WHERE binding_id=?", (binding_id,)
+            ).fetchone()
+            if row is not None and seq <= int(row["next_seq"]):
+                return None
+            parsed = json.loads(event.get("data_json") or "{}")
+            if not isinstance(parsed, dict):
+                parsed = {}
+            data = {
+                **parsed,
+                "remote_seq": seq,
+                "remote_id": remote_id,
+                "remote_job_id": remote_job_id,
+            }
+
+            def advance_cursor(db: sqlite3.Connection) -> None:
+                # Runs under the same db_lock as the guard above, so no other
+                # writer can have advanced the cursor in between.
+                self._remote_cursor_upsert(db, binding_id, next_seq)
+
+            result = self._emit(
+                binding_id,
+                event["type"],
+                message=event.get("message"),
+                data=data,
+                level=event.get("level") or "info",
+                source="remote",
+                mutate=advance_cursor,
+            )
+            if result is not None and result.get("persisted") is False:
+                # The per-job event cap dropped the event, so `mutate` never ran
+                # and the cursor would never advance — the backlog would refetch
+                # the same page forever and starve the terminal wake. The event is
+                # dropped by design (matching local behaviour), so skip it.
+                # A `noop` result means the cursor already covered this seq.
+                if not result.get("noop"):
+                    self._remote_cursor_upsert(self.db, binding_id, next_seq)
+                    self.db.commit()
+                return None
+            return result
+
+    def drop_remote_wake_binding(self, remote_id: str, remote_job_id: str, *, reason: str = "remote job no longer exists") -> bool:
+        """Settle a binding whose remote job is gone (deleted/forgotten on the host).
+
+        The wake can never fire, so remove the binding and its cursor and fail any
+        owed deliveries — rather than re-polling the host forever for a shadow that
+        will never come back.
+        """
+        binding_id = self._remote_binding_id(remote_id, remote_job_id)
+        with self.db_lock:
+            if not self.db.execute("SELECT 1 FROM wake_targets WHERE job_id=? LIMIT 1", (binding_id,)).fetchone():
+                return False
+            self.db.execute(
+                "UPDATE deliveries SET status='failed', last_error=?, next_attempt_at=NULL, "
+                "claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL "
+                "WHERE job_id=? AND status IN ('pending','dispatching')",
+                (reason, binding_id),
+            )
+            self.db.execute("DELETE FROM wake_targets WHERE job_id=?", (binding_id,))
+            self.db.execute("DELETE FROM remote_event_cursors WHERE binding_id=?", (binding_id,))
+            self.db.commit()
+        return True
+
+    def remote_wake_bindings(self) -> list[dict[str, Any]]:
+        with self.db_lock:
+            rows = self.db.execute(
+                "SELECT remote_id, job_id, target_id, events_json FROM wake_targets "
+                "WHERE remote_id IS NOT NULL ORDER BY rowid"
+            ).fetchall()
+        return [
+            {
+                "remote_id": row["remote_id"],
+                "remote_job_id": row["job_id"].rsplit(":", 1)[-1],
+                "binding_id": row["job_id"],
+                "target_id": row["target_id"],
+                "events": json.loads(row["events_json"] or "[]"),
+            }
+            for row in rows
+        ]
+
+    def _start_extras(self, wake_targets: list[dict[str, Any]] | None, notify_on: list[str] | None) -> dict[str, Any]:
+        """Wake identity echo + advisory warnings for a start response."""
+        extras = self._wake_start_info(wake_targets or [])
+        if notify_on and not wake_targets:
+            # notify_on is only a default for a wake target's events; on its own
+            # it notifies nobody. Stored (not an error) for compatibility, but
+            # the caller is told so a silent no-op is not mistaken for a wake.
+            extras["warnings"] = [
+                "notify_on has no effect without wake_targets: it only sets the default events of a wake target. "
+                "Pass wake_me=True (or a wake_targets entry) to actually be woken."
+            ]
+        return extras
+
+    def _wake_start_info(self, targets: list[dict[str, Any]]) -> dict[str, Any]:
+        """Echo the resolved wake identity back to the caller.
+
+        ``wake_addressable`` is ``True`` when every relay-delivered target has a
+        destination identity, ``False`` when one does not, and ``None`` when
+        there are no relay-delivered targets (nothing to address).
+        """
+        info = []
+        relay_addressable = []
+        for target in targets:
+            target_type = target.get("type")
+            entry: dict[str, Any] = {
+                "type": target_type,
+                "events": target.get("events") or target.get("notify_on") or [],
+            }
+            if target_type in RELAY_IDENTITY_KEYS:
+                identity_key = "session_id" if target_type == "opencode_thread" else "thread_id"
+                identity = target.get(identity_key) or target.get("sessionId" if identity_key == "session_id" else "threadId")
+                entry[identity_key] = identity
+                if not target.get("command"):
+                    relay_addressable.append(bool(identity))
+            info.append(entry)
+        return {
+            "wake_targets": info,
+            "wake_addressable": (all(relay_addressable) if relay_addressable else None),
+        }
 
     def _latest_relay_session(self, directory: str | None) -> str | None:
         """Newest OpenCode plugin-relay session registered for ``directory``.
@@ -4167,26 +4448,65 @@ class JobManager:
         """
         client_ids = self._relay_client_ids()
         for target in targets or []:
-            if not isinstance(target, dict) or target.get("command"):
+            if not isinstance(target, dict):
+                continue
+            identity = wake_target_identity(target)
+            if identity is None:
                 continue
             target_type = target.get("type")
-            if not isinstance(target_type, str) or target_type not in RELAY_IDENTITY_KEYS:
+            if is_relay_client_id(target_type, identity, client_ids):
+                raise ValueError(self._relay_client_id_error(target_type, identity))
+
+    @staticmethod
+    def _relay_client_id_error(target_type: str, identity: str) -> str:
+        return (
+            f"{target_type} target id {identity!r} is a relay client id, not a wake destination; "
+            "pass the destination id shown by `vanth doctor` (the session/thread id), "
+            "not the relay's client id"
+        )
+
+    def _reconcile_invalid_wake_targets(self) -> None:
+        """Remove pre-1.11 relay client-id wakes that can never be claimed.
+
+        Creation-time rejection (``_reject_relay_client_id_targets``) landed in
+        1.11.0, but targets written before it still sit in the table and their
+        deliveries stay ``pending`` forever (never claimed, never errored). Sweep
+        them once at startup so the zombie rows and their pending deliveries
+        become visible as ``failed``.
+        """
+        client_ids = self._relay_client_ids()
+        try:
+            rows = self.db.execute("SELECT target_id, type, config_json FROM wake_targets").fetchall()
+        except sqlite3.Error:
+            # Defensive: a pre-wake_targets DB must not break manager construction.
+            return
+        invalid = []
+        for row in rows:
+            try:
+                config = json.loads(row["config_json"] or "{}")
+            except (TypeError, ValueError):
                 continue
-            identity = (
-                target.get("session_id")
-                or target.get("sessionId")
-                or target.get("thread_id")
-                or target.get("threadId")
+            if not isinstance(config, dict):
+                continue
+            identity = wake_target_identity({**config, "type": row["type"]})
+            if identity is None:
+                continue
+            if is_relay_client_id(row["type"], identity, client_ids):
+                invalid.append((row["target_id"], self._relay_client_id_error(row["type"], identity)))
+        for target_id, message in invalid:
+            self.db.execute(
+                "UPDATE deliveries SET status='failed', last_error=?, next_attempt_at=NULL, "
+                "claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL "
+                "WHERE target_id=? AND status IN ('pending','dispatching')",
+                (message, target_id),
             )
-            if not isinstance(identity, str) or not identity:
-                continue
-            is_opencode_shape = target_type == "opencode_thread" and OPENCODE_CLIENT_ID_RE.match(identity)
-            if is_opencode_shape or identity in client_ids:
-                raise ValueError(
-                    f"{target_type} target id {identity!r} is a relay client id, not a wake destination; "
-                    "pass the destination id shown by `vanth doctor` (the session/thread id), "
-                    "not the relay's client id"
-                )
+            binding = self.db.execute("SELECT job_id FROM wake_targets WHERE target_id=?", (target_id,)).fetchone()
+            self.db.execute("DELETE FROM wake_targets WHERE target_id=?", (target_id,))
+            if binding:
+                self.db.execute("DELETE FROM remote_event_cursors WHERE binding_id=?", (binding["job_id"],))
+        if invalid:
+            self.db.commit()
+            self.logger.info("reconciled %d undeliverable wake target(s)", len(invalid))
 
     def _relay_client_ids(self) -> set[str]:
         try:
@@ -5598,7 +5918,27 @@ class JobManager:
             row["status"]: row["count"]
             for row in self.db.execute("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status").fetchall()
         }
+        relay_client_ids = self._relay_client_ids()
+        undeliverable_wakes = 0
+        for row in self.db.execute("SELECT type, config_json FROM wake_targets").fetchall():
+            try:
+                config = json.loads(row["config_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(config, dict):
+                continue
+            identity = wake_target_identity({**config, "type": row["type"]})
+            if identity and is_relay_client_id(row["type"], identity, relay_client_ids):
+                undeliverable_wakes += 1
         warnings = []
+        if undeliverable_wakes:
+            warnings.append(
+                {
+                    "type": "undeliverable_wake_targets",
+                    "count": undeliverable_wakes,
+                    "detail": "these wakes can never fire; inspect with `vanth deliveries --status pending`",
+                }
+            )
         missing = sorted(required - tables)
         if missing:
             warnings.append({"type": "missing_tables", "tables": missing})
@@ -5664,6 +6004,8 @@ class JobManager:
             "events_dir": str(self.events_dir),
             "tables": sorted(tables),
             "delivery_counts": delivery_counts,
+            "pending_deliveries": delivery_counts.get("pending", 0),
+            "undeliverable_wakes": undeliverable_wakes,
             "codex": {"command": codex_bin, "available": codex_available},
             "opencode": {"command": opencode_bin, "available": opencode_available},
             "schema_version": int(self.db.execute("PRAGMA user_version").fetchone()[0]),
@@ -5783,8 +6125,51 @@ class JobManager:
                 self.db.execute(f"DELETE FROM jobs WHERE job_id IN ({still_ph})", still)
                 self.db.commit()
         if not dry_run:
+            self._prune_remote_wake_rows(older_than_seconds)
             self._drain_cleanup_tombstones()
         return {"dry_run": dry_run, "older_than_seconds": older_than_seconds, "jobs": deleted, "count": len(deleted)}
+
+    def _prune_remote_wake_rows(self, older_than_seconds: int) -> int:
+        """Prune SETTLED remote-wake rows, which have no ``jobs`` row to sweep.
+
+        A remote binding's terminal event and delivery carry a
+        ``remote:<remote_id>:<job_id>`` key with no local ``jobs`` row, so the
+        per-job DELETEs above never reach them and they would accumulate forever.
+        A ``pending``/``dispatching`` delivery is a wake still owed and is never
+        pruned; only delivered/failed rows at or below the cutoff are.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+        with self.db_lock:
+            try:
+                attempts = self.db.execute(
+                    "DELETE FROM delivery_attempts WHERE delivery_id IN "
+                    "(SELECT delivery_id FROM deliveries WHERE job_id LIKE 'remote:%' "
+                    "AND created_at<=? AND status IN ('delivered','failed'))",
+                    (cutoff,),
+                ).rowcount
+                deliveries = self.db.execute(
+                    "DELETE FROM deliveries WHERE job_id LIKE 'remote:%' "
+                    "AND created_at<=? AND status IN ('delivered','failed')",
+                    (cutoff,),
+                ).rowcount
+                events = self.db.execute(
+                    "DELETE FROM events WHERE job_id LIKE 'remote:%' AND created_at<=?",
+                    (cutoff,),
+                ).rowcount
+                metrics = self.db.execute(
+                    "DELETE FROM metric_series WHERE job_id LIKE 'remote:%' AND created_at<=?",
+                    (cutoff,),
+                ).rowcount
+                cursors = self.db.execute(
+                    "DELETE FROM remote_event_cursors WHERE NOT EXISTS "
+                    "(SELECT 1 FROM wake_targets WHERE wake_targets.job_id=remote_event_cursors.binding_id "
+                    "AND wake_targets.remote_id IS NOT NULL)"
+                ).rowcount
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+        return attempts + deliveries + events + metrics + cursors
 
     def cleanup_preview(self, older_than_seconds: int) -> dict[str, Any]:
         """Dry-run preview of the jobs a cleanup would remove, without deleting."""
@@ -6542,6 +6927,7 @@ def job_start(
     priority: int = 0,
     remote_id: str | None = None,
     idempotency_key: str | None = None,
+    wake_me: bool = False,
 ) -> dict[str, Any]:
     """Start a background job.
 
@@ -6599,6 +6985,8 @@ def job_start(
     plugin relay for the job's directory; ``attach`` is optional (only for a
     headless ``opencode serve``). The daemon rejects a client id in
     ``session_id`` rather than enqueueing a wake that would never be claimed.
+    ``wake_me`` is shorthand for ``wake_targets=[{"type": "opencode_thread"}]``;
+    explicit ``wake_targets`` win when both are supplied.
     """
     # Thread identity is resolved HERE, in the MCP process that owns the
     # calling task (review P1-4). The persistent daemon's environment belongs
@@ -6611,6 +6999,10 @@ def job_start(
         or os.environ.get("CODEX_THREAD_ID")
     )
     copied_targets: list[dict[str, Any]] | None = None
+    if wake_me and wake_targets is None:
+        # Mirror the CLI shorthand: the events MUST be present, because a wake
+        # target with neither events nor notify_on is rejected as empty.
+        wake_targets = [{"type": "opencode_thread", "events": ["completed", "failed"]}]
     if wake_targets is not None:
         copied_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
     return get_client().post(

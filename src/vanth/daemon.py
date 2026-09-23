@@ -221,10 +221,54 @@ def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict
             "INVALID_REQUEST", "remote is not paired with a verified instance identity"
         )
     if method == "job.start":
+        wake_targets = payload.pop("wake_targets", None)
+        notify_on = payload.pop("notify_on", None)
+        if notify_on and wake_targets:
+            wake_targets = [
+                {**target, "events": notify_on}
+                if "events" not in target and "notify_on" not in target else target
+                for target in wake_targets
+            ]
         request = control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
-        if request["status"] != "creating":
-            return request
-        return control.run_request(remote_id, request, expected_state_epoch=expected)
+        # A request that is still creating/submitting/accepted must be DRIVEN so
+        # its response (and the remote job id) is observed. Only a terminal
+        # request short-circuits with a stored response. Treating
+        # submitting/accepted as "done" (as an earlier version did) silently
+        # skipped wake registration after a lost response or a crash mid-request.
+        if request["status"] in {"creating", "submitting", "accepted"}:
+            result = control.run_request(remote_id, request, expected_state_epoch=expected)
+        else:
+            result = request
+        warnings = list(result.get("warnings") or [])
+        if notify_on and not wake_targets:
+            warnings.append(
+                "notify_on has no effect without wake_targets: it only sets the default events of a wake target. "
+                "Pass wake_me=True (or a wake_targets entry) to actually be woken."
+            )
+        response = result.get("response") or {}
+        remote_job_id = response.get("job_id") if isinstance(response, dict) else None
+        if wake_targets and remote_job_id:
+            non_terminal = [
+                str(target.get("type"))
+                for target in wake_targets
+                if not (set(target.get("events") or target.get("notify_on") or []) & TERMINAL_STATUSES)
+            ]
+            if non_terminal:
+                warnings.append(
+                    "non-terminal remote wakes are best-effort and will never fire if the matching event "
+                    "has expired from the remote retention window: " + ", ".join(non_terminal)
+                )
+            try:
+                get_manager().register_remote_wake_targets(remote_id, str(remote_job_id), wake_targets)
+            except Exception as exc:
+                logging.getLogger("vanth.daemon").warning(
+                    "remote wake targets were not registered remote=%s job=%s: %s",
+                    remote_id, remote_job_id, exc,
+                )
+                warnings.append(f"wake targets were NOT registered locally: {exc}")
+        if warnings:
+            result = {**result, "warnings": warnings}
+        return result
     if method == "job.stop":
         return control.stop(
             remote_id, job_id,
@@ -236,6 +280,160 @@ def _remote_submit(remote_id: str, method: str, payload: dict[str, Any]) -> dict
         overrides = {k: v for k, v in payload.items() if k != "job_id"}
         return control.rerun(remote_id, job_id, overrides, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
     return control.submit(remote_id, method, payload, idempotency_key=key, expected_state_epoch=expected, expected_instance_id=expected_instance)
+
+
+def _remote_wake_sync_once(manager: JobManager, control: Any, store: Any) -> None:
+    """Sync remote event feeds, then emit newly observed terminal wake events."""
+    bindings = manager.remote_wake_bindings()
+    if not bindings:
+        return
+    remote_ids = {binding["remote_id"] for binding in bindings}
+    # Only a binding that can fire on a NON-terminal event needs the event drain.
+    # A terminal-only binding (the common `wake_me=True`) is never gated by it, so
+    # a failing or unsupported event read cannot starve its terminal wake.
+    event_jobs = {
+        (binding["remote_id"], binding["remote_job_id"])
+        for binding in bindings
+        if any(event not in TERMINAL_STATUSES for event in (binding.get("events") or []))
+    }
+    # Jobs whose event backlog did not fully drain this tick. Their terminal wake
+    # MUST wait: the terminal deletes the binding, so an undrained checkpoint
+    # would be lost and could otherwise arrive after the terminal wake. The check
+    # FAILS SAFE — a job whose read failed or that the host omitted is undrained.
+    undrained: set[tuple[str, str]] = set()
+    for remote_id in remote_ids:
+        try:
+            control.feed_sync(remote_id)
+        except Exception:
+            logging.getLogger("vanth.daemon").warning(
+                "remote wake sync failed remote=%s", remote_id, exc_info=True
+            )
+        jobs_needing_events = sorted({job_id for (rid, job_id) in event_jobs if rid == remote_id})
+        if not jobs_needing_events:
+            continue
+        cursors: dict[str, int | None] = {}
+        for job_id in jobs_needing_events:
+            try:
+                cursors[job_id] = manager.remote_event_cursor(remote_id, job_id)
+            except Exception:
+                logging.getLogger("vanth.daemon").warning(
+                    "remote wake cursor read failed remote=%s job=%s", remote_id, job_id, exc_info=True
+                )
+        if not cursors:
+            undrained.update((remote_id, job_id) for job_id in jobs_needing_events)
+            continue
+        jobs: dict[str, Any] = {}
+        unsupported = False
+        for _ in range(5):
+            try:
+                info = control.events(remote_id, cursors)
+            except VanthRemoteProtocolError as exc:
+                # An older host without `job.events` cannot serve these events at
+                # all; degrade to terminal-only rather than blocking the terminal
+                # wake forever.
+                if exc.code == "UNSUPPORTED_FEATURE":
+                    unsupported = True
+                else:
+                    logging.getLogger("vanth.daemon").warning(
+                        "remote wake event sync failed remote=%s: %s", remote_id, exc
+                    )
+                break
+            except Exception:
+                logging.getLogger("vanth.daemon").warning(
+                    "remote wake event sync failed remote=%s", remote_id, exc_info=True
+                )
+                break
+            jobs = info.get("jobs") or {}
+            for job_id, job_info in jobs.items():
+                try:
+                    if cursors.get(job_id) is None:
+                        manager.set_remote_event_cursor(remote_id, job_id, job_info["next_seq"])
+                        cursors[job_id] = job_info["next_seq"]
+                    else:
+                        for event in job_info.get("events") or []:
+                            manager.emit_remote_event(remote_id, job_id, event, event["seq"])
+                            cursors[job_id] = event["seq"]
+                except Exception:
+                    logging.getLogger("vanth.daemon").warning(
+                        "remote wake event handling failed remote=%s job=%s", remote_id, job_id, exc_info=True
+                    )
+            if not any(job_info.get("has_more") for job_info in jobs.values()):
+                break
+        if unsupported:
+            continue
+        for job_id in jobs_needing_events:
+            info = jobs.get(job_id)
+            if info is None or info.get("has_more"):
+                undrained.add((remote_id, job_id))
+    for binding in bindings:
+        if (binding["remote_id"], binding["remote_job_id"]) in undrained:
+            continue
+        try:
+            shadow = store.get_shadow(binding["remote_id"], binding["remote_job_id"])
+        except ValueError:
+            # The shadow is absent or suppressed (the job was deleted/forgotten on
+            # the host), so the wake can never fire. Settle the binding instead of
+            # logging a traceback every tick forever.
+            manager.drop_remote_wake_binding(binding["remote_id"], binding["remote_job_id"])
+            continue
+        except Exception:
+            logging.getLogger("vanth.daemon").warning(
+                "remote wake inspection failed remote=%s job=%s",
+                binding.get("remote_id"), binding.get("remote_job_id"), exc_info=True,
+            )
+            continue
+        try:
+            if shadow.get("status") in TERMINAL_STATUSES:
+                manager.emit_remote_terminal(
+                    binding["remote_id"], binding["remote_job_id"], shadow["status"],
+                    exit_code=(shadow.get("payload") or {}).get("exit_code"),
+                )
+        except Exception:
+            logging.getLogger("vanth.daemon").warning(
+                "remote wake terminal emit failed remote=%s job=%s",
+                binding.get("remote_id"), binding.get("remote_job_id"), exc_info=True,
+            )
+
+
+def _prune_remote_request_rows(ttl_seconds: int) -> dict[str, Any]:
+    """Prune settled controller request/journal rows (poll-loop bookkeeping)."""
+    counts = get_remote_store().prune_requests(ttl_seconds)
+    journal = get_request_journal()
+    if journal is not None:
+        counts["journal"] = journal.prune_resolved(ttl_seconds)
+    return counts
+
+
+def _remote_wake_sync_loop() -> None:
+    def _number(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+        # inf/nan would raise in int() below and kill the sync thread.
+        if value != value or value in (float("inf"), float("-inf")):
+            return default
+        return value
+
+    interval = max(1.0, _number("VANTH_REMOTE_WAKE_SYNC_SECONDS", 5))
+    ttl = int(_number("VANTH_REMOTE_REQUEST_TTL_SECONDS", 604800))
+    prune_interval = max(60.0, _number("VANTH_REMOTE_PRUNE_INTERVAL_SECONDS", 3600))
+    next_prune = 0.0
+    while not shutdown_event.is_set():
+        if shutdown_event.wait(interval):
+            break
+        try:
+            _remote_wake_sync_once(get_manager(), get_remote_control(), get_remote_store())
+        except Exception:
+            logging.getLogger("vanth.daemon").exception("remote wake sync iteration failed")
+        if ttl > 0 and time.monotonic() >= next_prune:
+            next_prune = time.monotonic() + prune_interval
+            try:
+                counts = _prune_remote_request_rows(ttl)
+                if any(counts.values()):
+                    logging.getLogger("vanth.daemon").info("pruned remote request rows: %s", counts)
+            except Exception:
+                logging.getLogger("vanth.daemon").exception("remote request prune failed")
 
 
 def _remote_wait(remote_id: str, remote_job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1217,6 +1415,12 @@ def main() -> None:
         raise SystemExit(f"cannot bind {host}:{port}: {exc}") from exc
     _set_httpd(httpd)
     shutdown_event.clear()
+    try:
+        remote_wake_interval = float(os.environ.get("VANTH_REMOTE_WAKE_SYNC_SECONDS", "5"))
+    except ValueError:
+        remote_wake_interval = 5.0
+    if remote_wake_interval != 0:
+        threading.Thread(target=_remote_wake_sync_loop, name="remote-wake-sync", daemon=True).start()
     daemon_url = f"http://{host}:{port}"
     write_daemon_metadata(home, daemon_url)
 

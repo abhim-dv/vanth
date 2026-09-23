@@ -19,7 +19,7 @@ FRAME_KINDS = ("hello", "request", "response", "error", "snapshot", "log_range")
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 VALID_REQUEST_METHODS = (
-    "job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed",
+    "job.start", "job.stop", "job.rerun", "job.status", "job.snapshot", "job.log_range", "job.feed", "job.events",
     "artifact.transfer_init", "artifact.blob_chunk", "artifact.transfer_complete",
 )
 
@@ -280,6 +280,10 @@ FEED_DEFAULT_LIMIT = 100
 FEED_MAX_LIMIT = 500
 FEED_MAX_WAIT_MS = 10000
 FEED_ALLOWED = {"cursor", "limit", "wait_ms"}
+EVENTS_DEFAULT_LIMIT = 200
+EVENTS_MAX_LIMIT = 500
+EVENTS_MAX_JOBS = 50
+EVENTS_ALLOWED = {"cursors", "limit"}
 
 VALID_LOG_STREAMS = {"stdout", "stderr"}
 
@@ -444,6 +448,21 @@ def validate_request(method: str, payload: dict[str, Any]) -> None:
         _check_numeric_field(payload, "wait_ms", minimum=0)
         if (payload.get("wait_ms") or 0) > FEED_MAX_WAIT_MS:
             raise VanthRemoteProtocolError("INVALID_REQUEST", f"wait_ms must be <= {FEED_MAX_WAIT_MS}")
+    elif method == "job.events":
+        _check_required_and_unknown(payload, {"cursors"}, EVENTS_ALLOWED, "payload")
+        cursors = payload["cursors"]
+        if not isinstance(cursors, dict) or not cursors:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", "cursors must be a non-empty object")
+        if len(cursors) > EVENTS_MAX_JOBS:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", f"cursors must contain at most {EVENTS_MAX_JOBS} jobs")
+        for job_id, since in cursors.items():
+            if not isinstance(job_id, str) or not job_id:
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "cursor job ids must be non-empty strings")
+            if since is not None and (isinstance(since, bool) or not isinstance(since, int) or since < 0):
+                raise VanthRemoteProtocolError("INVALID_REQUEST", "event cursors must be null or non-negative integers")
+        _check_numeric_field(payload, "limit", minimum=1)
+        if (payload.get("limit") or EVENTS_DEFAULT_LIMIT) > EVENTS_MAX_LIMIT:
+            raise VanthRemoteProtocolError("INVALID_REQUEST", f"limit must be <= {EVENTS_MAX_LIMIT}")
     elif method == "job.log_range":
         _check_required_and_unknown(payload, LOG_RANGE_REQUIRED, LOG_RANGE_ALLOWED, "payload")
         _check_string_field(payload, "remote_job_id", required=True)

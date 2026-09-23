@@ -1,0 +1,89 @@
+from vanth import cli
+
+
+class RecordingClient:
+    payload = None
+
+    def __init__(self, *, home):
+        self.home = home
+
+    def ensure(self):
+        pass
+
+    def post(self, path, payload):
+        RecordingClient.payload = payload
+        return {"job_id": "j1", "status": "queued"}
+
+
+def test_wake_me_forms(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "VanthClient", RecordingClient)
+    assert cli.cmd_start(["--wake-me", "--", "echo", "ok"], tmp_path) == 0
+    assert RecordingClient.payload["wake_targets"] == [{
+        "type": "opencode_thread", "events": ["completed", "failed"]
+    }]
+    assert cli.cmd_start(["--wake-me=checkpoint", "--", "echo", "ok"], tmp_path) == 0
+    assert RecordingClient.payload["wake_targets"] == [{
+        "type": "opencode_thread", "events": ["checkpoint"]
+    }]
+
+
+def test_wake_me_empty_is_usage_error(capsys, tmp_path):
+    assert cli.cmd_start(["--wake-me=", "--", "echo", "ok"], tmp_path) == 2
+    assert "non-empty comma-separated" in capsys.readouterr().err
+
+
+def test_reassembled_shell_command_is_refused(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli, "VanthClient", RecordingClient)
+    assert cli.cmd_start(["--", "echo", "one", "&&", "echo", "two"], tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "refusing reassembled command" in err
+    assert "ONE quoted string" in err
+    assert 'echo one "&&" echo two' in err
+
+
+def test_single_token_shell_command_is_accepted(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "VanthClient", RecordingClient)
+    assert cli.cmd_start(["echo one && echo two"], tmp_path) == 0
+    assert RecordingClient.payload["command"] == "echo one && echo two"
+
+
+def test_operator_inside_a_token_is_not_refused(monkeypatch, tmp_path):
+    """A `|`/`>` inside a larger argument (`rg "a|b"`, `-DFOO>bar`) is quoted as
+    a whole by `_quote_for_cmd` and is safe; only a BARE operator token is the
+    mangling signature."""
+    monkeypatch.setattr(cli, "VanthClient", RecordingClient)
+    assert cli.cmd_start(["--", "rg", "a|b", "file.txt"], tmp_path) == 0
+    assert RecordingClient.payload["command"] == 'rg "a|b" file.txt'
+
+
+def test_bare_redirect_token_is_refused(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli, "VanthClient", RecordingClient)
+    assert cli.cmd_start(["--", "cmd", "/c", "ping", "-n", "3", "host", ">nul", "&&", "echo", "done"], tmp_path) == 2
+    assert "refusing reassembled command" in capsys.readouterr().err
+
+
+def test_literal_angle_bracket_argument_is_not_refused(monkeypatch, tmp_path):
+    """`<html>` is literal data, not an input redirect; only a token that IS the
+    operator (or a `>` output redirect) is refused."""
+    monkeypatch.setattr(cli, "VanthClient", RecordingClient)
+    assert cli.cmd_start(["--", "curl", "-d", "<html>", "http://x"], tmp_path) == 0
+    assert RecordingClient.payload["command"] == 'curl -d "<html>" http://x'
+
+
+def test_sleep_delegates_to_start(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_start(argv, home, *, json_out=False):
+        seen.update(argv=argv, home=home, json_out=json_out)
+        return 7
+
+    monkeypatch.setattr(cli, "cmd_start", fake_start)
+    assert cli.main(["sleep", "3"]) == 7
+    assert seen["argv"][:6] == ["--name", "sleep-3s", "--timeout", "63", "--", cli.sys.executable]
+    assert seen["argv"][-2:] == ["-c", "import time; time.sleep(3)"]
+
+
+def test_sleep_requires_positive_integer(capsys, tmp_path):
+    assert cli.cmd_sleep(["abc"], tmp_path) == 2
+    assert cli.cmd_sleep([], tmp_path) == 2
+    assert "positive number" in capsys.readouterr().err

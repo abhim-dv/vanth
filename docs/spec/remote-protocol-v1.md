@@ -185,8 +185,8 @@ Field semantics reuse Vanth's local `JobManager.start` / `stop` / `rerun` /
 | name | string | no | job name |
 | env | object | no | string → string environment overrides |
 | timeout_seconds | integer | no | `>= 1` |
-| notify_on | array | no | array of strings |
-| wake_targets | array | no | array of objects (Vanth wake target schema) |
+| notify_on | array | no | accepted but IGNORED on remote jobs (the controller registers remote wakes locally) |
+| wake_targets | array | no | accepted but IGNORED on remote jobs (the controller registers remote wakes locally) |
 | origin_thread_id | string | no | originating thread id |
 | tags | array | no | array of strings |
 | notes | string | no | free-form notes |
@@ -285,7 +285,26 @@ history (`seq + 1 < oldest_seq` once compaction lands), is gapped: the
 controller recovers through a Phase 3 full snapshot and resets its feed
 cursor to `high_water_seq`.
 
-### 4.8 `artifact.transfer_init`
+### 4.8 `job.events`
+
+Reads the remote's retained structured `events` table on a best-effort basis;
+the result is subject to the remote's event cap and retention policy. The
+request carries `cursors` (a non-empty object mapping remote job ids to a
+sequence number, or `null`) and an optional `limit` (default 200, maximum 500).
+A `null` cursor initializes that job at its current high-water sequence and
+returns no history, registering only for future events.
+
+The result is nested in the standard `response.result` object:
+
+```json
+{"kind":"events","state_epoch":1,"feed_epoch":1,"jobs":{
+  "job-id":{"events":[{"event_id":"…","job_id":"job-id","seq":1,
+  "type":"checkpoint","level":"info","message":"…","data_json":"{}",
+  "source":"runner","created_at":"…"}],"next_seq":1,
+  "high_water_seq":1,"has_more":false}}}
+```
+
+### 4.9 `artifact.transfer_init`
 
 Registers — or resumes — a durable bulk artifact transfer on the remote
 (Phase 9). Transfers live in the `remote_transfers` table on the remote
@@ -310,7 +329,7 @@ Re-registering the same `transfer_id` with a different content identity is
 rejected with `PROTOCOL_REPLAY_MISMATCH`; re-registering with the same
 identity resumes at the stored `acked_offset`.
 
-### 4.9 `artifact.blob_chunk`
+### 4.10 `artifact.blob_chunk`
 
 One chunk at a strict byte offset.
 
@@ -339,7 +358,7 @@ Every transfer response also reports the remote's current `state_epoch`. If
 it changed since registration the transfer stops rather than rebinding:
 further chunks are refused until a new epoch-consistent transfer exists.
 
-### 4.10 `artifact.transfer_complete`
+### 4.11 `artifact.transfer_complete`
 
 Finalizes a transfer once both sides agree on the whole content.
 

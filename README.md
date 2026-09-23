@@ -32,6 +32,18 @@ When MCP is unavailable, use the `vanth start` CLI fallback. Make jobs emit
 in the `vanth-monitor` dashboard; and let long jobs resume you via wake targets
 instead of you checking in.
 
+### Wake me when it finishes
+
+```cmd
+vanth start --wake-me -- <command>
+```
+
+The MCP equivalent is `job_start(command="...", wake_me=True)`. `--wake-me`
+defaults to `completed,failed`; use `--wake-me=completed,failed,checkpoint` to
+override the event list. Never use the relay client id
+`opencode-<pid>-<rand>` as `session_id`: pass the `ses_...` destination shown by
+`vanth doctor`, or omit `session_id` to resolve the live relay.
+
 ---
 
 ## Quick start
@@ -88,7 +100,7 @@ Once the MCP client is connected, this is the whole loop:
 job_start(
   command="uv run python examples\\long_job.py",
   name="demo run",
-  notify_on=["checkpoint", "failed", "completed"],
+  wake_me=True,
 )
 # -> job_<id>
 
@@ -133,7 +145,8 @@ for scripts.
 | `vanth doctor` | Full health report (same as `job_doctor`, human-readable; `--json`) |
 | `vanth restart` | Gracefully stop + start the daemon (jobs survive) |
 | `vanth setup [opencode] [codex] [claude] [--remove] [--yes]` | Register/unregister the MCP server in your clients' configs |
-| `vanth start [options] [--] <command...>` | Start a background job without MCP. Options: `--name`, `--cwd`, `--timeout`, `--env K=V`, `--wake JSON`, `--interactive`, `--priority`, `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`, `--policy JSON`; `--` passes command flags verbatim |
+| `vanth start [options] [--] <command...>` | Start a background job without MCP. Options: `--name`, `--cwd`, `--timeout`, `--env K=V`, `--wake JSON`, `--wake-me[=EVENTS]`, `--interactive`, `--priority`, `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`, `--policy JSON`; `--` passes command flags verbatim |
+| `vanth sleep <seconds>` | Start a trivial sleep job |
 | `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`); defaults to in-flight (launching/queued/running/…), `--all` shows finished jobs; running jobs show DURATION and AGE |
 | `vanth deliveries [--status S] [--job JOB_ID] [--limit N] [--json]` | List wake deliveries, attempts, and last errors |
 | `vanth wake <job_id> [--now] [--type T] [--events a,b] [--cwd DIR] [--config JSON] [--target JSON]` | Add a wake target to a job **after it started** (in-flight or finished). Fires on future events; `--now` surfaces a synthetic wake immediately. CLI counterpart of `job_add_wake_target` / `job_wake_now` |
@@ -162,13 +175,15 @@ pass the whole command as one quoted string for those). Repeated `--env`,
 quoted string or put the steps in a script file and start that.** Reassembling
 operators from separate arguments is where shell quoting goes wrong (and the
 classic PowerShell-5.1 failure mode is that a single-quoted string with inner
-quotes arrives split into garbage argv). `vanth start` warns when it detects
-this:
+quotes arrives split into garbage argv). `vanth start` refuses this with exit 2:
 
 ```cmd
-vanth start "cmd /c ping -n 30 host >nul && echo done"   # one quoted string
+vanth start "cmd /c echo done && timeout /t 30 /nobreak >nul" # one quoted string
 vanth start -- run.cmd                                     # or a script file
 ```
+
+For a trivial delay, use `vanth sleep <seconds>` rather than a shell sleep
+idiom.
 
 `--wake` takes the same wake-target JSON shape documented in
 [docs/agent-tools.md](docs/agent-tools.md). The global `--json` flag is
@@ -860,11 +875,12 @@ fabricates a `"completed"`/`"failed"` event.
 inherit the calling task's (`CODEX_THREAD_ID` / `VANTH_CODEX_DESKTOP_THREAD`);
 an explicit `thread_id` always wins. `opencode_thread` does **not** inherit the
 calling session (OpenCode never injects `OPENCODE_SESSION_ID` into MCP
-subprocesses): it resolves the session from the newest live plugin relay
-registered for the job's `cwd` (see `vanth doctor`), and otherwise requires an
-explicit `session_id`. A target naming an explicit session can be resumed by a
-subprocess (`opencode run --session`); the plugin relay is what lands the prompt
-in the TUI you are watching.
+subprocesses): it resolves the session from the newest registered plugin relay
+for the job's `cwd` (see `vanth doctor`). Omitting `session_id` therefore works
+whenever a relay is registered for that cwd; if none is, target creation fails
+with an actionable error. A target naming an explicit session can be resumed by
+a subprocess (`opencode run --session`); the plugin relay is what lands the
+prompt in the TUI you are watching.
 
 ### local_command
 
@@ -968,7 +984,7 @@ installing it.
 
 With the plugin loaded, `vanth start`/`job_start` can name just
 `{"type": "opencode_thread", "events": [...]}`: Vanth resolves the session from
-the relay registered for the job's `cwd` (an explicit `session_id` always wins).
+the newest relay registered for the job's `cwd` (an explicit `session_id` always wins).
 `vanth doctor` lists registered relays and their liveness — if none is `live`,
 `opencode_thread` wakes cannot be delivered. `attach` remains supported for
 headless `opencode serve` deployments and takes the direct-subprocess path.
@@ -1027,8 +1043,11 @@ services.
 With `auto_dispatch: false`, deliveries stay `pending` until an agent either
 dispatches them manually or changes the target.
 
-A target that omits `events` (or `notify_on`) inherits the job's top-level
-`notify_on` list. An explicit target `events` always wins:
+A target that omits `events` inherits the job's top-level `notify_on` list.
+`notify_on` is not a notification switch: it only supplies default `events` for
+an already-supplied `wake_targets` entry. Without `wake_targets` it notifies
+nobody — the job still starts, and the start response carries a `warnings`
+entry saying so. An explicit target `events` always wins:
 
 ```json
 job_start(command="...", notify_on=["checkpoint","failed"],
@@ -1322,6 +1341,18 @@ no SSH round trip (and accepts no filters beyond `limit`), while
 protocol (no `follow`/`grep`). `vanth remote pending` / `retry` reconcile
 requests whose response was lost.
 
+**Remote wakes.** `job_start(remote_id=..., wake_me=True)` (or `wake_targets=`)
+is supported: the wake targets are registered on the LOCAL daemon (never sent to
+the host). The local daemon polls the host's retained structured events, so a
+remote wake can match any event type (including `checkpoint`, `progress`, and
+`metric`) after the binding is registered. This is best-effort for non-terminal
+events, subject to the remote event cap/retention and the poll interval;
+terminal wakes remain durable via the change feed. The controller polls every
+`VANTH_REMOTE_WAKE_SYNC_SECONDS` (default 5; set `0` to disable). Settled
+controller request/journal rows from that polling are pruned after
+`VANTH_REMOTE_REQUEST_TTL_SECONDS` (default 604800 = 7 days; set `0` to
+disable), checked every `VANTH_REMOTE_PRUNE_INTERVAL_SECONDS` (default 3600).
+
 ---
 
 ## Agent usage tips
@@ -1346,7 +1377,9 @@ requests whose response was lost.
    history; `job_retry_delivery` requeues a failed one after fixing the cause.
 8. **Set a sane `timeout_seconds`** on `job_start` so a hung command becomes a
    `timeout` (terminal) state instead of running forever; the runner enforces it
-   even across daemon restarts.
+   even across daemon restarts. Pass the whole shell command as ONE quoted
+   string: a shell operator passed as its own argument (`&&`, `|`, `>nul`, ...)
+   is refused. Prefer `--wake-me` over hand-written wake JSON.
 9. **Clean up old state** with `job_cleanup(older_than_seconds=..., dry_run=false)`
    so the SQLite store and log files stay bounded.
 10. **Rerun failed jobs, don't rebuild them.** `job_rerun(job_id=...)` relaunches
@@ -1391,6 +1424,9 @@ Start it through `job_start` and watch it in `vanth monitor`.
   `opencode_thread` relay is `live`, the plugin is not loaded. Re-run
   `vanth setup opencode` and restart opencode. Without a live relay an
   `opencode_thread` target is rejected at creation rather than silently lost.
+- **Wake will never fire**: inspect `vanth deliveries --status pending` (or
+  `vanth deliveries --status failed`); `vanth doctor` reports
+  `pending_deliveries` and `undeliverable_wakes`.
 - **OpenCode wake timing out**: increase `timeout_seconds` on the wake target
   beyond the expected turn length.
 - **OpenCode wake failed with `Session not found`**: the wake target's
