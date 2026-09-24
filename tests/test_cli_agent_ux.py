@@ -1,3 +1,5 @@
+import os
+
 from vanth import cli
 
 
@@ -43,7 +45,7 @@ def test_reassembled_shell_command_is_refused(monkeypatch, capsys, tmp_path):
     err = capsys.readouterr().err
     assert "refusing reassembled command" in err
     assert "ONE quoted string" in err
-    assert 'echo one "&&" echo two' in err
+    assert ('echo one "&&" echo two' if os.name == "nt" else "echo one '&&' echo two") in err
 
 
 def test_single_token_shell_command_is_accepted(monkeypatch, tmp_path):
@@ -58,7 +60,8 @@ def test_operator_inside_a_token_is_not_refused(monkeypatch, tmp_path):
     mangling signature."""
     monkeypatch.setattr(cli, "VanthClient", RecordingClient)
     assert cli.cmd_start(["--", "rg", "a|b", "file.txt"], tmp_path) == 0
-    assert RecordingClient.payload["command"] == 'rg "a|b" file.txt'
+    expected = 'rg "a|b" file.txt' if os.name == "nt" else "rg 'a|b' file.txt"
+    assert RecordingClient.payload["command"] == expected
 
 
 def test_bare_redirect_token_is_refused(monkeypatch, capsys, tmp_path):
@@ -72,7 +75,8 @@ def test_literal_angle_bracket_argument_is_not_refused(monkeypatch, tmp_path):
     operator (or a `>` output redirect) is refused."""
     monkeypatch.setattr(cli, "VanthClient", RecordingClient)
     assert cli.cmd_start(["--", "curl", "-d", "<html>", "http://x"], tmp_path) == 0
-    assert RecordingClient.payload["command"] == 'curl -d "<html>" http://x'
+    expected = 'curl -d "<html>" http://x' if os.name == "nt" else "curl -d '<html>' http://x"
+    assert RecordingClient.payload["command"] == expected
 
 
 def test_sleep_delegates_to_start(monkeypatch, tmp_path):
