@@ -2,6 +2,30 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.12.3 - 2026-09-23
+
+### Agent usability
+
+- CLI `wait` and the CLI/MCP `wake_me` shorthand now cover every terminal
+  outcome by default: completed, failed, timeout, cancelled, and orphaned.
+- MCP tools have descriptions for all registered actions, and the agent tool
+  reference groups the available tools by task.
+- `doctor` summarizes relays and highlights failed delivery records while
+  retaining the full relay list in JSON output.
+- The quick start now includes MCP client verification, and CLI help and
+  examples are aligned with the available commands.
+- `vanth status` is documented as a read-only daemon check; it reports `DOWN`
+  on a fresh home instead of triggering autostart. Operational CLI commands and
+  MCP calls still start the daemon on demand.
+- `vanth setup` now documents creating a missing supported-client config before
+  registering Vanth, which lets first-run setup work on clean profiles.
+- Monitor instructions now distinguish published wheels, which bundle the
+  native Go executable, from source checkouts, where Go must be built once.
+- Client startup now identifies an occupied daemon port and points to the
+  daemon log when startup fails. Added recovery guidance and parameter-level
+  workflows for all 26 versioned-artifact MCP tools, including safe GC and
+  alias update usage.
+
 ## 1.12.2 - 2026-09-23
 
 ### Fixes

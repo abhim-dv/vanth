@@ -6929,7 +6929,7 @@ def job_start(
     idempotency_key: str | None = None,
     wake_me: bool = False,
 ) -> dict[str, Any]:
-    """Start a background job.
+    """Core: Start a background job and return its job ID; use ``job_wait`` or ``job_status`` to track it.
 
     ``pool`` queues the job behind a named concurrency pool instead of starting
     it immediately; ``priority`` (higher first) orders queued pool/trigger jobs.
@@ -6985,8 +6985,9 @@ def job_start(
     plugin relay for the job's directory; ``attach`` is optional (only for a
     headless ``opencode serve``). The daemon rejects a client id in
     ``session_id`` rather than enqueueing a wake that would never be claimed.
-    ``wake_me`` is shorthand for ``wake_targets=[{"type": "opencode_thread"}]``;
-    explicit ``wake_targets`` win when both are supplied.
+    ``wake_me`` wakes the calling OpenCode thread on every terminal outcome
+    (completed, failed, timeout, cancelled, or orphaned). Explicit
+    ``wake_targets`` win when both are supplied.
     """
     # Thread identity is resolved HERE, in the MCP process that owns the
     # calling task (review P1-4). The persistent daemon's environment belongs
@@ -7006,7 +7007,7 @@ def job_start(
         # not resolve an unrelated project's relay.
         wake_targets = [{
             "type": "opencode_thread",
-            "events": ["completed", "failed"],
+            "events": ["completed", "failed", "timeout", "cancelled", "orphaned"],
             "cwd": cwd or os.getcwd(),
         }]
     if wake_targets is not None:
@@ -7042,6 +7043,12 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
               notes: str | None = None, cwd: str | None = None, interactive: bool | None = None,
               secret_env: list[str] | None = None,
               remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+    """Core: Start a new job from this job's settings, overriding only supplied fields.
+
+    Use after inspecting a failed or completed run; this creates a new job ID.
+    Remote reruns require ``idempotency_key``. Check the returned ID with
+    ``job_status`` or ``job_wait``.
+    """
     payload = {key: value for key, value in {
         "command": command,
         "env": env,
@@ -7060,16 +7067,19 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
 
 @mcp.tool()
 def job_status_batch(job_ids: list[str], limit: int = 500) -> dict[str, Any]:
+    """Core: Get status for several job IDs in one call; use when tracking a batch of jobs."""
     return get_client().get("/status/batch", {"job_ids": ",".join(job_ids), "limit": limit})
 
 
 @mcp.tool()
 def job_status(job_id: str, remote_id: str | None = None) -> dict[str, Any]:
+    """Core: Check one job's current state and summary; pass ``remote_id`` for a paired host."""
     return get_client().get(f"/jobs/{job_id}/status", {"remote_id": remote_id})
 
 
 @mcp.tool()
 def job_send(job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
+    """Core: Send stdin to an interactive job; set ``eof=True`` when input is complete."""
     return get_client().post(f"/jobs/{job_id}/send", {"input": input, "eof": eof})
 
 
@@ -7164,32 +7174,38 @@ def remote_doctor(remote_id: str | None = None) -> dict[str, Any]:
 
 @mcp.tool()
 def job_view(thread_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """Core: Show recent jobs, optionally scoped to a thread; use to rediscover job IDs."""
     return get_client().get("/view", {"thread_id": thread_id, "limit": limit})
 
 
 @mcp.tool()
 def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20,
                reverse: bool = False) -> dict[str, Any]:
+    """Core: Read a job's structured event history; pass ``since_event_id`` to continue from a prior result."""
     return get_client().get(f"/jobs/{job_id}/events", {"since_event_id": since_event_id, "types": types, "limit": limit, "reverse": reverse})
 
 
 @mcp.tool()
 def job_deliveries(job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
+    """Core: Inspect wake notification deliveries; filter by job or status when diagnosing a missed wake."""
     return get_client().get("/deliveries", {"job_id": job_id, "status": status, "limit": limit})
 
 
 @mcp.tool()
 def job_mark_delivery(delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
+    """Advanced: Record a delivery outcome manually; use after external delivery handling or to stop retries."""
     return get_client().post(f"/deliveries/{delivery_id}/mark", {"status": status, "error": error})
 
 
 @mcp.tool()
 def job_retry_delivery(delivery_id: str) -> dict[str, Any]:
+    """Core: Retry a failed or retrying wake delivery; inspect ``job_delivery_attempts`` if it fails again."""
     return get_client().post(f"/deliveries/{delivery_id}/retry")
 
 
 @mcp.tool()
 def job_delivery_attempts(delivery_id: str, limit: int = 20) -> dict[str, Any]:
+    """Core: Inspect attempt history for one wake delivery to find why it was not delivered."""
     return get_client().get(f"/deliveries/{delivery_id}/attempts", {"limit": limit})
 
 
@@ -7394,11 +7410,13 @@ def schedule_next(schedule_id: str, count: int = 5) -> dict[str, Any]:
 
 @mcp.tool()
 def job_doctor() -> dict[str, Any]:
+    """Core: Check daemon and job-store health; use when Vanth tools fail or report inconsistent state."""
     return get_client().get("/doctor")
 
 
 @mcp.tool()
 def job_cleanup(older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
+    """Advanced: Preview or delete terminal jobs older than the given age; inspect the dry run before deleting."""
     return get_client().post("/cleanup", {"older_than_seconds": older_than_seconds, "dry_run": dry_run})
 
 

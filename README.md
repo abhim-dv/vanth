@@ -39,19 +39,20 @@ vanth start --wake-me -- <command>
 ```
 
 The MCP equivalent is `job_start(command="...", wake_me=True)`. `--wake-me`
-defaults to `completed,failed`; use `--wake-me=completed,failed,checkpoint` to
-override the event list. Never use the relay client id
-`opencode-<pid>-<rand>` as `session_id`: pass the `ses_...` destination shown by
-`vanth doctor`, or omit `session_id` to resolve the live relay.
+defaults to all terminal outcomes (`completed`, `failed`, `timeout`, `cancelled`,
+`orphaned`); use `--wake-me=completed,failed,checkpoint` to override the event
+list. Never use the relay client id `opencode-<pid>-<rand>` as `session_id`: use
+the `ses_...` destination in `vanth doctor --json`, or omit `session_id` to
+resolve the live relay automatically.
 
 ---
 
 ## Quick start
 
-Install via `pip` or `uv` (Python 3.11+):
+Install with `uv` (Python 3.11+):
 
 ```cmd
-pip install vanth              # or: uv tool install vanth
+uv tool install vanth
 ```
 
 This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
@@ -59,33 +60,49 @@ the ops CLI as standalone tools (the wheel bundles the native Go monitor, so
 no Go toolchain is needed). Wheels are published for Windows x86_64, Linux
 x86_64/arm64, and macOS x86_64/arm64.
 
-From a source checkout (development):
+From a source checkout (development), install the project environment with `uv sync` and run commands as `uv run vanth ...`. The rest of this guide shows the installed `vanth` command unless a row says `uv run`.
 
 ```cmd
-git clone https://github.com/abhim-dv/vanth.git && cd vanth
+git clone https://github.com/abhim-dv/vanth.git
+cd vanth
 uv sync
 ```
 
-The daemon **autostarts on demand**: the first MCP tool call or CLI command
-starts it if it isn't already running, so there is no separate "start the
-daemon" step.
+The daemon **autostarts on demand** for MCP calls and operational CLI commands.
+`vanth status` is an observational check: it reports `DOWN` if the daemon is
+stopped and does not start it. Use `vanth doctor` for health details; a normal
+MCP call or command such as `vanth list` will start the daemon on demand.
 
 1. **Register the MCP server** in opencode, Codex, and Claude-style clients:
 
    ```cmd
-   vanth setup                 # detect + configure everything found (prompts)
-   vanth setup --yes           # apply without prompting (scripts/CI)
-   vanth setup opencode codex  # only specific clients
+   vanth setup
    ```
 
-2. **Check health**:
+   This detects client configs and supported client commands on `PATH`, then
+   configures them with prompts. When a
+   supported client's config file is missing, setup creates it before adding
+   Vanth. Use `vanth setup --yes` for scripts, or name clients such as
+   `vanth setup opencode codex`.
+
+2. **Refresh and verify the client connection.** MCP clients usually load server
+   configuration at startup. Restart or reload the client after setup, then
+   confirm its tool picker/list includes `job_start`, `job_wait`, and
+   `job_doctor`. In OpenCode, `opencode mcp list` checks the connection. If the
+   server is missing, run `vanth status` and `vanth doctor`; for a source
+   checkout, make sure the client config launches `uv run vanth` from the repo.
+
+3. **Check health**:
 
    ```cmd
-   vanth status                # is the daemon up? pid, schema, running jobs, deliveries
-   vanth doctor                # full health report (same as job_doctor, human-readable)
+   vanth status
+   vanth doctor
    ```
 
-3. **Pick up updates** — after upgrading, restart the daemon so it runs the new
+   `status` shows daemon state and jobs without starting the daemon;
+   `doctor` prints the full health report and may start it on demand.
+
+4. **Pick up updates** — after upgrading, restart the daemon so it runs the new
    code. In-flight jobs survive (runners are detached):
 
    ```cmd
@@ -95,6 +112,16 @@ daemon" step.
 ### End-to-end: run a tracked job
 
 Once the MCP client is connected, this is the whole loop:
+
+| Goal | MCP tools |
+|---|---|
+| Start a job | `job_start` |
+| Wait for progress or completion | `job_wait` |
+| Inspect output or status | `job_status`, `job_run_summary`, `job_tail`, `job_events` |
+| Stop or retry work | `job_stop`, `job_rerun` |
+| Diagnose a wake | `job_deliveries`, `job_delivery_attempts`, `job_retry_delivery` |
+
+The complete MCP reference is [docs/agent-tools.md](docs/agent-tools.md).
 
 ```text
 job_start(
@@ -107,44 +134,48 @@ job_start(
 job_wait(job_id="job_<id>", filters=["checkpoint"], timeout_seconds=120)
 # -> returns the first checkpoint event + current status
 
-job_wait(job_id="job_<id>", filters=["completed", "failed"], timeout_seconds=300)
+job_wait(job_id="job_<id>", filters=["completed", "failed", "timeout", "cancelled", "orphaned"], timeout_seconds=300)
 # -> returns the terminal event + exit code
+
+# If it failed, inspect the summary and recent output:
+job_run_summary(job_id="job_<id>")
+job_tail(job_id="job_<id>", stream="stderr", max_bytes=8192)
 ```
 
 And in a third terminal, watch it live:
 
 ```cmd
-uv run vanth-monitor
+vanth-monitor
 ```
 
 ### Command-line entry points
 
-| Command | Purpose |
-|---|---|
-| `uv run vanth` | MCP stdio server (bridge to the daemon); also the human CLI below |
+| Installed command | Source checkout command | Purpose |
+|---|---|---|
+| `vanth` | `uv run vanth` | MCP stdio server and human CLI |
+| `vanthd` | `uv run vanthd` | Background HTTP daemon |
+| `vanth-monitor` | `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
+| `vanth-codex-notify` | `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin and dispatches it to Codex |
 
-The MCP stdio server self-terminates when its launching client dies or closes
-stdin, and reaps itself after `VANTH_WATCH_IDLE` seconds of idle (default 1800;
-`0` disables), so stale sessions never leave orphaned `vanth` processes. Blocking
-tool calls are never reaped mid-flight. `vanth doctor --reap-orphans` cleans up
-any orphans from older versions.
-| `uv run vanthd` | The background HTTP daemon |
-| `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
-| `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin, dispatches it to Codex |
+The MCP stdio server exits when its launching client closes stdin or dies, and
+reaps itself after `VANTH_WATCH_IDLE` seconds of idle (default 1800; `0`
+disables). It does not exit during a blocking tool call. `vanth doctor
+--reap-orphans` cleans up orphaned MCP servers left by older versions.
 
 ### Human CLI
 
-`vanth` doubles as a human-facing operations CLI. The daemon autostarts on
-demand for any of these. Every flag-based command supports `--json` where noted
-for scripts.
+`vanth` doubles as a human-facing operations CLI. Operational commands
+autostart the daemon on demand; bare `vanth status` is read-only and reports
+`DOWN` when it is stopped. `vanth status <job-id>` inspects a job and may start
+the daemon. Every flag-based command supports `--json` where noted for scripts.
 
 | Command | Purpose |
 |---|---|
-| `vanth --version` | Print the installed version |
-| `vanth status [<job-id>]` | Daemon up/down, pid, schema, running jobs, deliveries — or, with a job id, that one job's status/exit/runtime/last event (the CLI `job_status`) (`--json`) |
+| `vanth --version` / `vanth version` | Print the installed version |
+| `vanth status [<job-id>]` | Bare command: read-only daemon up/down, pid, schema, running jobs, deliveries. With a job id: inspect that job's status/exit/runtime/last event (may start daemon). (`--json`) |
 | `vanth doctor` | Full health report (same as `job_doctor`, human-readable; `--json`) |
 | `vanth restart` | Gracefully stop + start the daemon (jobs survive) |
-| `vanth setup [opencode] [codex] [claude] [--remove] [--yes]` | Register/unregister the MCP server in your clients' configs |
+| `vanth setup [opencode] [codex] [claude] [desktop] [--remove] [--yes]` | Register/unregister the MCP server in your clients' configs |
 | `vanth start [options] [--] <command...>` | Start a background job without MCP. Options: `--name`, `--cwd`, `--timeout`, `--env K=V`, `--wake JSON`, `--wake-me[=EVENTS]`, `--interactive`, `--priority`, `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`, `--policy JSON`; `--` passes command flags verbatim |
 | `vanth sleep <seconds>` | Start a trivial sleep job |
 | `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`); defaults to in-flight (launching/queued/running/…), `--all` shows finished jobs; running jobs show DURATION and AGE |
@@ -152,16 +183,23 @@ for scripts.
 | `vanth wake <job_id> [--now] [--type T] [--events a,b] [--cwd DIR] [--config JSON] [--target JSON]` | Add a wake target to a job **after it started** (in-flight or finished). Fires on future events; `--now` surfaces a synthetic wake immediately. CLI counterpart of `job_add_wake_target` / `job_wake_now` |
 | `vanth api` | Print the loopback HTTP surface and authentication details |
 | `vanth logs <job_id>` (`tail` alias) | Show a job's output (`--stream stdout\|stderr\|all`, `--offset`, `--max-bytes`, `--grep`, `--json`) |
-| `vanth wait <job_id>` | Block until an event fires (the CLI `job_wait`): `--events completed,failed`, `--timeout SECONDS`, `--since-event-id ID`. Exits 0 on the event, 3 on timeout |
+| `vanth wait <job_id>` | Block until an event fires (the CLI `job_wait`): defaults to terminal outcomes (`completed`, `failed`, `timeout`, `cancelled`, `orphaned`); `--events` narrows the set. Also accepts `--timeout SECONDS`, `--since-event-id ID`. Exits 0 on an event, 3 on timeout |
 | `vanth diff <job_id> <other>` | Compare two jobs' run specs |
 | `vanth stop <job_id>` | Stop a running job (`--signal`, `--kill-after`) |
 | `vanth artifacts <job_id>` | List a job's artifacts (`--limit`, `--json`) |
 | `vanth prune` | Manual retention cleanup; dry-run by default (`--older-than N`, `--yes`) |
+| `vanth backup [--out PATH] [--include-logs]` | Write an archive of jobs, artifacts, and events |
+| `vanth restore <archive> --yes [--force]` | Restore an archive |
+| `vanth remote <action>` | Pair, list, inspect, remove, or retry remote execution hosts |
 | `vanth autostart enable\|disable\|status` | Daemon survives reboots (Windows Task Scheduler / macOS launchd / Linux systemd user unit) |
+| `vanth help <command>` | Show command-specific help; `vanth --help` lists commands |
 
-Every command supports `-h`/`--help` (and `vanth help <command>`), and job-id
-arguments accept an **unambiguous prefix** — hand-copying a 12-character id is
-otherwise easy to get wrong, and an unknown id now suggests near matches.
+Run `vanth --help` for the command list. Command-specific help is available
+with `vanth <command> --help` for `status`, `doctor`, `list`, `start`, `logs`,
+`wait`, `stop`, `sleep`, `deliveries`, `wake`, `artifacts`, `diff`, `api`,
+`remote`, `backup`, `restore`, `prune`, `restart`, `setup`, `autostart`, and
+`version`. Job-id arguments accept an **unambiguous prefix**, and an unknown id
+suggests near matches.
 
 For `vanth start`, `<command...>` begins at the first non-option argument. A
 single argument is used verbatim (so a whole quoted command string works);
@@ -178,9 +216,11 @@ classic PowerShell-5.1 failure mode is that a single-quoted string with inner
 quotes arrives split into garbage argv). `vanth start` refuses this with exit 2:
 
 ```cmd
-vanth start "cmd /c echo done && timeout /t 30 /nobreak >nul" # one quoted string
-vanth start -- run.cmd                                     # or a script file
+vanth start "cmd /c echo done && timeout /t 30 /nobreak >nul"
+vanth start -- run.cmd
 ```
+
+The first command passes one quoted shell command; the second starts a script.
 
 For a trivial delay, use `vanth sleep <seconds>` rather than a shell sleep
 idiom.
@@ -198,9 +238,14 @@ vanth list --status running --limit 20 --json
 vanth logs job_abc123 --stream stderr --max-bytes 65536
 vanth stop job_abc123 --signal terminate --kill-after 10
 vanth artifacts job_abc123 --json
-vanth prune --older-than 604800 --yes     # actually delete (dry-run is the default)
-vanth autostart enable                     # daemon survives reboots
+vanth prune --older-than 604800 --yes
+vanth backup
+vanth remote list
+vanth autostart enable
 ```
+
+`vanth prune --yes` performs deletion; without `--yes`, it only previews.
+`vanth autostart enable` configures the daemon to start at login.
 
 `vanth restart` is the reliable way to pick up a code/version update: it sends
 the daemon a graceful shutdown over loopback, waits for the old process to
@@ -273,13 +318,13 @@ After installing the tool, connect it to the MCP clients on your machine in a
 single step:
 
 ```cmd
-uv tool install vanth
-vanth setup
+uv tool install vanth && vanth setup
 ```
 
-`vanth setup` detects your installed clients (opencode, Codex, and generic
-`mcpServers`-style clients such as Claude Code / Cursor), shows what it found,
-backs up each config before touching it (`.vanth-setup-<ts>.bak`), and upserts
+`vanth setup` detects existing client configs and supported client commands on
+`PATH` (OpenCode, Codex, and Claude Code), creates a missing config file for a
+selected client when needed, and shows what it found. It backs up each existing
+config before changing it (`.vanth-setup-<ts>.bak`), and upserts
 the Vanth MCP entry — leaving every other setting and comment untouched. OpenCode
 deep-merges `config.json`, `opencode.json`, and `opencode.jsonc` in that order
 (later files win). Setup reads JSONC read-only (comments are stripped in memory,
@@ -293,12 +338,16 @@ entry: an entry with `enabled: false` is `disabled`, and a file that cannot be
 parsed is `unreadable` rather than `not configured`.
 
 ```cmd
-vanth setup                  # detect + configure everything found (prompts)
-vanth setup --yes            # apply without prompting (scripts/CI)
-vanth setup opencode codex   # only specific clients
-vanth setup --json           # machine-readable result
-vanth setup --remove         # remove the Vanth MCP entries instead
+vanth setup
+vanth setup --yes
+vanth setup opencode codex
+vanth setup --json
+vanth setup --remove
 ```
+
+By default setup detects clients and prompts before applying changes. `--yes`
+skips prompts, client names limit the targets, `--json` prints machine-readable
+output, and `--remove` unregisters Vanth.
 
 Configs it manages:
 
@@ -644,7 +693,7 @@ backward.
 ### job_wait — the heart of agent usage
 
 ```text
-job_wait(job_id="job_...", filters=["checkpoint","failed","completed"], timeout_seconds=3600)
+job_wait(job_id="job_...", filters=["checkpoint","completed","failed","timeout","cancelled","orphaned"], timeout_seconds=3600)
 ```
 
 - waits for the **first event matching any filter**, returning it with the
@@ -878,7 +927,8 @@ calling session (OpenCode never injects `OPENCODE_SESSION_ID` into MCP
 subprocesses): it resolves the session from the newest registered plugin relay
 for the job's `cwd` (see `vanth doctor`). Omitting `session_id` therefore works
 whenever a relay is registered for that cwd; if none is, target creation fails
-with an actionable error. A target naming an explicit session can be resumed by
+with an actionable error. Use `vanth doctor --json` for the full relay/session
+list. A target naming an explicit session can be resumed by
 a subprocess (`opencode run --session`); the plugin relay is what lands the
 prompt in the TUI you are watching.
 
@@ -985,7 +1035,8 @@ installing it.
 With the plugin loaded, `vanth start`/`job_start` can name just
 `{"type": "opencode_thread", "events": [...]}`: Vanth resolves the session from
 the newest relay registered for the job's `cwd` (an explicit `session_id` always wins).
-`vanth doctor` lists registered relays and their liveness — if none is `live`,
+`vanth doctor` summarizes registered relays and their liveness;
+`vanth doctor --json` includes the full relay/session list. If none is `live`,
 `opencode_thread` wakes cannot be delivered. `attach` remains supported for
 headless `opencode serve` deployments and takes the direct-subprocess path.
 
@@ -1123,17 +1174,20 @@ The native Go dashboard reads the same home **read-only** and renders live
 plots, progress bars, the exact event table, and log tails:
 
 ```cmd
-uv run vanth-monitor
+vanth-monitor
 ```
 
-From a built wheel, `vanth-monitor` runs the bundled native binary (no Go
-toolchain needed). From a source checkout, it builds the monitor on first use
-and caches it under `~/.cache/vanth/` (requires `go` on PATH):
+Published platform wheels include the native Go binary, so `vanth-monitor`
+runs without a Go toolchain. In a source checkout on Windows, build it once
+from the repo root using `cmd.exe` (requires Go on `PATH`), then run the
+generated executable:
 
 ```cmd
-go build -o bin\vanth.exe ./cmd\vanth
-bin\vanth.exe monitor
+mkdir dist 2>nul & go build -o dist\vanth-monitor.exe .\cmd\vanth && dist\vanth-monitor.exe monitor
 ```
+
+The source checkout's `vanth-monitor` wrapper does not build or discover that
+output automatically; run the executable produced by `go build` directly.
 
 Keys: `up/down` or `j/k` select jobs · `enter` pins a job's series · `e` event
 table · `l` log tail · `s` slowest-runs table · `+`/`-` zoom a chart · `[`/`]`
@@ -1416,11 +1470,18 @@ Start it through `job_start` and watch it in `vanth monitor`.
   daemon expects. Confirm `VANTH_HOME` is the same for the daemon and client.
 - **Second daemon won't start**: `another vanthd already owns this VANTH_HOME`.
   One daemon per home by design.
+- **Daemon startup reports a bind/port error**: another process is using the
+  configured loopback port (default `8765`). Stop the conflicting process or
+  choose another port by setting `VANTH_DAEMON_PORT` consistently for the
+  daemon and its clients, then retry. A different `VANTH_HOME` prevents state
+  collisions between isolated instances but does not free a port shared by
+  them; assign each concurrent home a distinct port.
 - **Job stuck `running` then `orphaned`**: the runner process died. Check
   `logs/<job_id>.runner.log` and the heartbeat thresholds.
 - **No charts in the monitor**: the job isn't emitting `AGENT_EVENT` `metric` or
   `progress` lines — add them (optional).
-- **OpenCode wake never arrives (TUI session)**: check `vanth doctor` — if no
+- **OpenCode wake never arrives (TUI session)**: check `vanth doctor` for the
+  relay summary, or `vanth doctor --json` for all relay/session details. If no
   `opencode_thread` relay is `live`, the plugin is not loaded. Re-run
   `vanth setup opencode` and restart opencode. Without a live relay an
   `opencode_thread` target is rejected at creation rather than silently lost.
@@ -1447,11 +1508,14 @@ Start it through `job_start` and watch it in `vanth monitor`.
 ## Development
 
 ```cmd
-uv run pytest -q                 # Python suite
+uv run pytest -q
 uv run python -m compileall -q src tests examples
-uv build                         # sdist + wheel; wheel bundles the Go monitor
-go vet ./... && go test ./...    # Go: config, state, monitor
+uv build
+go vet ./...
+go test ./...
 ```
+
+`uv build` produces the sdist and wheel; the wheel bundles the Go monitor.
 
 The wheel build runs a hatchling build hook (`build-hooks/bundle_monitor.py`)
 that compiles the Go monitor for the host platform and bundles it under

@@ -307,7 +307,14 @@ def cmd_doctor(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         print(f"  home:          {report.get('home')}")
         print(f"  schema:        {report.get('schema_version')}")
         print(f"  tables:        {len(report.get('tables', []))}")
-        print(f"  deliveries:    {report.get('delivery_counts')}")
+        delivery_counts = report.get("delivery_counts") or {}
+        print(f"  deliveries:    {delivery_counts}")
+        failed_deliveries = delivery_counts.get("failed", 0)
+        if failed_deliveries:
+            print(
+                f"  failed_wakes:  {failed_deliveries} failed delivery record(s) "
+                "(inspect with `vanth deliveries --status failed`)"
+            )
         print(f"  codex:         {'available' if report.get('codex', {}).get('available') else 'MISSING'}")
         print(f"  opencode:      {'available' if report.get('opencode', {}).get('available') else 'MISSING'}")
         print(f"  quick_check:   {report.get('quick_check')}")
@@ -318,25 +325,25 @@ def cmd_doctor(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         relay_types = {"codex_desktop", "opencode_thread"}
         wake_relays = [r for r in relays if r.get("client_type") in relay_types]
         if wake_relays:
-            for relay in wake_relays:
-                age = relay.get("last_poll_age_seconds")
-                state = "live" if relay.get("live") else "STALE"
-                age_text = "never polled" if age is None else f"last poll {_humanize(age)} ago"
-                sessions = sorted(
-                    {
-                        d.get("session_id") or d.get("thread_id")
-                        for d in relay.get("destinations") or []
-                        if isinstance(d, dict) and (d.get("session_id") or d.get("thread_id"))
-                    }
-                )
-                # Show the wake DESTINATION (session_id) first: the client_id is
-                # the long-poll identity, not a wake target, and copying it into a
-                # target silently never wakes (see _reject_relay_client_id_sessions).
-                target_ids = ", ".join(sessions) if sessions else "(no destination)"
-                print(f"  relay:         {relay.get('client_type')} {target_ids} "
-                      f"[client {relay.get('client_id')}] {state} ({age_text})")
+            live_relays = sum(bool(relay.get("live")) for relay in wake_relays)
+            destination_ids = sorted({
+                str(destination_id)
+                for relay in wake_relays
+                for destination in relay.get("destinations") or []
+                if isinstance(destination, dict)
+                if (destination_id := (destination.get("session_id") or destination.get("thread_id")))
+            })
+            shown_ids = ", ".join(destination_ids[:3]) or "none"
+            if len(destination_ids) > 3:
+                shown_ids += f", +{len(destination_ids) - 3} more"
+            print(
+                f"  relays:        {len(wake_relays)} total, {live_relays} live, "
+                f"{len(wake_relays) - live_relays} stale; destinations: {shown_ids}"
+            )
+            if len(destination_ids) > 3:
+                print("                 full destination list: vanth doctor --json")
         else:
-            print("  relay:         none - codex_desktop/opencode_thread wakes cannot be delivered")
+            print("  relays:        none - codex_desktop/opencode_thread wakes cannot be delivered")
         undeliverable_wakes = report.get("undeliverable_wakes", 0)
         if undeliverable_wakes > 0:
             print(
@@ -845,7 +852,7 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
             command_tokens = list(argv[i + 1:])
             break
         if arg == "--wake-me" or arg.startswith("--wake-me="):
-            value = arg.partition("=")[2] if "=" in arg else "completed,failed"
+            value = arg.partition("=")[2] if "=" in arg else "completed,failed,timeout,cancelled,orphaned"
             parts = value.split(",")
             events = [part.strip() for part in parts]
             if not value or any(not event or not re.fullmatch(r"[A-Za-z0-9_.:-]+", event) for event in events):
@@ -1119,7 +1126,7 @@ def cmd_wait(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         print("vanth wait: missing job id", file=sys.stderr)
         return 2
     job_id = argv[0]
-    events = ["completed", "failed"]
+    events = ["completed", "failed", "timeout", "cancelled", "orphaned"]
     timeout_seconds = 3600
     since_event_id: str | None = None
     i = 1
@@ -1917,6 +1924,7 @@ def _usage() -> str:
         "  setup          register the MCP server in your clients' configs (one-shot)\n"
         "  autostart      enable/disable/status (daemon survives reboots)\n"
         "  version        print the installed package version\n"
+        "  api            list loopback HTTP routes and authentication details\n"
         "\n"
         "  help <command> show help for one command (same as `vanth <command> --help`)\n"
         "\n"
@@ -1941,7 +1949,7 @@ def _usage() -> str:
         "  job_rerun   -> vanth start --name N -- <command>   job_view -> vanth list\n"
         "  job_add_wake_target / job_wake_now -> vanth wake <id> [--now]\n"
         "  full workflow: vanth sleep 30\n"
-        "                 vanth wait <id> --events completed,failed\n"
+        "                 vanth wait <id>\n"
         "                 vanth status <id> && vanth logs <id>\n"
         "\n"
         "windows quoting (vanth start): a single quoted command string is used\n"
@@ -1989,33 +1997,34 @@ _COMMAND_HELP: dict[str, str] = {
              "  JSON options (--wake/--trigger/--policy) hit the same quoting wall:\n"
              "  write the object to a file and pass @path (or @- for stdin).\n"
              "\n"
-             "  wakes: --wake '{\"type\":\"opencode_thread\",\"events\":[\"completed\"]}'\n"
+             "  wakes: use --wake-me for the current OpenCode session, or --wake @wake.json\n"
              "  shorthand: vanth start --wake-me -- <command> (or --wake-me=completed,failed,checkpoint)\n"
-             "  needs NO session_id — the daemon resolves the live OpenCode plugin\n"
+             "  --wake-me defaults to completed,failed,timeout,cancelled,orphaned.\n"
+             "  needs NO session_id; the daemon resolves the live OpenCode plugin\n"
              "  relay for --cwd. Add \"session_id\":\"ses_...\" only to target a specific\n"
              "  session; never use the relay client id (opencode-<pid>-<rand>).\n"
              "\n"
              "  examples:\n"
              "    vanth start -- python train.py --epochs 10\n"
              "    vanth start --name train --cwd C:\\\\work -- python train.py\n"
-             "    vanth sleep 30                                      # background sleep\n"
+             "    vanth sleep 30\n"
              "    vanth start \"cmd /c ping -n 15 host >nul && echo ONBOARD_MARKER\"\n"
-             "    vanth start \"cmd /c ping -n 30 host >nul && echo done\"   # one string\n"
-             "    vanth start -- run.cmd                                 # script file\n"
-             "    vanth start --name j --wake @wake.json -- make -j8     # JSON from a file\n"
-             "    vanth start --name j --wake '{\"type\":\"opencode_thread\",\"events\":[\"completed\"]}' -- make -j8\n",
+             "    vanth start -- run.cmd\n"
+             "    vanth start --name j --wake @wake.json -- make -j8\n",
      "logs": "usage: vanth logs <job-id> [--stream stdout|stderr|all] [--max-bytes N]\n"
              "                   [--offset N] [--grep TEXT] [--json]\n"
              "  Captured output. Defaults: --stream stdout, --max-bytes 8192 (a tail;\n"
              "  raise it or page with --offset for more). `-h/--help` is help, not a job\n"
              "  id, and an unambiguous job-id prefix is accepted.\n"
              "  example: vanth logs job_abc123 --stream all --max-bytes 65536\n",
-    "wait": "usage: vanth wait <job-id> [--events completed,failed] [--timeout SECONDS]\n"
+    "wait": "usage: vanth wait <job-id> [--events completed,failed,timeout,cancelled,orphaned] [--timeout SECONDS]\n"
             "                  [--since-event-id ID] [--json]\n"
             "  Block until a matching event fires (the CLI counterpart of job_wait).\n"
             "  Exit 0 on the event, 3 on timeout (default --timeout 3600). It blocks,\n"
             "  so give it a timeout shorter than your own patience.\n"
-            "  example: vanth wait job_abc123 --events completed,failed --timeout 120\n",
+            "  By default, waits for any terminal outcome: completed, failed, timeout,\n"
+            "  cancelled, or orphaned. Pass --events to narrow the event types.\n"
+            "  example: vanth wait job_abc123 --timeout 120\n",
      "stop": "usage: vanth stop <job-id> [--signal terminate|kill] [--kill-after SECONDS]\n"
              "                  [--reason TEXT]\n"
              "  Stop a running job. terminate asks first and escalates to kill after\n"
@@ -2053,14 +2062,19 @@ _COMMAND_HELP: dict[str, str] = {
             "  Compare two jobs' run specs (command/env/cwd/tags/wake targets).\n",
     "api": "usage: vanth api [--json]\n  The loopback HTTP routes and how to authenticate.\n",
     "remote": "usage: vanth remote <pair|list|doctor|remove|pending|retry> [options]\n"
-              "  pair <user@host>  list  doctor  remove <id>  pending  retry <req-id>\n"
-              "  Run jobs on a paired host with the remote_id these commands return.\n",
+              "  pair <user@host> [--name N] [--allow-root]   create an SSH pairing\n"
+              "  list   doctor [--remote ID]   remove <id> [--yes]\n"
+              "  pending [--remote ID]   retry <request-id>\n"
+              "  Pairing prepares SSH hosts for remote execution; use the returned\n"
+              "  remote_id with Vanth's remote execution tools.\n",
     "backup": "usage: vanth backup [--out PATH]\n  One archive of jobs + artifacts + events.\n",
     "restore": "usage: vanth restore <archive> --yes\n  Restore a backup archive.\n",
     "prune": "usage: vanth prune [--older-than SECONDS] [--yes]\n  Remove terminal jobs (dry run by default).\n",
     "restart": "usage: vanth restart\n  Gracefully restart the daemon; running jobs survive.\n",
-    "setup": "usage: vanth setup [client...] [--remove] [--yes] [--json]\n"
-             "  Register the MCP server (and the OpenCode wake plugin) in client configs.\n",
+    "setup": "usage: vanth setup [opencode] [codex] [claude] [desktop] [--remove] [--yes] [--json]\n"
+             "  Register Vanth MCP in selected clients; with no clients, configure\n"
+             "  detected clients. OpenCode setup also installs its wake plugin.\n"
+             "  --remove removes the registration; --yes skips confirmation.\n",
     "autostart": "usage: vanth autostart <enable|disable|status>\n  Whether the daemon survives reboots.\n",
     "version": "usage: vanth version\n  Print the installed package version.\n",
 }

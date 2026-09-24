@@ -113,6 +113,16 @@ class VanthClient:
                 return
         except Exception:
             pass
+        try:
+            occupied = self.get("/health", timeout=1) == {"ok": True}
+        except (OSError, ValueError):
+            occupied = False
+        if occupied:
+            raise RuntimeError(
+                f"a service is already responding at {self.url}, but Vanth cannot use it with "
+                f"VANTH_HOME={self.home}; use a free VANTH_DAEMON_PORT for a separate home "
+                "or check its token and schema"
+            )
         subprocess.Popen(
             [sys.executable, "-m", "vanth.daemon"],
             stdin=subprocess.DEVNULL,
@@ -129,7 +139,7 @@ class VanthClient:
             except Exception:
                 pass
             time.sleep(0.1)
-        raise RuntimeError("vanthd did not start")
+        raise RuntimeError(f"vanthd did not start; inspect {self.home / 'logs' / 'daemon.log'}")
 
     def get(self, path: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
         url = self.url + path
