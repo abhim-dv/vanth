@@ -9,6 +9,7 @@ import pytest
 
 from vanth.client import VanthClient
 from vanth.migrations import LATEST_SCHEMA_VERSION
+from vanth import cli
 
 
 def free_port():
@@ -100,6 +101,55 @@ def test_doctor_ok(daemon):
     result = run_cli(tmp_path / "state", "doctor", port=port)
     assert result.returncode == 0
     assert "OK" in result.stdout
+
+
+def test_doctor_summarizes_relays_and_failed_delivery_history(tmp_path, monkeypatch, capsys):
+    report = {
+        "ok": True,
+        "home": str(tmp_path),
+        "schema_version": 1,
+        "tables": [],
+        "delivery_counts": {"failed": 4, "delivered": 8},
+        "codex": {"available": True},
+        "opencode": {"available": True},
+        "quick_check": "ok",
+        "maintenance_alive": True,
+        "disk_free_bytes": 1024,
+        "relays": [
+            {
+                "client_type": "opencode_thread",
+                "client_id": "relay-private-id",
+                "live": True,
+                "destinations": [{"session_id": f"session-{i}"} for i in range(5)],
+            },
+            {"client_type": "codex_desktop", "live": False, "destinations": []},
+        ],
+    }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def ensure(self):
+            pass
+
+        def get(self, path):
+            assert path == "/doctor"
+            return report
+
+    monkeypatch.setattr(cli, "VanthClient", FakeClient)
+    monkeypatch.setattr(cli, "_print_setup_status", lambda: None)
+    assert cli.cmd_doctor([], tmp_path) == 0
+    output = capsys.readouterr().out
+    assert "2 total, 1 live, 1 stale" in output
+    assert "session-0, session-1, session-2, +2 more" in output
+    assert "relay-private-id" not in output
+    assert "4 failed delivery record(s)" in output
+    assert "full destination list: vanth doctor --json" in output
+    assert "vanth deliveries --status failed" in output
+
+    assert cli.cmd_doctor([], tmp_path, json_out=True) == 0
+    assert json.loads(capsys.readouterr().out) == report
 
 
 def test_restart_starts_fresh_daemon(tmp_path):

@@ -414,6 +414,19 @@ def test_cli_wait_returns_the_event_and_times_out_with_3(daemon):
     client.post(f"/jobs/{long_job}/stop", {"signal": "kill"})
 
 
+def test_cli_wait_defaults_to_every_terminal_outcome(daemon):
+    tmp_path, client, port = daemon
+    job_id = client.post(
+        "/jobs", {"command": cmd("import time; time.sleep(30)"), "name": "wait-cancelled"}
+    )["job_id"]
+    client.post(f"/jobs/{job_id}/stop", {"signal": "kill"})
+    wait_status(client, job_id, ["cancelled"])
+
+    result = run_cli(tmp_path / "state", "wait", job_id, "--timeout", "5", port=port)
+    assert result.returncode == 0, result.stderr
+    assert "cancelled" in result.stdout
+
+
 def test_cli_logs_accepts_a_job_id_prefix(daemon):
     """Observed onboarding failure: one dropped character from a hand-copied id
     produced "unknown job" with no hint."""
@@ -427,10 +440,13 @@ def test_cli_logs_accepts_a_job_id_prefix(daemon):
 
 def test_cli_per_command_help_does_not_report_unknown_option(daemon):
     tmp_path, client, port = daemon
-    for command in ("start", "list", "logs", "stop", "wait", "diff"):
+    for command in ("start", "list", "logs", "stop", "wait", "diff", "setup", "remote", "api"):
         result = run_cli(tmp_path / "state", command, "--help", port=port)
         assert result.returncode == 0, f"{command}: {result.stderr}"
         assert f"usage: vanth {command}" in result.stdout
+
+    root_help = run_cli(tmp_path / "state", "--help", port=port)
+    assert "api            list loopback HTTP routes" in root_help.stdout
 
 
 def test_remote_tail_route_validates_and_reaches_the_remote(daemon):
@@ -842,15 +858,16 @@ def test_remove_with_no_config_at_all_succeeds(tmp_path, monkeypatch):
     assert setup.run_setup(["opencode"], home=tmp_path, remove=True, assume_yes=True) == 0
 
 
-def test_run_setup_records_missing_requested_client(tmp_path, monkeypatch, capsys):
+def test_run_setup_creates_missing_requested_client(tmp_path, monkeypatch, capsys):
     codex = tmp_path / "config.toml"
     codex.write_text('model = "x"\n', encoding="utf-8")
     monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {"codex": [codex]})
+    monkeypatch.setattr(setup, "_default_config_path", lambda client: tmp_path / f"{client}.json")
     result = setup.run_setup(["opencode", "codex"], home=tmp_path, assume_yes=True, json_out=True)
-    assert result == 1
+    assert result == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is False
-    assert any(item["client"] == "opencode" for item in payload["skipped"])
+    assert payload["ok"] is True
+    assert json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))["mcp"]["vanth"]
 
 
 def test_remove_clears_every_registration(tmp_path, monkeypatch):

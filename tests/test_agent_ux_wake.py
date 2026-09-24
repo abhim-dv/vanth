@@ -125,7 +125,7 @@ def test_mcp_job_start_wake_me_payload(monkeypatch):
     assert captured["path"] == "/jobs"
     target = captured["payload"]["wake_targets"][0]
     assert target["type"] == "opencode_thread"
-    assert target["events"] == ["completed", "failed"]
+    assert target["events"] == ["completed", "failed", "timeout", "cancelled", "orphaned"]
     assert target["cwd"]  # pins relay resolution to the caller's directory
     server_mod.job_start(command="echo hi", wake_me=True, cwd="D:\\proj")
     assert captured["payload"]["wake_targets"][0]["cwd"] == "D:\\proj"

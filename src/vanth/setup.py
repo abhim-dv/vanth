@@ -3,8 +3,9 @@
 `vanth setup` connects the MCP server to the agent clients installed on this
 machine. It detects known clients, shows what it found, lets the user pick
 which to configure (interactively, or via flags for scripting), backs up any
-config it touches, and upserts the Vanth MCP entry without clobbering the rest
-of the file.
+existing config it changes, and upserts the Vanth MCP entry without clobbering
+the rest of the file. For a selected client with no config, it safely creates
+the standard config file.
 
 It writes the exact format each client expects:
 
@@ -14,7 +15,8 @@ It writes the exact format each client expects:
   ``mcpServers.vanth``
 
 Only the user's own config files are modified; nothing is installed or run.
-A timestamped ``.vanth-setup-<ts>.bak`` backup is written before any change.
+A timestamped ``.vanth-setup-<ts>.bak`` backup is written before changing an
+existing file; newly created files have no prior contents to back up.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -64,6 +67,11 @@ def client_config_paths(home: Path | None = None) -> dict[str, list[Path]]:
             if path.is_file():
                 found.setdefault(client, []).append(path)
     return found
+
+
+def _default_config_path(client: str) -> Path:
+    """Return the usual config path for a selected client."""
+    return Path(_CLIENTS[client][1]).expanduser()
 
 
 OPENCODE_PLUGIN_FILENAME = "vanth.ts"
@@ -121,10 +129,27 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _write_new(path: Path, text: str) -> None:
+    """Create a config only if it is still absent; never replace a racing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False
+    ) as stream:
+        tmp = Path(stream.name)
+        stream.write(text)
+    try:
+        # A hard link publishes the complete file atomically and fails if a
+        # client created its config after setup inspected the path.
+        os.link(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _merge_json(path: Path, merge_fn) -> tuple[bool, str]:
     """Merge into a JSON file, preserving everything except the key set by
     ``merge_fn``. Returns (changed, summary)."""
-    original = path.read_text(encoding="utf-8")
+    existed = path.exists()
+    original = path.read_text(encoding="utf-8") if existed else "{}"
     try:
         data = json.loads(original)
     except json.JSONDecodeError:
@@ -134,8 +159,12 @@ def _merge_json(path: Path, merge_fn) -> tuple[bool, str]:
     after = json.dumps(data, sort_keys=True)
     if after == before:
         return False, "already configured"
-    _backup(path)
-    _write_atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    if existed:
+        _backup(path)
+        _write_atomic(path, text)
+    else:
+        _write_new(path, text)
     return True, "updated"
 
 
@@ -185,7 +214,8 @@ def register_codex(path: Path, home: Path) -> tuple[bool, str]:
         import tomllib
     except ImportError:  # pragma: no cover - 3.11+ always has it
         return False, "tomllib unavailable"
-    original = path.read_text(encoding="utf-8")
+    existed = path.exists()
+    original = path.read_text(encoding="utf-8") if existed else ""
     try:
         data = tomllib.loads(original)
     except tomllib.TOMLDecodeError:
@@ -238,8 +268,11 @@ def register_codex(path: Path, home: Path) -> tuple[bool, str]:
     new_text = "\n".join(out).rstrip() + "\n"
     if new_text == original.rstrip("\n") + "\n":
         return False, "already configured"
-    _backup(path)
-    _write_atomic(path, new_text)
+    if existed:
+        _backup(path)
+        _write_atomic(path, new_text)
+    else:
+        _write_new(path, new_text)
     return True, "updated"
 
 
@@ -625,7 +658,10 @@ def run_setup(
     home = home or canonical_home()
     found = client_config_paths(home)
 
-    requested = list(clients or found.keys())
+    requested = list(clients or dict.fromkeys([
+        *found,
+        *(client for client in _CLIENTS if shutil.which(client)),
+    ]))
     if clients:
         unknown = set(clients) - {"opencode", "codex", "claude"}
         if unknown:
@@ -642,10 +678,10 @@ def run_setup(
     for client in requested:
         paths = found.get(client, [])
         if not paths:
-            # A requested client with no config file cannot be registered; for
-            # removal there is simply nothing to do.
+            # A requested client with no config gets its standard config path.
+            # Bare setup requests only detected configs and installed clients.
             if not remove:
-                skipped.append((client, "no config file found"))
+                targets.append((client, _default_config_path(client)))
             continue
         if remove:
             # Removal must clean EVERY safe registration: selecting a single
@@ -732,7 +768,7 @@ def run_setup(
             failures += 1
     # The OpenCode wake plugin is part of onboarding OpenCode: TUI sessions have
     # no attach URL, so opencode_thread wakes are undeliverable without it.
-    if "opencode" in requested and found.get("opencode"):
+    if "opencode" in requested and (found.get("opencode") or (not remove and any(c == "opencode" for c, _ in targets))):
         try:
             changed, summary = remove_opencode_plugin() if remove else install_opencode_plugin()
         except Exception as exc:

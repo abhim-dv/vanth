@@ -16,9 +16,10 @@ def _isolate_opencode_plugin_dir(tmp_path, monkeypatch):
     """`run_setup` installs/removes the OpenCode wake plugin: a test must never
     touch the developer's real ~/.config/opencode/plugins."""
     monkeypatch.setenv("VANTH_OPENCODE_PLUGIN_DIR", str(tmp_path / "opencode-plugins"))
+    monkeypatch.setattr(setup.shutil, "which", lambda name: None)
 
 
-def _scratch_configs(tmp_path):
+def _scratch_configs(tmp_path, monkeypatch):
     """Create fake opencode/codex/claude configs in tmp_path and point setup
     discovery at them. Returns the three paths."""
     opencode_path = tmp_path / "opencode.json"
@@ -31,17 +32,17 @@ def _scratch_configs(tmp_path):
     codex_path.write_text('[model]\nname = "gpt"\n\n[mcp_servers.other]\ncommand = "other"\n', encoding="utf-8")
     claude_path.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}, indent=2), encoding="utf-8")
 
-    setup.client_config_paths = lambda home=None: {
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {
         "opencode": [opencode_path],
         "codex": [codex_path],
         "claude": [claude_path],
-    }
+    })
     return opencode_path, codex_path, claude_path
 
 
 def test_register_all_clients_and_idempotence(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin", None)
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
     home = canonical_home()
 
     assert setup.run_setup(None, home=home, assume_yes=True) == 0
@@ -76,8 +77,52 @@ def test_register_all_clients_and_idempotence(tmp_path, monkeypatch):
     assert json.loads(opencode_path.read_text(encoding="utf-8"))["mcp"]["vanth"] is not None
 
 
-def test_remove_all_clients(tmp_path):
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+def test_explicit_setup_creates_missing_client_configs_without_backups(tmp_path, monkeypatch):
+    paths = {
+        "opencode": tmp_path / ".config" / "opencode" / "opencode.json",
+        "codex": tmp_path / ".codex" / "config.toml",
+        "claude": tmp_path / ".claude.json",
+    }
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {})
+    monkeypatch.setattr(setup, "_default_config_path", paths.__getitem__)
+    home = tmp_path / "vanth-home"
+
+    assert setup.run_setup(["opencode", "codex", "claude"], home=home, assume_yes=True) == 0
+
+    opencode = tmp_path / ".config" / "opencode" / "opencode.json"
+    codex = tmp_path / ".codex" / "config.toml"
+    claude = tmp_path / ".claude.json"
+    assert json.loads(opencode.read_text(encoding="utf-8"))["mcp"]["vanth"]["enabled"] is True
+    assert "[mcp_servers.vanth]" in codex.read_text(encoding="utf-8")
+    assert json.loads(claude.read_text(encoding="utf-8"))["mcpServers"]["vanth"]["command"] == "vanth"
+    assert list(tmp_path.rglob("*.vanth-setup-*.bak")) == []
+
+
+def test_bare_setup_creates_configs_for_detected_installed_clients(tmp_path, monkeypatch):
+    config = tmp_path / ".codex" / "config.toml"
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {})
+    monkeypatch.setattr(setup, "_default_config_path", lambda client: config)
+    monkeypatch.setattr(setup.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+
+    assert setup.run_setup(home=tmp_path / "vanth-home", assume_yes=True) == 0
+
+    assert "[mcp_servers.vanth]" in config.read_text(encoding="utf-8")
+    assert not (tmp_path / ".claude.json").exists()
+
+
+def test_write_new_never_replaces_a_config_that_appeared(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text('{"other": true}\n', encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        setup._write_new(config, '{"mcp": {"vanth": {}}}\n')
+
+    assert config.read_text(encoding="utf-8") == '{"other": true}\n'
+    assert list(tmp_path.glob("config.json.*.tmp")) == []
+
+
+def test_remove_all_clients(tmp_path, monkeypatch):
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
     home = canonical_home()
 
     setup.run_setup(None, home=home, assume_yes=True)
@@ -96,16 +141,16 @@ def test_remove_all_clients(tmp_path):
     assert cl["mcpServers"]["other"] is not None
 
 
-def test_backups_are_written_before_change(tmp_path):
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+def test_backups_are_written_before_change(tmp_path, monkeypatch):
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
     home = canonical_home()
     setup.run_setup(None, home=home, assume_yes=True)
     backups = list(tmp_path.glob("*.bak"))
     assert len(backups) == 3
 
 
-def test_detect_status(tmp_path):
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+def test_detect_status(tmp_path, monkeypatch):
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
     home = canonical_home()
     status = setup.detect_status(home)
     assert status["opencode"][0]["configured"] is False
@@ -114,35 +159,35 @@ def test_detect_status(tmp_path):
     assert all(entry["configured"] for entries in status.values() for entry in entries)
 
 
-def test_unknown_client_is_usage_error(tmp_path):
-    _scratch_configs(tmp_path)
+def test_unknown_client_is_usage_error(tmp_path, monkeypatch):
+    _scratch_configs(tmp_path, monkeypatch)
     home = canonical_home()
     assert setup.run_setup(["bogus"], home=home, assume_yes=True) == 2
 
 
-def test_no_configs_found_returns_one(tmp_path):
+def test_no_configs_found_returns_one(tmp_path, monkeypatch):
     home = tmp_path / "empty"
     home.mkdir()
-    setup.client_config_paths = lambda home=None: {}
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {})
     assert setup.run_setup(None, home=home, assume_yes=True) == 1
 
 
-def test_mcp_startup_hint_mentions_unconfigured_clients(tmp_path, capsys):
+def test_mcp_startup_hint_mentions_unconfigured_clients(tmp_path, capsys, monkeypatch):
     import vanth.server as server
 
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
-    setup.client_config_paths = lambda home=None: {"claude": [claude_path]}
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {"claude": [claude_path]})
     server._hint_setup()
     captured = capsys.readouterr()
     assert "vanth setup" in captured.err
 
 
-def test_mcp_startup_hint_silent_when_all_configured(tmp_path, capsys):
+def test_mcp_startup_hint_silent_when_all_configured(tmp_path, capsys, monkeypatch):
     import vanth.server as server
 
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
     setup.run_setup(None, home=canonical_home(), assume_yes=True)
-    setup.client_config_paths = lambda home=None: {"opencode": [opencode_path]}
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {"opencode": [opencode_path]})
     server._hint_setup()
     captured = capsys.readouterr()
     assert "vanth setup" not in captured.err
@@ -151,18 +196,18 @@ def test_mcp_startup_hint_silent_when_all_configured(tmp_path, capsys):
 def test_mcp_startup_hint_respects_env_opt_out(tmp_path, capsys, monkeypatch):
     import vanth.server as server
 
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
-    setup.client_config_paths = lambda home=None: {"opencode": [opencode_path]}
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {"opencode": [opencode_path]})
     monkeypatch.setenv("VANTH_NO_SETUP_HINT", "1")
     server._hint_setup()
     captured = capsys.readouterr()
     assert "vanth setup" not in captured.err
 
 
-def test_status_line_prints_client_states(tmp_path, capsys):
+def test_status_line_prints_client_states(tmp_path, capsys, monkeypatch):
     from vanth.cli import _print_setup_status
 
-    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path)
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
     _print_setup_status()
     captured = capsys.readouterr()
     assert "opencode=not configured" in captured.out

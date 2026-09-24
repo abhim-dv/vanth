@@ -1,8 +1,10 @@
 # Vanth agent tool surface
 
 This is the reference contract for the MCP tools an agent sees when connected
-to Vanth. Every tool talks to the local daemon over HTTP; the daemon is
-started on demand if it isn't already running. All responses are JSON objects.
+to Vanth. Agents call these MCP tools directly; Vanth handles the local HTTP
+connection to its daemon internally and starts the daemon on demand. Agents do
+not need to construct HTTP requests for the workflows below. All responses are
+JSON objects.
 
 Conventions:
 
@@ -15,23 +17,87 @@ Conventions:
 - `limit` is validated to 1–1000 (up to 10000 for metrics, 50000 for
   dashboard, 1000 for artifacts).
 
-The current tool set is `job_start`, `job_rerun`, `job_status`,
-`job_status_batch`, `job_send`, `job_list`, `job_view`, `job_events`,
-`job_deliveries`, `job_mark_delivery`, `job_retry_delivery`,
-`job_delivery_attempts`, `job_tail`, `job_wait`, `job_stop`, `job_pause`,
-`job_resume`, `job_doctor`, `job_cleanup`, `job_metrics_query`,
-`job_metric_compare`, `job_duration_stats`, `job_run_summary`,
-`job_artifact_add`, `job_artifacts`, `job_dashboard`, `job_metric_ingest`,
-`job_artifact_read`, `job_add_wake_target`, `job_wake_now`, `job_cleanup_preview`,
-`job_request_decision`, `job_resolve`, `job_withdraw_decision`, `job_decisions`,
-`pool_configure`, `pool_list`, `schedule_create`, `schedule_list`,
-`schedule_update`, `schedule_delete`, `schedule_next`, `remote_list`, `remote_doctor`.
-The wake tools (`job_add_wake_target` / `job_wake_now` /
-`daemon_wake`) and their `daemon_wake` / `job_wake_now` / `job_add_wake_target`
-Python counterparts, plus `job_wait` `return_progress` and `job_tail` `follow` /
-`timeout_seconds`, are documented below. The MCP tools are registered under
-these external names (the rc37 contract) — the `mcp_`-prefixed implementation
-names are NOT exposed to agents.
+## Tool map
+
+This guide describes the MCP names registered by the current server. Use the
+core job tools for the usual start, wait, inspect, and recover loop; the rest
+are optional surfaces for delivery management, scheduling, metrics, artifacts,
+and remote execution.
+
+| Need | Tools | Reference |
+|---|---|---|
+| Start and control work | `job_start`, `job_rerun`, `job_send`, `job_stop`, `job_pause`, `job_resume` | [Start](#job_start), [rerun](#job_rerun), [interactive stdin](#job_send), [stop](#job_stop) |
+| Wait and inspect | `job_wait`, `job_status`, `job_status_batch`, `job_list`, `job_view`, `job_tail`, `job_events`, `job_run_summary`, `job_diff` | [status](#job_status), [list](#job_list), [events](#job_events), [wait](#job_wait), [summary](#job_run_summary) |
+| Wake a session | `job_add_wake_target`, `job_wake_now`; `daemon_wake` is a deprecated alias | [Wake targets](#job_add_wake_target) |
+| Diagnose deliveries | `job_deliveries`, `job_mark_delivery`, `job_retry_delivery`, `job_delivery_attempts`, `job_clear_deliveries` | [Delivery tools](#job_deliveries) |
+| Coordinate jobs | `job_request_decision`, `job_resolve`, `job_withdraw_decision`, `job_decisions`, `pool_configure`, `pool_list`, `schedule_create`, `schedule_list`, `schedule_update`, `schedule_delete`, `schedule_next` | [Decisions](#job_request_decision--job_resolve--job_withdraw_decision--job_decisions), [pools](#pool_configure--pool_list), [schedules](#schedule_create--schedule_list--schedule_update--schedule_delete--schedule_next) |
+| Read or compare metrics | `job_metrics_query`, `job_metric_ingest`, `job_metric_compare`, `job_duration_stats`, `job_dashboard` | [Metrics](#job_metrics_query) |
+| Attach job files | `job_artifact_add`, `job_artifacts`, `job_artifact_read` | [Job artifacts](#job_artifact_add) |
+| Manage versioned artifacts | `artifact_put`, `artifact_put_dir`, `artifact_resolve`, `artifact_info`, `artifact_materialize`, `artifact_verify`, `artifact_collection_create`, `artifact_collection_append`, `artifact_collection_get`, `artifact_alias_set`, `artifact_link_lineage`, `artifact_lineage_for`, `artifact_delete_request`, `artifact_restore`, `artifact_pin`, `artifact_unpin`, `artifact_gc`, `artifact_backup`, `artifact_begin_restore`, `artifact_complete_restore`, `artifact_storage_profile_create`, `artifact_storage_profile_get`, `artifact_storage_profile_probe`, `artifact_storage_profile_update`, `artifact_push_remote`, `artifact_pull_remote` | [Versioned artifacts](#versioned-artifacts) |
+| Health and cleanup | `job_doctor`, `job_cleanup_preview`, `job_cleanup` | [Health](#job_doctor), [cleanup](#job_cleanup) |
+| Remote execution | `remote_list`, `remote_doctor`; `job_start`, `job_list`, `job_status`, `job_tail`, `job_wait`, `job_stop`, `job_rerun` accept remote execution where documented | [Remote execution](#remote-execution) |
+
+The versioned artifact tools store files and directories by name, resolve
+versions or aliases, build collections, and record producer/consumer lineage.
+Pinning protects a version from garbage collection; delete requests can be
+restored. Storage profiles configure and probe backends, while backup/restore
+and remote push/pull move artifact data between stores and paired hosts.
+
+### Versioned artifacts
+
+These tools use immutable version IDs (`version_id`) under a named root. A root
+resolves to its latest version; aliases are explicit movable pointers, updated
+with compare-and-swap. Paths are local to the machine running the Vanth daemon.
+`idempotency_key` is optional for local mutations and useful when retrying a
+request after an uncertain response. Remote artifact mutations require it.
+
+| Tool | Parameters | Use |
+|---|---|---|
+| `artifact_put(path, name, idempotency_key?)` | Local file path, root name | Publish a file; identical content under the same root deduplicates. |
+| `artifact_put_dir(source_path, name, idempotency_key?)` | Local directory path, root name | Publish a directory tree as one version. Symlinks, reparse points, special files, and concurrent source changes are rejected. |
+| `artifact_resolve(name, alias?, version_id?)` | Root name and optionally one selector | Resolve the latest root version, named alias, or explicit version. |
+| `artifact_info(version_id)` | Version ID | Read its manifest and blob/verification state. |
+| `artifact_materialize(version_id, dest_path, overwrite=False)` | Version ID, local destination | Atomically write content; an existing destination fails unless `overwrite=True`. |
+| `artifact_verify(version_id)` | Version ID | Re-hash content and compare it with the manifest. |
+| `artifact_collection_create(name, idempotency_key?)` | Collection name | Create an ordered collection. |
+| `artifact_collection_append(collection, version_id, idempotency_key?)` | Collection name, version ID | Append in monotonic order; duplicate append is a no-op. |
+| `artifact_collection_get(name)` | Collection name | Read its ordered versions. |
+| `artifact_alias_set(alias_name, root_id, new_version_id, expected_version_id?, updated_by?, idempotency_key?)` | Alias, root ID, target version, optional expected current version | Move the alias only if its current target matches `expected_version_id`; omit/null to create a new alias. Mismatch returns `ALIAS_CAS_MISMATCH`. |
+| `artifact_link_lineage(producer_kind, producer_id, consumer_kind, consumer_id, version_id, idempotency_key?)` | Producer and consumer identities plus version | Record a link. Kinds are `job`, `remote_job`, `version`, or `alias`. |
+| `artifact_lineage_for(version_id)` | Version ID | List recorded lineage links. |
+| `artifact_delete_request(version_id, idempotency_key?)` | Version ID | Request logical deletion; aliased versions are rejected and content remains until GC. |
+| `artifact_restore(version_id, idempotency_key?)` | Version ID | Clear a pending delete request. |
+| `artifact_pin(version_id, hold_reason, idempotency_key?)` | Version ID, reason | Hold a version so GC cannot reclaim it. |
+| `artifact_unpin(version_id, idempotency_key?)` | Version ID | Remove the hold. |
+| `artifact_gc(dry_run=True, idempotency_key?)` | Dry-run flag | Report eligible unreachable content; inspect this result before setting `dry_run=False`. |
+| `artifact_backup()` | None | Create a SQLite catalog backup. |
+| `artifact_begin_restore(backup_path)` | Local backup path | Begin catalog recovery. Mutations stay locked until complete-restore. |
+| `artifact_complete_restore()` | None | Clear the recovery-required marker after restore. |
+| `artifact_storage_profile_create(kind="s3", config?)` | Backend kind and config | Register a profile at revision 1. |
+| `artifact_storage_profile_get(profile_id)` | Profile ID | Read its latest revision and capabilities. |
+| `artifact_storage_profile_probe(profile_id)` | Profile ID | Probe endpoint capabilities and record them on the latest revision. |
+| `artifact_storage_profile_update(profile_id, config, idempotency_key?)` | Profile ID and replacement config | Create the next immutable profile revision; prior revisions remain queryable. |
+| `artifact_push_remote(remote_id, version_id, idempotency_key?)` | Paired remote ID, version ID | Push a version to a paired host using resumable transfer. |
+| `artifact_pull_remote(remote_id, version_id, dest_path, idempotency_key?)` | Paired remote ID, remote version ID, local destination | Pull and materialize a remote version here using resumable transfer. |
+
+Typical flow: publish, resolve, verify, then materialize. For example, call
+`artifact_put(path="F:/models/best.pt", name="experiment-a")`, pass its
+returned `version_id` to `artifact_verify`, and use that ID with
+`artifact_materialize(version_id="...", dest_path="F:/restore/best.pt")`.
+Use `artifact_alias_set` when a consumer needs a stable name such as `stable`,
+and supply the expected prior version when moving it. Pin versions that must
+survive collection/retention cleanup. Start garbage collection with its default
+dry run and review candidates before making a destructive call.
+
+Storage profile `config` is backend-specific. Create or update a profile, read
+it back, and probe it before relying on storage capabilities; do not place
+credentials in prompts or logs. Remote push/pull use the paired-host broker and
+require an `idempotency_key` for safe retries.
+
+`job_wait` can return current progress, and `job_tail` can follow output; these
+options are documented in their sections. Wake tools also have Python
+counterparts, but the MCP names are the external names shown above. The
+implementation adapters named `mcp_*` are not exposed to agents.
 
 ---
 
@@ -51,7 +117,7 @@ client or daemon restarts.
 | `timeout_seconds` | `int?` | `None` | >= 1; `None` = no timeout (enforced even across daemon restarts) |
 | `notify_on` | `string[]?` | `None` | Only defaults `events` on an existing `wake_targets` entry; without `wake_targets` it notifies nobody, and the start response carries a `warnings` entry saying so |
 | `wake_targets` | `object[]?` | `None` | See README "Wake targets"; `{type, events, ...config}` |
-| `wake_me` | `bool?` | `False` | Zero-JSON `opencode_thread` wake; defaults to `completed,failed`, omits `session_id`, and resolves the live relay for the job's cwd |
+| `wake_me` | `bool?` | `False` | Zero-JSON `opencode_thread` wake; defaults to all terminal outcomes (`completed`, `failed`, `timeout`, `cancelled`, `orphaned`), omits `session_id`, and resolves the live relay for the job's cwd |
 | `origin_thread_id` | `string?` | `None` | The agent thread that launched it (defaults to `CODEX_THREAD_ID`) |
 | `tags` | `string[]?` | `None` | Arbitrary labels, filterable in `job_list` |
 | `notes` | `string?` | `None` | Free-form annotation shown in the monitor |
@@ -926,10 +992,9 @@ way. Over HTTP the equivalents are `POST /jobs` with `remote_id`,
 
 ---
 
-## Planned (v1.4, in progress — not yet released)
+## Additional shipped tools
 
-These tools are being added in parallel and are documented here as part of the
-planned surface.
+The tools in this section are registered in the current server release.
 
 ### `job_metric_ingest`
 
@@ -952,16 +1017,14 @@ Write scalar metric points into a job's metric series programmatically
 
 ### `job_artifact_read`
 
-Read a stored artifact's metadata and (when it is a local file) contents back
-out of a job — the read side of `job_artifact_add`.
+Read a stored job artifact's metadata and, when it is a local file, contents.
 
 **Parameters**
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `job_id` | `string` | required | Job owning the artifact |
 | `artifact_id` | `string` | required | Artifact to read |
-| `max_bytes` | `int?` | `None` | Cap on returned content |
+| `max_bytes` | `int` | `262144` | Maximum local-file content bytes returned |
 
 **Response**
 
@@ -1004,9 +1067,10 @@ registered plugin relay for the job's `cwd`, and the in-process plugin injects
 the wake into the TUI you are watching. If no relay is registered for that cwd,
 creation fails with an actionable error. An explicit `session_id` (`ses_...`,
 from `opencode session list`) always wins — use it, **not** the relay client id
-`opencode-<pid>-<rand>` that `vanth doctor` prints as `[client ...]` (a target
-naming a client id is rejected, since the relay matches on the destination
-session and would never claim it). `attach` is optional and only needed for a
+`opencode-<pid>-<rand>` that may appear as a relay client id in diagnostics (a
+target naming a client id is rejected, since the relay matches on the destination
+session and would never claim it). Use `vanth doctor --json` for the full
+relay/session details, or let `wake_me` resolve the live destination. `attach` is optional and only needed for a
 headless `opencode serve` (an explicit `session_id` plus the server URL);
 without a plugin relay and without `attach` there is no visible client to wake.
 
@@ -1037,7 +1101,8 @@ This is the genuine "wake now" operation: it registers the target AND enqueues
 a synthetic delivery right away, so the wake reaches the target session without
 waiting for a matching event. Same target contract as `job_add_wake_target`;
 `opencode_thread` targets may omit `session_id` when a plugin relay is
-registered for the job's cwd (`vanth doctor` lists them and their liveness),
+registered for the job's cwd (`vanth doctor` summarizes relays; `vanth doctor
+--json` gives the full relay/session list),
 **not** the relay client id `opencode-<pid>-<rand>`; otherwise supply the
 `ses_...` session id.
 

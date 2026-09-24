@@ -5,9 +5,9 @@ state as a Bubble Tea TUI. Platform wheels bundle the host-platform binary
 inside the wheel (``vanth/monitor-bin/vanth-monitor``); this module locates and
 re-executes it, so ``vanth-monitor`` works without a Go toolchain.
 
-If the bundled binary is missing (source checkout or sdist install), the
-wrapper errors out and recommends reinstalling from a platform wheel — a
-standalone-binary override or local Go build is deliberately NOT attempted.
+If the bundled binary is missing (for example, in a source checkout or sdist
+install), the wrapper explains how to build and run the monitor from the Go
+source or install a platform wheel.
 """
 
 from __future__ import annotations
@@ -42,12 +42,24 @@ def find_monitor_binary() -> Path:
     """Return the bundled monitor binary, or raise with a fix-it message."""
     bundled = bundled_binary()
     if bundled is None:
+        if os.name == "nt":
+            build_command = (
+                r"mkdir dist 2>nul & "
+                r"go build -o dist\vanth-monitor.exe .\cmd\vanth && "
+                r"dist\vanth-monitor.exe monitor"
+            )
+        else:
+            build_command = (
+                "mkdir -p dist && go build -o dist/vanth-monitor ./cmd/vanth && "
+                "./dist/vanth-monitor monitor"
+            )
         raise RuntimeError(
             "the vanth-monitor native binary is not present in this install.\n"
-            "This happens when vanth was installed from source or an sdist "
-            "instead of a platform wheel. Fix:\n"
-            "  uv tool install --force <platform wheel URL or 'vanth' from "
-            "PyPI>\n"
+            "From the repository root, build and run it directly with:\n"
+            f"  {build_command}\n"
+            "To use the vanth-monitor command without a Go toolchain, install "
+            "the platform wheel:\n"
+            "  uv tool install --force vanth\n"
             f"(looked in: {Path(vanth.__file__).parent / _BIN_DIR_NAME})"
         )
     return bundled
